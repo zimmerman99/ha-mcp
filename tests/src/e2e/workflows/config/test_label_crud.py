@@ -11,7 +11,7 @@ import logging
 
 import pytest
 
-from ...utilities.assertions import assert_mcp_success, parse_mcp_result
+from ...utilities.assertions import assert_mcp_success, parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,9 @@ class TestLabelCRUD:
 
         logger.info(f"Found {data['count']} labels")
         for label in data["labels"][:5]:  # Log first 5
-            logger.info(f"  - {label.get('name', 'Unknown')} (id: {label.get('label_id')})")
+            logger.info(
+                f"  - {label.get('name', 'Unknown')} (id: {label.get('label_id')})"
+            )
 
     async def test_label_full_lifecycle(self, mcp_client, cleanup_tracker):
         """Test complete label lifecycle: create, get, update, delete."""
@@ -107,11 +109,11 @@ class TestLabelCRUD:
         logger.info(f"Deleted label: {delete_data.get('message')}")
 
         # VERIFY DELETION (config operations are synchronous)
-        get_result = await mcp_client.call_tool(
+        get_data = await safe_call_tool(
+            mcp_client,
             "ha_config_get_label",
             {"label_id": label_id},
         )
-        get_data = parse_mcp_result(get_result)
         assert get_data.get("success") is False, (
             f"Deleted label should not be found: {get_data}"
         )
@@ -202,30 +204,88 @@ class TestLabelCRUD:
         )
 
     async def test_get_nonexistent_label(self, mcp_client):
-        """Test getting a non-existent label."""
+        """
+        Test: ha_config_get_label with a nonexistent label_id returns a
+        structured error with code RESOURCE_NOT_FOUND, not success=True.
+
+        Source path: tools_labels.py — after listing labels via WebSocket,
+        the requested label_id is looked up in the result. When absent,
+        raise_tool_error is invoked with ErrorCode.RESOURCE_NOT_FOUND and
+        the message "Label not found: ..." (labels are registry metadata,
+        not entities — RESOURCE_NOT_FOUND is the correct category per #1297).
+
+        Hardened from success-only check to explicit error-code and
+        message-substring assertions.
+        """
         logger.info("Testing get non-existent label")
 
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_config_get_label",
-            {"label_id": "nonexistent_label_xyz_12345"},
+            {"label_id": "nonexistent_label_a2_e2e_xyz_404"},
         )
 
-        data = parse_mcp_result(result)
         assert data.get("success") is False, (
             f"Should fail for non-existent label: {data}"
         )
+        assert data["error"]["code"] == "RESOURCE_NOT_FOUND", (
+            f"Expected error code RESOURCE_NOT_FOUND, got: {data['error']}"
+        )
+        assert "suggestion" in data["error"], (
+            "Error response should include a suggestion"
+        )
+        error_msg = data["error"]["message"].lower()
+        assert "not found" in error_msg, (
+            f"Expected 'not found' in error message, got: {data['error']}"
+        )
         logger.info("Non-existent label properly returned error")
+
+    async def test_set_label_with_unknown_id_returns_not_found_1860(self, mcp_client):
+        """Regression for #1860: ha_config_set_label with a label_id that does
+        not exist must return a structured RESOURCE_NOT_FOUND that points at the
+        create path — NOT the opaque "Failed to update label: Command failed:
+        Unknown error" HA emits when label_registry/update receives an unknown
+        id (an agent in the report retried 23 times before finding the create
+        path).
+
+        Source path: tools_labels.py — set_label now verifies the id exists via
+        _list_labels() before routing to update, and raises RESOURCE_NOT_FOUND
+        with an "omit label_id" suggestion when it does not.
+        """
+        logger.info("Testing set_label with unknown label_id (#1860)")
+
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_config_set_label",
+            {"name": "vendor:tapo", "label_id": "vendor_nonexistent_1860_xyz"},
+        )
+
+        assert data.get("success") is False, f"Should fail for unknown label_id: {data}"
+        assert data["error"]["code"] == "RESOURCE_NOT_FOUND", (
+            f"Expected RESOURCE_NOT_FOUND (not the opaque update failure), "
+            f"got: {data['error']}"
+        )
+        error_msg = data["error"]["message"].lower()
+        assert "unknown error" not in error_msg, (
+            f"The opaque HA update failure must not leak through: {data['error']}"
+        )
+        # Actionable guidance must steer the caller to the create path.
+        suggestion = str(data["error"].get("suggestion", "")).lower()
+        assert "omit label_id" in suggestion, (
+            f"Expected an 'omit label_id' create hint, got: {data['error']}"
+        )
+        logger.info("Unknown label_id returned actionable RESOURCE_NOT_FOUND (#1860)")
 
     async def test_delete_nonexistent_label(self, mcp_client):
         """Test deleting a non-existent label."""
         logger.info("Testing delete non-existent label")
 
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_config_remove_label",
             {"label_id": "nonexistent_label_xyz_12345"},
         )
 
-        data = parse_mcp_result(result)
         # Should return error or handle gracefully
         if data.get("success"):
             logger.info("Delete returned success (idempotent)")
@@ -253,7 +313,6 @@ class TestLabelAssignment:
         label_id = create_data.get("label_id")
         cleanup_tracker.track("label", label_id)
         logger.info(f"Created label for assignment: {label_id}")
-
 
         # Assign label to entity
         assign_result = await mcp_client.call_tool(
@@ -302,7 +361,6 @@ class TestLabelAssignment:
             cleanup_tracker.track("label", label_id)
         logger.info(f"Created labels: {label_ids}")
 
-
         # Assign both labels
         assign_result = await mcp_client.call_tool(
             "ha_set_entity",
@@ -345,7 +403,6 @@ class TestLabelAssignment:
         label_id = create_data.get("label_id")
         cleanup_tracker.track("label", label_id)
 
-
         # Assign using string (JSON array) instead of list
         assign_result = await mcp_client.call_tool(
             "ha_set_entity",
@@ -387,7 +444,6 @@ class TestLabelAssignment:
         label_id = create_data.get("label_id")
         cleanup_tracker.track("label", label_id)
 
-
         # Assign using JSON array string
         assign_result = await mcp_client.call_tool(
             "ha_set_entity",
@@ -414,7 +470,9 @@ class TestLabelAssignment:
             {"label_id": label_id},
         )
 
-    async def test_assign_label_to_nonexistent_entity(self, mcp_client, cleanup_tracker):
+    async def test_assign_label_to_nonexistent_entity(
+        self, mcp_client, cleanup_tracker
+    ):
         """Test assigning label to non-existent entity."""
         logger.info("Testing label assignment to non-existent entity")
 
@@ -427,17 +485,15 @@ class TestLabelAssignment:
         label_id = create_data.get("label_id")
         cleanup_tracker.track("label", label_id)
 
-
         # Try to assign to non-existent entity
-        assign_result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_set_entity",
             {
                 "entity_id": "light.nonexistent_xyz_12345",
                 "labels": [label_id],
             },
         )
-
-        data = parse_mcp_result(assign_result)
         # Should fail for non-existent entity
         assert data.get("success") is False, (
             f"Should fail for non-existent entity: {data}"
@@ -505,7 +561,5 @@ async def test_multiple_labels_lifecycle(mcp_client, cleanup_tracker):
 
     list_label_ids = [lbl.get("label_id") for lbl in list_data.get("labels", [])]
     for label_id in label_ids:
-        assert label_id not in list_label_ids, (
-            f"Label {label_id} should be deleted"
-        )
+        assert label_id not in list_label_ids, f"Label {label_id} should be deleted"
     logger.info("All label deletions verified")

@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** November 2024
+**Last updated:** June 2026
 
 ## Scope
 
@@ -12,20 +12,20 @@ Ha-mcp runs on your local machine and communicates with your own Home Assistant 
 
 ## Anonymous Usage Statistics
 
-Ha-mcp may collect anonymous usage statistics to help improve the server. If enabled, this includes:
+Anonymous usage statistics are a planned future feature and are **not currently collected or transmitted** as of June 2026. When this feature is implemented, it will respect your Home Assistant analytics/telemetry setting by default, and you will be able to override that choice (opt out). The change will be announced prominently in the release notes — shown in the README, on the GitHub releases page, and in the web Settings UI — at least one month before it takes effect.
+
+When enabled in a future release, anonymous usage statistics would include:
 
 - **Tool usage counts** — which tools are used and how often
 - **Server version** — to understand adoption of updates
 - **Request/response sizes** — to optimize performance (not content)
 
-**What we do NOT collect:**
+**What would NOT be collected:**
 - Entity names or IDs
 - Home Assistant configuration
 - Personal information
 - Automation or script content
 - Any data from your smart home devices
-
-Telemetry is configurable in the settings.
 
 ## Bug Reports
 
@@ -49,17 +49,17 @@ When you use ha-mcp, your MCP client accesses data from your Home Assistant inst
 
 - **Your Home Assistant instance** — via the URL and token you provide
 - **Your MCP client** — the application that runs ha-mcp
-- **Our telemetry server** — for anonymous usage statistics (if enabled)
+- **A telemetry server** — *planned future feature, not currently active*; when active it would follow your Home Assistant analytics/telemetry setting, which you can override (opt out)
 
 ## Data Security
 
 - Your Home Assistant credentials are stored locally by your MCP client
-- Anonymous telemetry contains no identifying information
 - Bug reports are only sent when you explicitly approve
+- Anonymous telemetry (when implemented) will contain no identifying information
 
 ## Changes to This Policy
 
-We may update this privacy policy to reflect changes in our practices. Significant changes will be noted in release notes.
+We may update this privacy policy to reflect changes in our practices. Any change that affects what data is collected or transmitted will be announced prominently in the release notes — shown in the README, on the GitHub releases page, and in the web Settings UI — at least one month before it takes effect.
 
 ## Contact
 
@@ -72,7 +72,7 @@ For privacy-related questions or concerns:
 
 | Aspect | Status |
 |--------|--------|
-| Anonymous telemetry | Configurable |
+| Anonymous telemetry | Not currently implemented (planned; will follow your Home Assistant analytics/telemetry setting, override-able) |
 | Personal data collected | None |
 | Bug reports | User-approved only |
 | Local processing | Yes |

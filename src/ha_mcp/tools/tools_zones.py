@@ -1,26 +1,142 @@
 """
 Configuration management tools for Home Assistant zones.
 
-This module provides tools for listing, creating, updating, and deleting
+This module provides tools for listing, creating/updating, and removing
 Home Assistant zones (location-based areas for presence automation).
 """
 
 import logging
 from typing import Annotated, Any
 
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
 from pydantic import Field
 
-from .helpers import log_tool_usage
+from ..client.rest_client import (
+    HomeAssistantCommandError,
+    HomeAssistantCommandTimeout,
+)
+from ..client.websocket_client import get_websocket_client
+from ..errors import ErrorCode, create_error_response, create_validation_error
+from .auto_backup import with_auto_backup
+from .component_api import (
+    component_supports,
+    get_component_caps,
+    invalidate_caps,
+    is_unknown_command,
+)
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    validate_identifier_not_empty,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def register_zone_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register Home Assistant zone configuration tools."""
+def _build_zone_result(
+    zones: list[dict[str, Any]], zone_id: str | None
+) -> dict[str, Any]:
+    """Assemble the ha_get_zone response from a list of zone records.
 
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["zone"], "title": "Get Zone"})
+    Shared by the legacy ``zone/list`` path and the component ``helpers_list``
+    path so the two produce an identical envelope. Without ``zone_id`` returns
+    the full list; with one, returns that single zone or raises
+    RESOURCE_NOT_FOUND — byte-identical to the original inline logic.
+    """
+    if zone_id is None:
+        return {
+            "success": True,
+            "count": len(zones),
+            "zones": zones,
+            "message": f"Found {len(zones)} zone(s)",
+        }
+
+    zone = next((z for z in zones if z.get("id") == zone_id), None)
+    if zone is None:
+        available_ids = [z.get("id") for z in zones[:10]]  # Show first 10
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                f"Zone not found: {zone_id}",
+                context={
+                    "zone_id": zone_id,
+                    "available_zone_ids": available_ids,
+                },
+                suggestions=[
+                    "Use ha_get_zone() without zone_id to see all available zones"
+                ],
+            )
+        )
+    return {
+        "success": True,
+        "zone_id": zone_id,
+        "zone": zone,
+    }
+
+
+def _shape_component_zone_record(rec: dict[str, Any]) -> dict[str, Any]:
+    """Map one component ``helpers_list`` zone record onto the legacy zone shape.
+
+    The legacy ``zone/list`` record is the storage body itself (``id`` = storage
+    id, ``name``, ``latitude`` / ``longitude`` / ``radius`` / ``passive`` /
+    ``icon``). The component supplies that same body as ``config`` plus the
+    authoritative ``storage_id`` — ``None`` for a YAML-defined zone, whose config
+    core's ``Zone.__init__`` still retains, so ``home`` and other YAML zones that
+    ``zone/list`` structurally omits come through here. Keep the legacy body and
+    additively stamp an ``editable`` / ``source`` discriminator derived from
+    ``storage_id is None`` (YAML zones are not editable via the storage API).
+    """
+    config = rec.get("config")
+    out: dict[str, Any] = dict(config) if isinstance(config, dict) else {}
+    # storage_id is NOT a YAML discriminator: for state-only records the
+    # component backfills it with the registry unique_id or object_id, so a
+    # YAML zone (incl. ``home``) arrives with a non-null storage_id. The
+    # reliable signal is the body itself — a state-attribute body carries
+    # core's ATTR_EDITABLE (False for YAML zones), while a real storage body
+    # never has the key.
+    is_yaml = out.get("editable") is False
+    storage_id = rec.get("storage_id")
+    # Storage zones keep their storage id (the key ha_get_zone matches on);
+    # YAML zones get their object_id so they can still be fetched by zone_id.
+    out["id"] = storage_id if storage_id is not None else rec.get("object_id")
+    out["editable"] = not is_yaml
+    out["source"] = "yaml" if is_yaml else "storage"
+    return out
+
+
+def _shape_component_zone_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reshape the component's zone ``helpers_list`` result into legacy rows."""
+    raw = result.get("helpers")
+    records = raw if isinstance(raw, list) else []
+    return [
+        _shape_component_zone_record(rec)
+        for rec in records
+        if isinstance(rec, dict) and rec.get("helper_type") == "zone"
+    ]
+
+
+class ZoneTools:
+    """Zone configuration management tools for Home Assistant."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @tool(
+        name="ha_get_zone",
+        tags={"Zones"},
+        annotations={
+            "openWorldHint": False,
+            "idempotentHint": True,
+            "readOnlyHint": True,
+            "title": "Get Zone",
+        },
+    )
     @log_tool_usage
     async def ha_get_zone(
+        self,
         zone_id: Annotated[
             str | None,
             Field(
@@ -45,222 +161,190 @@ def register_zone_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - List all zones: ha_get_zone()
         - Get specific zone: ha_get_zone(zone_id="abc123")
 
-        **NOTE:** This returns storage-based zones (created via UI/API), not YAML-defined zones.
-        The 'home' zone is typically defined in YAML and may not appear in this list.
+        **NOTE:** With the ha_mcp_tools custom component installed, YAML-defined
+        zones — including the auto-synthesized 'home' zone — are included and
+        marked ``editable=false`` / ``source="yaml"`` (storage zones created via
+        UI/API are ``source="storage"``). Without the component, only storage
+        zones are listed and YAML-defined zones such as 'home' will not appear.
         """
         try:
+            # Prefer the ha_mcp_tools component's helpers_list: core's zone/list
+            # serves only the storage collection, so YAML-defined zones —
+            # including the auto-synthesized 'home' zone — are structurally
+            # absent. The component enumerates them (each with storage_id=None),
+            # filling that gap. Falls back cleanly to the legacy zone/list body
+            # below when the component is absent, downlevel, or errors — the
+            # taxonomy lives in ``_get_zone_via_component``.
+            caps = await get_component_caps(self._client)
+            if component_supports(caps, "helpers_list"):
+                component_response = await self._get_zone_via_component(zone_id)
+                if component_response is not None:
+                    return component_response
+
             message: dict[str, Any] = {
                 "type": "zone/list",
             }
 
-            result = await client.send_websocket_message(message)
+            result = await self._client.send_websocket_message(message)
 
             if not result.get("success"):
-                return {
-                    "success": False,
-                    "error": f"Failed to get zones: {result.get('error', 'Unknown error')}",
-                }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        result.get("error", "Failed to get zones"),
+                        context={"zone_id": zone_id},
+                    )
+                )
 
-            zones = result.get("result", [])
+            return _build_zone_result(result.get("result", []), zone_id)
 
-            # If no zone_id provided, return list of all zones
-            if zone_id is None:
-                return {
-                    "success": True,
-                    "count": len(zones),
-                    "zones": zones,
-                    "message": f"Found {len(zones)} zone(s)",
-                }
-
-            # Find specific zone by ID
-            zone = next((z for z in zones if z.get("id") == zone_id), None)
-
-            if zone is None:
-                available_ids = [z.get("id") for z in zones[:10]]  # Show first 10
-                return {
-                    "success": False,
-                    "error": f"Zone not found: {zone_id}",
-                    "zone_id": zone_id,
-                    "available_zone_ids": available_ids,
-                    "suggestion": "Use ha_get_zone() without zone_id to see all available zones",
-                }
-
-            return {
-                "success": True,
-                "zone_id": zone_id,
-                "zone": zone,
-            }
-
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error getting zones: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to get zones: {str(e)}",
-                "suggestions": [
+            logger.error(f"Error getting zone(s) (zone_id={zone_id}): {e}")
+            exception_to_structured_error(
+                e,
+                context={"zone_id": zone_id},
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify WebSocket connection is active",
-                    "Use ha_search_entities(domain_filter='zone') as alternative",
+                    "Use ha_get_zone() without zone_id to see all available zones",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
 
-    @mcp.tool(annotations={"destructiveHint": True, "tags": ["zone"], "title": "Create Zone"})
-    @log_tool_usage
-    async def ha_create_zone(
-        name: Annotated[str, Field(description="Display name for the zone")],
-        latitude: Annotated[
-            float,
-            Field(description="Latitude coordinate of the zone center"),
-        ],
-        longitude: Annotated[
-            float,
-            Field(description="Longitude coordinate of the zone center"),
-        ],
-        radius: Annotated[
-            float,
-            Field(
-                description="Radius of the zone in meters (default: 100)",
-                default=100,
-            ),
-        ] = 100,
-        icon: Annotated[
-            str | None,
-            Field(
-                description="Material Design Icon (e.g., 'mdi:briefcase', 'mdi:school')",
-                default=None,
-            ),
-        ] = None,
-        passive: Annotated[
-            bool,
-            Field(
-                description="If True, zone will not trigger automations on enter/exit (default: False)",
-                default=False,
-            ),
-        ] = False,
-    ) -> dict[str, Any]:
-        """
-        Create a new Home Assistant zone for presence detection.
+    async def _get_zone_via_component(
+        self, zone_id: str | None
+    ) -> dict[str, Any] | None:
+        """Serve ha_get_zone from the component's helpers_list; ``None`` ⇒ legacy.
 
-        Zones are location-based areas that can trigger automations when
-        devices enter or exit. Common use cases include:
-        - Home, Work, School locations
-        - Gym, Shopping areas
-        - Family members' locations
+        Error taxonomy mirrors ``_list_helpers_via_component`` in
+        tools_config_helpers (§ 4). ``zone`` is always in the collection
+        universe, so there is a legacy fallback for every failure:
 
-        EXAMPLES:
-        - Create office zone: ha_create_zone("Office", 40.7128, -74.0060, radius=150, icon="mdi:briefcase")
-        - Create gym zone: ha_create_zone("Gym", 40.7580, -73.9855, radius=50, icon="mdi:dumbbell")
-        - Create passive zone: ha_create_zone("City Center", 40.7484, -73.9857, radius=500, passive=True)
-
-        Note: The 'home' zone is typically defined in configuration.yaml and cannot be created via this API.
+        - ``unknown_command`` (cached caps went stale after a component
+          downgrade): invalidate the caps and return ``None`` so the caller
+          serves the byte-identical legacy ``zone/list`` body, silently.
+        - any other ``HomeAssistantCommandError`` / ``HomeAssistantCommandTimeout``:
+          serve the correct result from the legacy zone list, append a
+          ``warnings[]`` entry, and ``log.warning``.
+        - a response that does not authoritatively enumerate ``zone`` (an older
+          component with no ``covered_types``): fall back to legacy silently.
+        - ``HomeAssistantConnectionError`` (pooled-WS drop) or the plain
+          ``Exception`` ``get_websocket_client()`` raises on a failed (re)connect:
+          served from the legacy ``zone/list`` (which rides the swallowing
+          ``send_websocket_message`` bridge, so a transport failure surfaces there
+          as a structured error rather than dying identically), with a
+          ``warnings[]`` entry + ``log.warning``; a transport failure must not
+          escape.
         """
         try:
-            # Validate coordinates
-            if not (-90 <= latitude <= 90):
-                return {
-                    "success": False,
-                    "error": f"Invalid latitude: {latitude}. Must be between -90 and 90.",
-                }
-            if not (-180 <= longitude <= 180):
-                return {
-                    "success": False,
-                    "error": f"Invalid longitude: {longitude}. Must be between -180 and 180.",
-                }
-            if radius <= 0:
-                return {
-                    "success": False,
-                    "error": f"Invalid radius: {radius}. Must be greater than 0.",
-                }
+            raw = await self._send_component_zone_list()
+        except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
+            if is_unknown_command(exc):
+                invalidate_caps(self._client)
+                return None
+            response = _build_zone_result(await self._legacy_zone_rows(), zone_id)
+            response.setdefault("warnings", []).append(
+                f"component zone listing failed ({exc}); served via legacy path"
+            )
+            logger.warning(
+                "ha_mcp_tools/helpers_list (zone) failed; fell back to legacy: %r",
+                exc,
+            )
+            return response
+        except Exception as exc:
+            response = _build_zone_result(await self._legacy_zone_rows(), zone_id)
+            response.setdefault("warnings", []).append(
+                f"component zone listing connection error ({exc}); "
+                "served via legacy path"
+            )
+            logger.warning(
+                "ha_mcp_tools/helpers_list (zone) connection error; "
+                "fell back to legacy: %r",
+                exc,
+            )
+            return response
+        result = raw.get("result") or {}
+        covered = result.get("covered_types")
+        if not (isinstance(covered, list) and "zone" in covered):
+            # The component did not authoritatively enumerate zones (older
+            # component with no covered_types): don't trust its list — fall back
+            # to the legacy storage-only path silently.
+            return None
+        return _build_zone_result(_shape_component_zone_rows(result), zone_id)
 
-            # Build create message
-            message: dict[str, Any] = {
-                "type": "zone/create",
-                "name": name,
-                "latitude": latitude,
-                "longitude": longitude,
-                "radius": radius,
-                "passive": passive,
-            }
+    async def _send_component_zone_list(self) -> dict[str, Any]:
+        """Send one ``ha_mcp_tools/helpers_list`` zone query over the per-client WS."""
+        ws = await get_websocket_client(
+            url=self._client.base_url,
+            token=self._client.token,
+            verify_ssl=getattr(self._client, "verify_ssl", None),
+        )
+        return await ws.send_command(
+            "ha_mcp_tools/helpers_list",
+            helper_types=["zone"],
+            include_flow_helpers=False,
+        )
 
-            if icon:
-                message["icon"] = icon
+    async def _legacy_zone_rows(self) -> list[dict[str, Any]]:
+        """Fetch storage zones via the legacy ``zone/list`` WS command."""
+        result = await self._client.send_websocket_message({"type": "zone/list"})
+        if not result.get("success"):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    result.get("error", "Failed to get zones"),
+                    context={},
+                )
+            )
+        rows: list[dict[str, Any]] = result.get("result", [])
+        return rows
 
-            result = await client.send_websocket_message(message)
+    @staticmethod
+    def _validate_coordinates(
+        latitude: float | None,
+        longitude: float | None,
+        radius: float | None,
+    ) -> None:
+        """Validate zone coordinate parameters, raising ToolError on invalid values."""
+        if latitude is not None and not (-90 <= latitude <= 90):
+            raise_tool_error(
+                create_validation_error(
+                    f"Invalid latitude: {latitude}. Must be between -90 and 90.",
+                    parameter="latitude",
+                )
+            )
+        if longitude is not None and not (-180 <= longitude <= 180):
+            raise_tool_error(
+                create_validation_error(
+                    f"Invalid longitude: {longitude}. Must be between -180 and 180.",
+                    parameter="longitude",
+                )
+            )
+        if radius is not None and radius <= 0:
+            raise_tool_error(
+                create_validation_error(
+                    f"Invalid radius: {radius}. Must be greater than 0.",
+                    parameter="radius",
+                )
+            )
 
-            if result.get("success"):
-                zone_data = result.get("result", {})
-                return {
-                    "success": True,
-                    "zone_data": zone_data,
-                    "zone_id": zone_data.get("id"),
-                    "message": f"Successfully created zone: {name}",
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"Failed to create zone: {result.get('error', 'Unknown error')}",
-                    "name": name,
-                }
-
-        except Exception as e:
-            logger.error(f"Error creating zone: {e}")
-            return {
-                "success": False,
-                "error": f"Zone creation failed: {str(e)}",
-                "name": name,
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "Verify coordinates are valid",
-                    "Ensure zone name is unique",
-                ],
-            }
-
-    @mcp.tool(annotations={"destructiveHint": True, "tags": ["zone"], "title": "Update Zone"})
-    @log_tool_usage
-    async def ha_update_zone(
-        zone_id: Annotated[
-            str,
-            Field(description="Zone ID to update (from ha_get_zone)"),
-        ],
-        name: Annotated[
-            str | None,
-            Field(description="New display name for the zone", default=None),
-        ] = None,
-        latitude: Annotated[
-            float | None,
-            Field(description="New latitude coordinate", default=None),
-        ] = None,
-        longitude: Annotated[
-            float | None,
-            Field(description="New longitude coordinate", default=None),
-        ] = None,
-        radius: Annotated[
-            float | None,
-            Field(description="New radius in meters", default=None),
-        ] = None,
-        icon: Annotated[
-            str | None,
-            Field(description="New Material Design Icon", default=None),
-        ] = None,
-        passive: Annotated[
-            bool | None,
-            Field(description="New passive mode setting", default=None),
-        ] = None,
-    ) -> dict[str, Any]:
-        """
-        Update an existing Home Assistant zone.
-
-        Only the fields you specify will be updated. Other fields remain unchanged.
-
-        EXAMPLES:
-        - Update zone name: ha_update_zone("abc123", name="New Office")
-        - Update zone radius: ha_update_zone("abc123", radius=200)
-        - Update zone location: ha_update_zone("abc123", latitude=40.7128, longitude=-74.0060)
-        - Update multiple fields: ha_update_zone("abc123", name="Gym", radius=75, icon="mdi:dumbbell")
-
-        **TIP:** Use ha_get_zone() to get the zone_id for the zone you want to update.
-        """
-        try:
-            # Validate that at least one field is being updated
+    def _build_set_zone_message(
+        self,
+        name: str | None,
+        latitude: float | None,
+        longitude: float | None,
+        zone_id: str | None,
+        radius: float | None,
+        icon: str | None,
+        passive: bool | None,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        """Build the zone/create|update WS message plus (operation, fields_to_update)."""
+        fields_to_update: dict[str, Any] = {}
+        if zone_id:
+            # UPDATE operation
+            operation = "update"
             update_fields = {
                 "name": name,
                 "latitude": latitude,
@@ -272,116 +356,287 @@ def register_zone_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             fields_to_update = {k: v for k, v in update_fields.items() if v is not None}
 
             if not fields_to_update:
-                return {
-                    "success": False,
-                    "error": "No fields to update. Provide at least one field to change.",
-                    "zone_id": zone_id,
-                }
+                raise_tool_error(
+                    create_validation_error(
+                        "No fields to update. Provide at least one field to change.",
+                        context={"zone_id": zone_id},
+                    )
+                )
 
-            # Validate coordinates if provided
-            if latitude is not None and not (-90 <= latitude <= 90):
-                return {
-                    "success": False,
-                    "error": f"Invalid latitude: {latitude}. Must be between -90 and 90.",
-                }
-            if longitude is not None and not (-180 <= longitude <= 180):
-                return {
-                    "success": False,
-                    "error": f"Invalid longitude: {longitude}. Must be between -180 and 180.",
-                }
-            if radius is not None and radius <= 0:
-                return {
-                    "success": False,
-                    "error": f"Invalid radius: {radius}. Must be greater than 0.",
-                }
+            self._validate_coordinates(latitude, longitude, radius)
 
-            # Build update message
             message: dict[str, Any] = {
                 "type": "zone/update",
                 "zone_id": zone_id,
                 **fields_to_update,
             }
+        else:
+            # CREATE operation
+            operation = "create"
+            if name is None or latitude is None or longitude is None:
+                raise_tool_error(
+                    create_validation_error(
+                        "name, latitude, and longitude are required when creating a zone.",
+                    )
+                )
 
-            result = await client.send_websocket_message(message)
+            self._validate_coordinates(latitude, longitude, radius)
+
+            message = {
+                "type": "zone/create",
+                "name": name,
+                "latitude": latitude,
+                "longitude": longitude,
+                "radius": radius if radius is not None else 100,
+                "passive": passive if passive is not None else False,
+            }
+            if icon:
+                message["icon"] = icon
+        return message, operation, fields_to_update
+
+    @tool(
+        name="ha_set_zone",
+        tags={"Zones"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "title": "Set Zone",
+        },
+    )
+    @with_auto_backup(
+        domain="zone",
+        id_fn=lambda kw: str(kw.get("zone_id") or kw.get("name") or ""),
+    )
+    @log_tool_usage
+    async def ha_set_zone(
+        self,
+        name: Annotated[
+            str | None,
+            Field(
+                description="Display name for the zone (required for create)",
+                default=None,
+            ),
+        ] = None,
+        latitude: Annotated[
+            float | None,
+            Field(
+                description="Latitude coordinate of the zone center (required for create)",
+                default=None,
+            ),
+        ] = None,
+        longitude: Annotated[
+            float | None,
+            Field(
+                description="Longitude coordinate of the zone center (required for create)",
+                default=None,
+            ),
+        ] = None,
+        zone_id: Annotated[
+            str | None,
+            Field(
+                description="Zone ID to update (omit to create new zone, use ha_get_zone to find IDs)",
+                default=None,
+            ),
+        ] = None,
+        radius: Annotated[
+            float | None,
+            Field(
+                description="Radius of the zone in meters (must be > 0, defaults to 100 on create)",
+                default=None,
+            ),
+        ] = None,
+        icon: Annotated[
+            str | None,
+            Field(
+                description="Material Design Icon (e.g., 'mdi:briefcase', 'mdi:school')",
+                default=None,
+            ),
+        ] = None,
+        passive: Annotated[
+            bool | None,
+            Field(
+                description="Passive mode - if True, zone will not trigger enter/exit automations (defaults to False on create)",
+                default=None,
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        """
+        Create or update a Home Assistant zone.
+
+        Omit zone_id to create a new zone (name, latitude, longitude required).
+        Provide zone_id to update an existing zone (only specified fields change).
+
+        EXAMPLES:
+        - Create: ha_set_zone(name="Office", latitude=40.7128, longitude=-74.0060, radius=150, icon="mdi:briefcase")
+        - Update name: ha_set_zone(zone_id="abc123", name="New Office")
+        - Update radius: ha_set_zone(zone_id="abc123", radius=200)
+        - Update location: ha_set_zone(zone_id="abc123", latitude=40.7128, longitude=-74.0060)
+
+        Note: The 'home' zone is typically defined in YAML and cannot be modified via this API.
+        """
+        operation = "create"
+        try:
+            # ``None`` stays the documented "create-new" sentinel; explicit
+            # empty/whitespace ``zone_id`` would silently route to the
+            # create branch below and surface "name, latitude, longitude
+            # required" instead of the actual cause (unusable ``zone_id``).
+            if zone_id is not None:
+                validate_identifier_not_empty(
+                    zone_id,
+                    "zone_id",
+                    suggestions=[
+                        "Omit zone_id entirely to create a new zone",
+                        "Pass a valid zone_id to update an existing zone",
+                    ],
+                    context={"action": "set"},
+                )
+            message, operation, fields_to_update = self._build_set_zone_message(
+                name, latitude, longitude, zone_id, radius, icon, passive
+            )
+
+            result = await self._client.send_websocket_message(message)
 
             if result.get("success"):
                 zone_data = result.get("result", {})
-                return {
+                zone_name = name or zone_data.get("name", zone_id)
+                response: dict[str, Any] = {
                     "success": True,
                     "zone_data": zone_data,
-                    "zone_id": zone_id,
-                    "updated_fields": list(fields_to_update.keys()),
-                    "message": f"Successfully updated zone: {zone_id}",
+                    "zone_id": zone_data.get("id", zone_id),
+                    "message": f"Successfully {'updated' if zone_id else 'created'} zone: {zone_name}",
                 }
+                if zone_id and fields_to_update:
+                    response["updated_fields"] = list(fields_to_update.keys())
+                return response
             else:
-                return {
-                    "success": False,
-                    "error": f"Failed to update zone: {result.get('error', 'Unknown error')}",
-                    "zone_id": zone_id,
-                }
+                error_str = str(result.get("error", "")).lower()
+                if "not found" in error_str or "doesn't exist" in error_str:
+                    raise_tool_error(
+                        create_error_response(
+                            ErrorCode.RESOURCE_NOT_FOUND,
+                            f"Zone not found: {zone_id}",
+                            context={"zone_id": zone_id, "operation": operation},
+                            suggestions=[
+                                "Use ha_get_zone() without zone_id to see all available zones",
+                            ],
+                        )
+                    )
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        f"Failed to {operation} zone: {result.get('error', 'Unknown error')}",
+                        context={"zone_id": zone_id, "operation": operation},
+                    )
+                )
 
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error updating zone: {e}")
-            return {
-                "success": False,
-                "error": f"Zone update failed: {str(e)}",
-                "zone_id": zone_id,
-                "suggestions": [
+            logger.error(
+                f"Error in ha_set_zone ({operation}, zone_id={zone_id}, name={name}): {e}"
+            )
+            exception_to_structured_error(
+                e,
+                context={"zone_id": zone_id, "operation": operation},
+                suggestions=[
                     "Check Home Assistant connection",
-                    "Verify zone_id exists using ha_get_zone()",
-                    "Ensure values are valid",
+                    "Verify coordinates are valid"
+                    if operation == "create"
+                    else "Verify zone_id exists using ha_get_zone()",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 
-    @mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True, "tags": ["zone"], "title": "Delete Zone"})
+    @tool(
+        name="ha_remove_zone",
+        tags={"Zones"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "title": "Remove Zone",
+        },
+    )
+    @with_auto_backup(domain="zone", id_param="zone_id")
     @log_tool_usage
-    async def ha_delete_zone(
+    async def ha_remove_zone(
+        self,
         zone_id: Annotated[
             str,
-            Field(description="Zone ID to delete (from ha_get_zone)"),
+            Field(description="Zone ID to remove (use ha_get_zone to find IDs)"),
         ],
     ) -> dict[str, Any]:
         """
-        Delete a Home Assistant zone.
+        Remove a Home Assistant zone.
 
         EXAMPLES:
-        - Delete zone: ha_delete_zone("abc123")
+        - Remove zone: ha_remove_zone("abc123")
 
-        **WARNING:** Deleting a zone that is used in automations may cause those automations to fail.
-        Use ha_get_zone() to get the zone_id for the zone you want to delete.
+        **WARNING:** Removing a zone used in automations may cause those automations to fail.
+        Use ha_get_zone() to find the zone_id for the zone you want to remove.
 
-        **NOTE:** The 'home' zone cannot be deleted as it is typically defined in configuration.yaml.
+        **NOTE:** The 'home' zone cannot be removed as it is typically defined in configuration.yaml.
         """
         try:
+            # Empty/whitespace would surface as a misleading HA delete-failure.
+            validate_identifier_not_empty(
+                zone_id,
+                "zone_id",
+                suggestions=["Use ha_get_zone() to find existing zone_ids"],
+                context={"operation": "remove_zone"},
+            )
             message: dict[str, Any] = {
                 "type": "zone/delete",
                 "zone_id": zone_id,
             }
 
-            result = await client.send_websocket_message(message)
+            result = await self._client.send_websocket_message(message)
 
             if result.get("success"):
                 return {
                     "success": True,
                     "zone_id": zone_id,
-                    "message": f"Successfully deleted zone: {zone_id}",
+                    "message": f"Successfully removed zone: {zone_id}",
                 }
             else:
-                return {
-                    "success": False,
-                    "error": f"Failed to delete zone: {result.get('error', 'Unknown error')}",
-                    "zone_id": zone_id,
-                }
+                error_str = str(result.get("error", "")).lower()
+                if "not found" in error_str or "doesn't exist" in error_str:
+                    raise_tool_error(
+                        create_error_response(
+                            ErrorCode.RESOURCE_NOT_FOUND,
+                            f"Zone not found: {zone_id}",
+                            context={"zone_id": zone_id},
+                            suggestions=[
+                                "Use ha_get_zone() without zone_id to see all available zones",
+                            ],
+                        )
+                    )
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        f"Failed to remove zone: {result.get('error', 'Unknown error')}",
+                        context={"zone_id": zone_id},
+                    )
+                )
 
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error deleting zone: {e}")
-            return {
-                "success": False,
-                "error": f"Zone deletion failed: {str(e)}",
-                "zone_id": zone_id,
-                "suggestions": [
+            logger.error(f"Error removing zone (zone_id={zone_id}): {e}")
+            exception_to_structured_error(
+                e,
+                context={"zone_id": zone_id},
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify zone_id exists using ha_get_zone()",
                     "Ensure zone is not the 'home' zone (YAML-defined)",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
+
+
+def register_zone_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register Home Assistant zone configuration tools."""
+    register_tool_methods(mcp, ZoneTools(client))

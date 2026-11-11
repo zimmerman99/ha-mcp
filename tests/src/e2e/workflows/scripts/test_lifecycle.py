@@ -1,5 +1,5 @@
 """
-End-to-End tests for Home Assistant Script Management (ha_manage_script tool).
+End-to-End tests for the Home Assistant script configuration tool family.
 
 This test suite validates the complete lifecycle of Home Assistant scripts including:
 - Script creation with various configurations
@@ -16,6 +16,8 @@ production-level functionality and compatibility.
 Tests are designed for Docker Home Assistant test environment at localhost:8124.
 """
 
+import ast
+import asyncio
 import json
 import logging
 import time
@@ -26,6 +28,7 @@ import pytest
 # Import test utilities
 from ...utilities.assertions import (
     MCPAssertions,
+    safe_call_tool,
 )
 
 # Set up logging
@@ -35,6 +38,10 @@ logger = logging.getLogger(__name__)
 
 def enhanced_parse_mcp_result(result) -> dict[str, Any]:
     """Enhanced MCP result parser with better error handling."""
+    # Same passthrough contract as the shared utilities.assertions helper:
+    # an already-parsed dict comes back unchanged.
+    if isinstance(result, dict):
+        return result
     try:
         if hasattr(result, "content") and result.content:
             response_text = str(result.content[0].text)
@@ -49,8 +56,8 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
                         .replace("false", "False")
                         .replace("null", "None")
                     )
-                    return eval(fixed_text)
-                except (SyntaxError, NameError, ValueError):
+                    return ast.literal_eval(fixed_text)
+                except (SyntaxError, NameError, ValueError, TypeError):
                     # Return raw response if parsing fails
                     return {"raw_response": response_text, "parse_error": True}
 
@@ -66,7 +73,7 @@ def enhanced_parse_mcp_result(result) -> dict[str, Any]:
 
 
 def extract_script_config(get_data: dict[str, Any]) -> dict[str, Any]:
-    """Extract script configuration from ha_manage_script get response."""
+    """Extract script configuration from a ha_config_get_script response."""
     # Handle nested config structure: get_data["config"]["config"]
     config_wrapper = get_data.get("config", {})
     if isinstance(config_wrapper, dict) and "config" in config_wrapper:
@@ -121,19 +128,18 @@ async def verify_script_exists_and_registered(
     This function addresses timing issues where scripts are created but not
     immediately discoverable through the management API or entity registry.
     """
-    start_time = time.time()
+    start_time = time.monotonic()
     script_entity = f"script.{script_id}"
 
     logger.info(
         f"⏳ Waiting for script {script_entity} to be registered (timeout: {timeout}s)"
     )
 
-    while time.time() - start_time < timeout:
+    while time.monotonic() - start_time < timeout:
         try:
             # Method 1: Try to get script config via management API
             get_result = await mcp_client.call_tool(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
             get_data = enhanced_parse_mcp_result(get_result)
             if get_data.get("success") and get_data.get("config"):
@@ -151,14 +157,12 @@ async def verify_script_exists_and_registered(
 
             # Method 3: Try to search for the script entity
             search_result = await mcp_client.call_tool(
-                "ha_search_entities",
+                "ha_search",
                 {"query": script_id, "domain_filter": "script", "limit": 5},
             )
             search_data = enhanced_parse_mcp_result(search_result)
             search_results = (
-                search_data.get("data", {}).get("results", [])
-                if search_data.get("success")
-                else []
+                search_data.get("entities", []) if search_data.get("success") else []
             )
 
             for result in search_results:
@@ -169,7 +173,7 @@ async def verify_script_exists_and_registered(
         except Exception as e:
             logger.debug(f"Script registration check failed: {e}")
 
-        elapsed = time.time() - start_time
+        elapsed = time.monotonic() - start_time
         logger.debug(
             f"🔍 Script {script_entity} not yet registered (elapsed: {elapsed:.1f}s)"
         )
@@ -185,11 +189,11 @@ async def verify_script_execution_state(
     timeout: int = 15,  # Increased from 10s to 15s
 ) -> dict[str, Any]:
     """Verify script execution by checking state changes with retry logic."""
-    start_time = time.time()
+    start_time = time.monotonic()
     consecutive_failures = 0
     max_consecutive_failures = 3
 
-    while time.time() - start_time < timeout:
+    while time.monotonic() - start_time < timeout:
         try:
             state_result = await mcp_client.call_tool(
                 "ha_get_state", {"entity_id": script_entity}
@@ -240,6 +244,33 @@ def create_test_script_config(
     return config
 
 
+async def _verify_bulk_scripts(mcp, created_scripts):
+    """Fetch and validate each created script's config; return those verified."""
+    logger.info("🔍 Verifying all scripts exist...")
+    verified_scripts = []
+    for script_id, script_entity in created_scripts:
+        try:
+            get_data = await mcp.call_tool_success(
+                "ha_config_get_script", {"script_id": script_id}
+            )
+
+            config = extract_script_config(get_data)
+            assert "alias" in config, f"Alias missing for {script_entity}: {config}"
+            assert "sequence" in config, (
+                f"Sequence missing for {script_entity}: {config}"
+            )
+            assert validate_script_sequence(
+                config.get("sequence", []), len(config.get("sequence", []))
+            ), f"Invalid sequence for {script_entity}"
+
+            verified_scripts.append((script_id, script_entity))
+            logger.info(f"✅ Verified: {script_entity} - {config.get('alias')}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to verify {script_entity}: {e}")
+    return verified_scripts
+
+
 @pytest.mark.script
 @pytest.mark.cleanup
 class TestScriptOrchestration:
@@ -258,7 +289,7 @@ class TestScriptOrchestration:
 
         async with MCPAssertions(mcp_client) as mcp:
             # 1. CREATE: Basic delay script
-            create_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_config_set_script",
                 {
                     "script_id": script_id,
@@ -287,8 +318,16 @@ class TestScriptOrchestration:
 
             # 3. GET: Verify script configuration
             get_data = await mcp.call_tool_success(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
+            )
+
+            # Issue #1334: returned ``script_id`` is the canonical storage
+            # key. For inputs already in canonical form (as here), it must
+            # round-trip unchanged so callers can thread the result back
+            # into ha_config_set_script / ha_config_remove_script.
+            assert get_data.get("script_id") == script_id, (
+                f"Expected canonical script_id={script_id!r} in get response, "
+                f"got {get_data.get('script_id')!r}"
             )
 
             config = extract_script_config(get_data)
@@ -303,7 +342,7 @@ class TestScriptOrchestration:
             logger.info("✅ Script configuration verified")
 
             # 4. EXECUTE: Run the script
-            execute_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_call_service",
                 {"domain": "script", "service": "turn_on", "entity_id": script_entity},
             )
@@ -323,16 +362,15 @@ class TestScriptOrchestration:
                 )
 
             # 6. DELETE: Clean up script
-            delete_data = await mcp.call_tool_success(
-                "ha_config_remove_script",
-                { "script_id": script_id}
+            await mcp.call_tool_success(
+                "ha_config_remove_script", {"script_id": script_id}
             )
             logger.info("✅ Script deleted successfully")
 
             # 7. VERIFY: Script no longer exists
-            final_get_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_get_script",
-                { "script_id": script_id},
+                {"script_id": script_id},
                 expected_error="not found",
             )
             logger.info("✅ Script deletion verified")
@@ -352,7 +390,7 @@ class TestScriptOrchestration:
 
         async with MCPAssertions(mcp_client) as mcp:
             # 1. CREATE: Script that controls a light
-            create_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_config_set_script",
                 {
                     "script_id": script_id,
@@ -392,8 +430,7 @@ class TestScriptOrchestration:
 
             # 3. VERIFY: Configuration contains correct service calls
             get_data = await mcp.call_tool_success(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
 
             config = extract_script_config(get_data)
@@ -438,7 +475,7 @@ class TestScriptOrchestration:
             logger.info(f"💡 Initial light state: {initial_state}")
 
             # Execute the script
-            execute_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_call_service",
                 {"domain": "script", "service": "turn_on", "entity_id": script_entity},
             )
@@ -455,9 +492,8 @@ class TestScriptOrchestration:
             logger.info(f"💡 Final light state: {final_state}")
 
             # 4. CLEANUP: Delete script
-            delete_data = await mcp.call_tool_success(
-                "ha_config_remove_script",
-                { "script_id": script_id}
+            await mcp.call_tool_success(
+                "ha_config_remove_script", {"script_id": script_id}
             )
             logger.info("✅ Service call script cleaned up")
 
@@ -474,7 +510,7 @@ class TestScriptOrchestration:
 
         async with MCPAssertions(mcp_client) as mcp:
             # 1. CREATE: Script with input fields and templating
-            create_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_config_set_script",
                 {
                     "script_id": script_id,
@@ -517,8 +553,7 @@ class TestScriptOrchestration:
             # 2. VERIFY: Configuration includes fields and templating
 
             get_data = await mcp.call_tool_success(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
 
             config = extract_script_config(get_data)
@@ -560,7 +595,7 @@ class TestScriptOrchestration:
             test_message = "E2E Test Message"
             test_delay = 2
 
-            execute_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_call_service",
                 {
                     "domain": "script",
@@ -589,9 +624,8 @@ class TestScriptOrchestration:
                 logger.info(f"🔄 Script execution state: {script_state}")
 
             # 4. CLEANUP: Delete script
-            delete_data = await mcp.call_tool_success(
-                "ha_config_remove_script",
-                { "script_id": script_id}
+            await mcp.call_tool_success(
+                "ha_config_remove_script", {"script_id": script_id}
             )
             logger.info("✅ Parameterized script cleaned up")
 
@@ -615,9 +649,9 @@ class TestScriptOrchestration:
                 "mode": "single",
             }
 
-            create_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_config_set_script",
-                { "script_id": script_id, "config": initial_config},
+                {"script_id": script_id, "config": initial_config},
             )
 
             script_entity = f"script.{script_id}"
@@ -627,8 +661,7 @@ class TestScriptOrchestration:
             # 2. VERIFY: Initial configuration
 
             get_data = await mcp.call_tool_success(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
 
             initial_retrieved = extract_script_config(get_data)
@@ -660,17 +693,16 @@ class TestScriptOrchestration:
                 "mode": "restart",
             }
 
-            update_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_config_set_script",
-                { "script_id": script_id, "config": updated_config},
+                {"script_id": script_id, "config": updated_config},
             )
             logger.info("✅ Script updated successfully")
 
             # 4. VERIFY: Updated configuration
 
             updated_get_data = await mcp.call_tool_success(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
 
             updated_retrieved = extract_script_config(updated_get_data)
@@ -699,17 +731,15 @@ class TestScriptOrchestration:
             logger.info("✅ Updated configuration verified")
 
             # 5. EXECUTE: Test updated script
-            execute_data = await mcp.call_tool_success(
+            await mcp.call_tool_success(
                 "ha_call_service",
                 {"domain": "script", "service": "turn_on", "entity_id": script_entity},
             )
             logger.info("✅ Updated script executed successfully")
 
-
             # 6. CLEANUP: Delete script
-            delete_data = await mcp.call_tool_success(
-                "ha_config_remove_script",
-                { "script_id": script_id}
+            await mcp.call_tool_success(
+                "ha_config_remove_script", {"script_id": script_id}
             )
             logger.info("✅ Updated script cleaned up")
 
@@ -757,11 +787,9 @@ class TestScriptOrchestration:
                 if mode in ["queued", "parallel"]:
                     create_config["max"] = 3
 
-                create_data = await mcp.call_tool_success(
+                await mcp.call_tool_success(
                     "ha_config_set_script",
-                    {
-                        "script_id": script_id,
-                        "config": create_config},
+                    {"script_id": script_id, "config": create_config},
                 )
 
                 script_entity = f"script.{script_id}"
@@ -769,13 +797,11 @@ class TestScriptOrchestration:
                 created_scripts.append((script_id, script_entity, mode))
                 logger.info(f"✅ Created {mode} mode script: {script_entity}")
 
-
             # VERIFY: All scripts created with correct modes
 
-            for script_id, script_entity, expected_mode in created_scripts:
+            for script_id, _script_entity, expected_mode in created_scripts:
                 get_data = await mcp.call_tool_success(
-                    "ha_config_get_script",
-                    { "script_id": script_id}
+                    "ha_config_get_script", {"script_id": script_id}
                 )
 
                 config = extract_script_config(get_data)
@@ -798,12 +824,11 @@ class TestScriptOrchestration:
             logger.info("✅ All execution modes verified")
 
             # EXECUTE: Test each mode with timeout protection
-            execution_tasks = []
-            for script_id, script_entity, mode in created_scripts:
+            for _script_id, script_entity, mode in created_scripts:
                 logger.info(f"🚀 Testing execution of {mode} mode script...")
 
                 # Execute the script
-                execute_data = await mcp.call_tool_success(
+                await mcp.call_tool_success(
                     "ha_call_service",
                     {
                         "domain": "script",
@@ -817,7 +842,7 @@ class TestScriptOrchestration:
                 if mode in ["queued", "parallel"]:
                     logger.info(f"🔄 Testing concurrent execution for {mode} mode...")
                     # Execute again immediately to test mode behavior
-                    execute_data2 = await mcp.call_tool_success(
+                    await mcp.call_tool_success(
                         "ha_call_service",
                         {
                             "domain": "script",
@@ -827,15 +852,13 @@ class TestScriptOrchestration:
                     )
                     logger.info(f"✅ Second execution initiated for {mode} mode")
 
-
             # Allow all executions to complete with generous timeout
             logger.info("⏳ Allowing all script executions to complete...")
 
             # CLEANUP: Delete all test scripts
             for script_id, script_entity, mode in created_scripts:
-                delete_data = await mcp.call_tool_success(
-                    "ha_config_remove_script",
-                    { "script_id": script_id}
+                await mcp.call_tool_success(
+                    "ha_config_remove_script", {"script_id": script_id}
                 )
                 logger.debug(f"🗑️ Deleted {mode} script: {script_entity}")
 
@@ -898,9 +921,9 @@ class TestScriptOrchestration:
             logger.info(f"🚀 Creating {len(scripts_to_create)} scripts...")
             for script_id, config in scripts_to_create:
                 try:
-                    create_data = await mcp.call_tool_success(
+                    await mcp.call_tool_success(
                         "ha_config_set_script",
-                        { "script_id": script_id, "config": config},
+                        {"script_id": script_id, "config": config},
                     )
 
                     script_entity = f"script.{script_id}"
@@ -913,7 +936,6 @@ class TestScriptOrchestration:
                     logger.error(f"❌ Failed to create {script_id}: {e}")
                     failed_scripts.append((script_id, str(e)))
 
-
             if failed_scripts:
                 logger.warning(
                     f"⚠️ {len(failed_scripts)} scripts failed to create: {[s[0] for s in failed_scripts]}"
@@ -925,31 +947,7 @@ class TestScriptOrchestration:
 
             # 2. VERIFY: All successfully created scripts exist and have correct configurations
 
-            logger.info("🔍 Verifying all scripts exist...")
-            verified_scripts = []
-            for script_id, script_entity in created_scripts:
-                try:
-                    get_data = await mcp.call_tool_success(
-                        "ha_config_get_script",
-                        { "script_id": script_id}
-                    )
-
-                    config = extract_script_config(get_data)
-                    assert "alias" in config, (
-                        f"Alias missing for {script_entity}: {config}"
-                    )
-                    assert "sequence" in config, (
-                        f"Sequence missing for {script_entity}: {config}"
-                    )
-                    assert validate_script_sequence(
-                        config.get("sequence", []), len(config.get("sequence", []))
-                    ), f"Invalid sequence for {script_entity}"
-
-                    verified_scripts.append((script_id, script_entity))
-                    logger.info(f"✅ Verified: {script_entity} - {config.get('alias')}")
-
-                except Exception as e:
-                    logger.error(f"❌ Failed to verify {script_entity}: {e}")
+            verified_scripts = await _verify_bulk_scripts(mcp, created_scripts)
 
             # 3. EXECUTE: Bulk execution of verified scripts
             logger.info(
@@ -959,7 +957,7 @@ class TestScriptOrchestration:
             executed_scripts = []
             for script_id, script_entity in verified_scripts:
                 try:
-                    execute_data = await mcp.call_tool_success(
+                    await mcp.call_tool_success(
                         "ha_call_service",
                         {
                             "domain": "script",
@@ -984,16 +982,14 @@ class TestScriptOrchestration:
 
             for script_id, script_entity in created_scripts:
                 try:
-                    delete_data = await mcp.call_tool_success(
-                        "ha_config_remove_script",
-                        { "script_id": script_id}
+                    await mcp.call_tool_success(
+                        "ha_config_remove_script", {"script_id": script_id}
                     )
                     deleted_scripts.append((script_id, script_entity))
                     logger.debug(f"🗑️ Deleted: {script_entity}")
                 except Exception as e:
                     logger.error(f"❌ Failed to delete {script_entity}: {e}")
                     failed_deletions.append((script_id, script_entity, str(e)))
-
 
             logger.info(
                 f"✅ Bulk deletion completed: {len(deleted_scripts)} deleted, {len(failed_deletions)} failed"
@@ -1016,16 +1012,16 @@ class TestScriptOrchestration:
 
         async with MCPAssertions(mcp_client) as mcp:
             # 1. TEST: Get non-existent script
-            nonexistent_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_get_script",
-                { "script_id": "nonexistent_script_xyz"},
+                {"script_id": "nonexistent_script_xyz"},
                 expected_error="not found",
             )
             logger.info("✅ Non-existent script properly handled")
 
             # 2. TEST: Invalid config (missing sequence)
             script_id = "test_invalid_config"
-            invalid_config_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_set_script",
                 {
                     "script_id": script_id,
@@ -1040,22 +1036,22 @@ class TestScriptOrchestration:
             logger.info("✅ Invalid config (missing sequence) properly rejected")
 
             # 3. TEST: Delete non-existent script
-            delete_nonexistent_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_remove_script",
-                { "script_id": "nonexistent_delete_xyz"},
+                {"script_id": "nonexistent_delete_xyz"},
                 expected_error="not found",
             )
             logger.info("✅ Delete non-existent script properly handled")
 
             # 4. TEST: Invalid script ID format
-            invalid_id_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_get_script",
-                { "script_id": "invalid.script.id.with.dots"},
+                {"script_id": "invalid.script.id.with.dots"},
             )
             logger.info("✅ Invalid script ID format properly handled")
 
             # 5. TEST: Invalid sequence structure (non-list)
-            invalid_sequence_data = await mcp.call_tool_failure(
+            await mcp.call_tool_failure(
                 "ha_config_set_script",
                 {
                     "script_id": "test_invalid_sequence",
@@ -1063,7 +1059,8 @@ class TestScriptOrchestration:
                         "alias": "Invalid Sequence Script",
                         "description": "Script with invalid sequence type",
                         "sequence": "not_a_list",  # Invalid sequence type
-                        "mode": "single"},
+                        "mode": "single",
+                    },
                 },
             )
             logger.info("✅ Invalid sequence type properly rejected")
@@ -1085,17 +1082,12 @@ async def test_script_search_and_discovery(mcp_client):
         # Search for existing scripts with enhanced error handling
         try:
             search_data = await mcp.call_tool_success(
-                "ha_search_entities",
+                "ha_search",
                 {"query": "script", "domain_filter": "script", "limit": 10},
             )
 
-            # Handle nested data structure
-            data = (
-                search_data.get("data", {}) if search_data.get("data") else search_data
-            )
-
-            if data.get("success") and data.get("results"):
-                results = data.get("results", [])
+            if search_data.get("success") and search_data.get("entities"):
+                results = search_data.get("entities", [])
                 logger.info(f"✅ Found {len(results)} existing scripts")
 
                 # Test getting configuration of first found script
@@ -1112,7 +1104,7 @@ async def test_script_search_and_discovery(mcp_client):
                     try:
                         get_data = await mcp.call_tool_success(
                             "ha_config_get_script",
-                            { "script_id": script_id},
+                            {"script_id": script_id},
                         )
 
                         config = extract_script_config(get_data)
@@ -1132,7 +1124,7 @@ async def test_script_search_and_discovery(mcp_client):
 
                     # Test search with more specific criteria
                     specific_search_data = await mcp.call_tool_success(
-                        "ha_search_entities",
+                        "ha_search",
                         {
                             "query": script_id[:5],  # First 5 chars of script ID
                             "domain_filter": "script",
@@ -1140,12 +1132,7 @@ async def test_script_search_and_discovery(mcp_client):
                         },
                     )
 
-                    specific_data = (
-                        specific_search_data.get("data", {})
-                        if specific_search_data.get("data")
-                        else specific_search_data
-                    )
-                    specific_results = specific_data.get("results", [])
+                    specific_results = specific_search_data.get("entities", [])
                     logger.info(
                         f"✅ Specific search found {len(specific_results)} matching scripts"
                     )
@@ -1216,11 +1203,11 @@ async def test_blueprint_script_lifecycle(
 
         # This should reach HA (proving our validation passed) even if HA rejects it
         # If our validation failed, we'd get a different error code
-        create_result = await mcp_client.call_tool(
+        create_parsed = await safe_call_tool(
+            mcp_client,
             "ha_config_set_script",
             {"script_id": "test_blueprint_script_e2e", "config": script_config},
         )
-        create_parsed = enhanced_parse_mcp_result(create_result)
 
         # Check if it was our validation or HA's validation that failed
         if not create_parsed.get("success"):
@@ -1230,7 +1217,9 @@ async def test_blueprint_script_lifecycle(
                 logger.info(
                     "✅ Our validation passed (config reached HA), HA rejected due to missing blueprint inputs as expected"
                 )
-                logger.info("✅ Blueprint script lifecycle test completed (validation works)")
+                logger.info(
+                    "✅ Blueprint script lifecycle test completed (validation works)"
+                )
                 return
             # If error is about missing sequence, our fix didn't work
             if "sequence" in error_msg.lower():
@@ -1247,7 +1236,7 @@ async def test_blueprint_script_lifecycle(
         logger.info(f"✅ Created blueprint script: {script_id}")
 
         # Step 4: Wait for script to be registered, then verify no sequence field
-        time.sleep(wait_for_script_registration())
+        await asyncio.sleep(wait_for_script_registration())
         get_result = await mcp.call_tool_success(
             "ha_config_get_script",
             {"script_id": script_id},
@@ -1273,7 +1262,7 @@ async def test_blueprint_script_with_empty_sequence(
     """
     logger.info("Testing blueprint script with empty sequence array...")
 
-    async with MCPAssertions(mcp_client) as mcp:
+    async with MCPAssertions(mcp_client):
         # Use the blueprint path from fixture
         blueprint_path = script_blueprint_path
 
@@ -1289,11 +1278,11 @@ async def test_blueprint_script_with_empty_sequence(
 
         # The key test: This should pass our validation (not fail with "missing sequence")
         # It will fail HA validation due to missing blueprint inputs, but that's expected
-        create_result = await mcp_client.call_tool(
+        create_parsed = await safe_call_tool(
+            mcp_client,
             "ha_config_set_script",
             {"script_id": "test_blueprint_empty_seq_e2e", "config": script_config},
         )
-        create_parsed = enhanced_parse_mcp_result(create_result)
 
         # If our validation works, it should reach HA (which will reject due to missing inputs)
         if not create_parsed.get("success"):

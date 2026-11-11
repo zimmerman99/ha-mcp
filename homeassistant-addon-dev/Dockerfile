@@ -4,7 +4,7 @@
 # WARNING: This is unstable and may break at any time
 
 # --- Build stage: install dependencies with uv ---
-FROM ghcr.io/astral-sh/uv:0.9.29-python3.13-bookworm-slim@sha256:3133feeeaa71f24379a7c0d37c0a01195d75cfe9369b2c6df1505817f7ff51cd AS builder
+FROM ghcr.io/astral-sh/uv:0.11.33-python3.13-trixie-slim@sha256:ddcc6242921ee120cf279fdcedfc8bb917c9af4de9ad791495e4c7deb479a296 AS builder
 
 WORKDIR /app
 
@@ -22,7 +22,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
 # --- Runtime stage: clean image without uv ---
-FROM python:3.13-slim-bookworm@sha256:8092ae2ef67061f9db412458dbdce44dbf16748fb3cae5cdbd020f467a9712d0
+FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7ecc23d0755e35f
 
 WORKDIR /app
 
@@ -42,5 +42,11 @@ LABEL \
     io.hass.version="${BUILD_VERSION}" \
     io.hass.type="addon" \
     io.hass.arch="${BUILD_ARCH}"
+
+# Propagate dev build version into the runtime so startup logs / bug reports can
+# surface e.g. '7.3.0.dev229' instead of the bare pyproject base version.
+# Stable addon builds leave BUILD_VERSION unset; ha_mcp._version.get_version()
+# then falls back to package metadata.
+ENV HA_MCP_BUILD_VERSION=${BUILD_VERSION}
 
 CMD ["python3", "/start.py"]

@@ -44,7 +44,11 @@ jobs:
       dev_version: ${{ steps.version.outputs.dev_version }}
       short_sha: ${{ steps.version.outputs.short_sha }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          # Full history: the dev version number is the commit count.
+          fetch-depth: 0
 
       - name: Generate dev version
         id: version
@@ -52,7 +56,15 @@ jobs:
           # Get base version from pyproject.toml
           BASE_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          DEV_VERSION="${BASE_VERSION}.dev${{ github.run_number }}"
+          # dev N = commit count on master: the same commit produces the SAME
+          # number in every workflow (PyPI/Docker in publish-dev, the dev
+          # add-on here), so all surfaces report one dev version. run_number
+          # was per-workflow, which is how the add-on drifted ~300 builds
+          # behind the PyPI counter and made version reports incomparable.
+          # Count origin/master (not HEAD): a workflow_dispatch on an older
+          # ref would otherwise mint a LOWER number that collides with an
+          # existing dev release and clobbers it.
+          DEV_VERSION="${BASE_VERSION}.dev$(git rev-list --count origin/master)"
 
           echo "dev_version=$DEV_VERSION" >> $GITHUB_OUTPUT
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
@@ -71,10 +83,13 @@ jobs:
     env:
       DEV_VERSION: ${{ needs.prepare.outputs.dev_version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          submodules: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Temporarily set package name and version for dev build
         run: |
@@ -94,7 +109,7 @@ jobs:
         run: uv build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
           skip-existing: true
@@ -107,27 +122,34 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          submodules: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image (dev tags)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ./Dockerfile
           push: true
+          # Do NOT push :latest from dev builds. :latest is reserved for stable
+          # releases (release-publish.yml pushes :latest + :stable together).
+          # Dev builds run on every push to master, so tagging :latest here
+          # clobbers the default tag with bleeding-edge dev between the biweekly
+          # stable releases. The dev channel is :dev (rolling) + :dev-<sha>. (#1475)
           tags: |
             ${{ env.REGISTRY }}/${{ github.repository }}:dev
-            ${{ env.REGISTRY }}/${{ github.repository }}:latest
             ${{ env.REGISTRY }}/${{ github.repository }}:dev-${{ needs.prepare.outputs.short_sha }}
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
@@ -142,7 +164,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Create pre-release
         env:
@@ -179,7 +203,7 @@ jobs:
 
           # Delete old pre-release with same tag if exists
           gh release delete "$TAG" --yes 2>/dev/null || true
-          git push origin --delete "$TAG" 2>/dev/null || true
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/$TAG" 2>/dev/null || true
 
           # Create new draft pre-release (binaries will be added by build-and-release workflow)
           gh release create "$TAG" \
@@ -221,6 +245,6 @@ jobs:
                 if [ -n "$tag" ]; then
                   echo "Deleting old dev release: $tag"
                   gh release delete "$tag" --yes --repo ${{ github.repository }} || true
-                  git push origin --delete "$tag" 2>/dev/null || true
+                  gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/$tag" 2>/dev/null || true
                 fi
               done

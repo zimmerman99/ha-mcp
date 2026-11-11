@@ -95,8 +95,7 @@ class TestEntityCleaner:
         """Clean up an automation entity."""
         try:
             delete_result = await self.client.call_tool(
-                "ha_config_remove_automation",
-                { "identifier": entity_id}
+                "ha_config_remove_automation", {"identifier": entity_id}
             )
 
             delete_data = parse_mcp_result(delete_result)
@@ -113,8 +112,7 @@ class TestEntityCleaner:
             script_id = entity_id.replace("script.", "")
 
             delete_result = await self.client.call_tool(
-                "ha_config_remove_script",
-                { "script_id": script_id}
+                "ha_config_remove_script", {"script_id": script_id}
             )
 
             delete_data = parse_mcp_result(delete_result)
@@ -131,11 +129,11 @@ class TestEntityCleaner:
             helper_id = entity_id.replace(f"{helper_type}.", "")
 
             delete_result = await self.client.call_tool(
-                "ha_config_remove_helper",
+                "ha_remove_helpers_integrations",
                 {
                     "helper_type": helper_type,
-                    "helper_id": helper_id,
-                    "name": "",  # Required but not used for delete
+                    "target": helper_id,
+                    "confirm": True,
                 },
             )
 
@@ -191,6 +189,70 @@ class TestEntityCleaner:
         logger.debug("📋 Cleared entity tracking")
 
 
+def _matching_test_entity_ids(
+    entities: list[dict[str, Any]], name_patterns: list[str]
+) -> list[str]:
+    """Return entity_ids whose id or friendly_name contains a test pattern."""
+    test_entities: list[str] = []
+    for entity in entities:
+        entity_id = entity.get("entity_id", "")
+        friendly_name = entity.get("friendly_name", "")
+
+        # Check if entity ID or name contains test patterns
+        for pattern in name_patterns:
+            pattern_lower = pattern.lower()
+            if (
+                pattern_lower in entity_id.lower()
+                or pattern_lower in friendly_name.lower()
+            ):
+                test_entities.append(entity_id)
+                break
+    return test_entities
+
+
+async def _cleanup_domain_test_entities(
+    mcp_client, domain: str, name_patterns: list[str]
+) -> tuple[int, int]:
+    """Search one domain and clean its test entities; return (found, cleaned)."""
+    found_count = 0
+    cleaned_count = 0
+
+    try:
+        # Search for entities in this domain
+        search_result = await mcp_client.call_tool(
+            "ha_search",
+            {"domain_filter": domain, "limit": 50},
+        )
+
+        search_data = parse_mcp_result(search_result)
+
+        if search_data.get("success") and search_data.get("entities"):
+            entities = search_data["entities"]
+
+            # Filter for test entities
+            test_entities = _matching_test_entity_ids(entities, name_patterns)
+
+            found_count = len(test_entities)
+
+            if test_entities:
+                logger.info(
+                    f"🔍 Found {found_count} test entities in {domain}: {test_entities[:3]}..."
+                )
+
+                # Attempt to clean up each test entity
+                cleaner = TestEntityCleaner(mcp_client)
+
+                for entity_id in test_entities:
+                    success = await cleaner.cleanup_entity(domain, entity_id)
+                    if success:
+                        cleaned_count += 1
+
+    except Exception as e:
+        logger.warning(f"⚠️ Error cleaning up {domain} entities: {e}")
+
+    return found_count, cleaned_count
+
+
 async def cleanup_test_entities_by_name(
     mcp_client, name_patterns: list[str]
 ) -> dict[str, int]:
@@ -220,54 +282,9 @@ async def cleanup_test_entities_by_name(
     results = {}
 
     for domain in domains_to_check:
-        found_count = 0
-        cleaned_count = 0
-
-        try:
-            # Search for entities in this domain
-            search_result = await mcp_client.call_tool(
-                "ha_search_entities",
-                {"query": "", "domain_filter": domain, "limit": 50},
-            )
-
-            search_data = parse_mcp_result(search_result)
-
-            if search_data.get("success") and search_data.get("results"):
-                entities = search_data["results"]
-
-                # Filter for test entities
-                test_entities = []
-                for entity in entities:
-                    entity_id = entity.get("entity_id", "")
-                    friendly_name = entity.get("friendly_name", "")
-
-                    # Check if entity ID or name contains test patterns
-                    for pattern in name_patterns:
-                        pattern_lower = pattern.lower()
-                        if (
-                            pattern_lower in entity_id.lower()
-                            or pattern_lower in friendly_name.lower()
-                        ):
-                            test_entities.append(entity_id)
-                            break
-
-                found_count = len(test_entities)
-
-                if test_entities:
-                    logger.info(
-                        f"🔍 Found {found_count} test entities in {domain}: {test_entities[:3]}..."
-                    )
-
-                    # Attempt to clean up each test entity
-                    cleaner = TestEntityCleaner(mcp_client)
-
-                    for entity_id in test_entities:
-                        success = await cleaner.cleanup_entity(domain, entity_id)
-                        if success:
-                            cleaned_count += 1
-
-        except Exception as e:
-            logger.warning(f"⚠️ Error cleaning up {domain} entities: {e}")
+        found_count, cleaned_count = await _cleanup_domain_test_entities(
+            mcp_client, domain, name_patterns
+        )
 
         if found_count > 0:
             results[domain] = {"found": found_count, "cleaned": cleaned_count}
@@ -294,8 +311,7 @@ async def verify_entity_cleanup(mcp_client, entity_id: str, entity_type: str) ->
         if entity_type == "automation":
             # Try to get automation config
             result = await mcp_client.call_tool(
-                "ha_config_get_automation",
-                { "identifier": entity_id}
+                "ha_config_get_automation", {"identifier": entity_id}
             )
 
             result_data = parse_mcp_result(result)
@@ -305,8 +321,7 @@ async def verify_entity_cleanup(mcp_client, entity_id: str, entity_type: str) ->
             # Try to get script config
             script_id = entity_id.replace("script.", "")
             result = await mcp_client.call_tool(
-                "ha_config_get_script",
-                { "script_id": script_id}
+                "ha_config_get_script", {"script_id": script_id}
             )
 
             result_data = parse_mcp_result(result)

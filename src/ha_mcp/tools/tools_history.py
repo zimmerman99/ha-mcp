@@ -2,25 +2,40 @@
 Historical data access tools for Home Assistant MCP server.
 
 This module provides tools for accessing historical data from Home Assistant's
-recorder component. It includes:
+recorder component via a single consolidated tool:
 
-1. ha_get_history - Retrieve raw state change history (short-term, full resolution)
-2. ha_get_statistics - Retrieve pre-aggregated long-term statistics for trend analysis
-
-These tools serve different but complementary purposes:
-- History: Raw state changes, ~10 days retention, full resolution
-- Statistics: Pre-aggregated data, permanent retention, hourly minimum resolution
+ha_get_history -- Retrieve historical data with source-selectable mode:
+  - source="history" (default): Raw state changes, ~10 day retention
+  - source="statistics": Pre-aggregated long-term statistics, permanent retention
 """
 
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
+from fastmcp import Context
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
 from pydantic import Field
 
-from .helpers import get_connected_ws_client, log_tool_usage
-from .util_helpers import add_timezone_metadata, coerce_int_param, parse_string_list_param
+from ..errors import ErrorCode, create_error_response, create_validation_error
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    safe_info,
+    safe_progress,
+)
+from .util_helpers import (
+    JSON_STRING_COERCION,
+    add_timezone_metadata,
+    build_pagination_metadata,
+    is_connection_error_message,
+    parse_string_list_param,
+    project_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,26 +109,54 @@ def parse_relative_time(time_str: str | None, default_hours: int = 24) -> dateti
         ) from e
 
 
-def register_history_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register historical data access tools with the MCP server."""
+# Source-dependent default look-back periods
+_DEFAULT_START_HOURS_BY_SOURCE: dict[str, int] = {"history": 24, "statistics": 30 * 24}
 
-    # Default and maximum limits for history entries
-    DEFAULT_HISTORY_LIMIT = 100
-    MAX_HISTORY_LIMIT = 1000
+# Default and maximum limits for history entries
+_DEFAULT_HISTORY_LIMIT = 100
+_MAX_HISTORY_LIMIT = 1000
 
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["history"], "title": "Get Entity History"})
+
+class HistoryTools:
+    """Historical data access tools for Home Assistant."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @tool(
+        name="ha_get_history",
+        tags={"History & Statistics"},
+        annotations={
+            "openWorldHint": False,
+            "idempotentHint": True,
+            "readOnlyHint": True,
+            "title": "Get Entity History or Statistics",
+        },
+    )
     @log_tool_usage
     async def ha_get_history(
+        self,
         entity_ids: Annotated[
             str | list[str],
+            JSON_STRING_COERCION,
             Field(
                 description="Entity ID(s) to query. Can be a single ID, comma-separated string, or JSON array."
             ),
         ],
+        source: Annotated[
+            Literal["history", "statistics"],
+            Field(
+                description=(
+                    'Data source: "history" (default) for raw state changes (~10 day retention), '
+                    'or "statistics" for pre-aggregated long-term data (permanent, requires state_class).'
+                ),
+                default="history",
+            ),
+        ] = "history",
         start_time: Annotated[
             str | None,
             Field(
-                description="Start time: ISO datetime or relative (e.g., '24h', '7d', '2w'). Default: 24h ago",
+                description="Start time: ISO datetime or relative (e.g., '24h', '7d', '30d'). Default: 24h ago for history, 30d ago for statistics",
                 default=None,
             ),
         ] = None,
@@ -124,594 +167,666 @@ def register_history_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 default=None,
             ),
         ] = None,
+        # History-specific (ignored when source="statistics")
         minimal_response: Annotated[
             bool,
             Field(
-                description="Return only states/timestamps without attributes. Default: true",
+                description='Return only states/timestamps without attributes. Default: true. Ignored when source="statistics"',
                 default=True,
             ),
         ] = True,
         significant_changes_only: Annotated[
             bool,
             Field(
-                description="Filter to significant state changes only. Default: true",
+                description='Filter to significant state changes only. Default: true. Ignored when source="statistics"',
                 default=True,
             ),
         ] = True,
         limit: Annotated[
-            int | str | None,
+            int | None,
             Field(
-                description="Max state changes per entity. Default: 100, Max: 1000",
+                description='Max entries per entity. Default: 100, Max: 1000. For source="history": state changes. For source="statistics": aggregated rows. With multiple entity_ids, offset must be 0 and total rows returned can reach limit × len(entity_ids).',
                 default=None,
+                ge=1,
+                le=1000,
             ),
         ] = None,
-    ) -> dict[str, Any]:
-        """
-        Retrieve raw state change history for entities (last ~10 days).
-
-        Returns the full-resolution state history from Home Assistant's recorder.
-        This data shows every individual state change for the specified entities.
-
-        **Data Characteristics:**
-        - Full resolution: Every state transition captured
-        - Retention: ~10 days (configurable via recorder.purge_keep_days)
-        - Best for: Troubleshooting, pattern analysis, specific event queries
-
-        **Parameters:**
-        - entity_ids: Entity ID(s) to query (required)
-        - start_time: Start of period - ISO datetime or relative ('24h', '7d', '2w'). Default: 24h ago
-        - end_time: End of period - ISO datetime. Default: now
-        - minimal_response: Omit attributes for smaller response. Default: true
-        - significant_changes_only: Filter to actual state changes. Default: true
-        - limit: Max entries per entity. Default: 100, Max: 1000
-
-        **Use Cases:**
-        - "Why was my bedroom cold last night?" - Query temperature sensor history
-        - "Did my garage door open while I was away?" - Check cover state changes
-        - "What time does motion usually trigger?" - Analyze binary sensor patterns
-        - "Debug automation triggers" - See exact state change sequence
-
-        **Example:**
-        ```python
-        # Get temperature history for the last 24 hours
-        ha_get_history(entity_ids="sensor.bedroom_temperature")
-
-        # Get multiple entity history for last 7 days
-        ha_get_history(
-            entity_ids=["sensor.temperature", "sensor.humidity"],
-            start_time="7d",
-            limit=500
-        )
-
-        # Get full attributes for debugging
-        ha_get_history(
-            entity_ids="light.living_room",
-            start_time="2025-01-25T00:00:00Z",
-            end_time="2025-01-26T00:00:00Z",
-            minimal_response=False
-        )
-        ```
-
-        **Note:** For long-term trends (>10 days), use ha_get_statistics() instead.
-
-        **Returns:**
-        - List of entities with their state history
-        - Each entity includes: entity_id, period, states array, count
-        """
-        try:
-            # Parse entity_ids - handle string, list, or comma-separated
-            if isinstance(entity_ids, str):
-                if entity_ids.startswith("["):
-                    # JSON array string
-                    parsed_ids = parse_string_list_param(entity_ids, "entity_ids")
-                    if parsed_ids is None:
-                        return {
-                            "success": False,
-                            "error": "entity_ids is required",
-                            "suggestions": ["Provide at least one entity ID"],
-                        }
-                    entity_id_list = parsed_ids
-                elif "," in entity_ids:
-                    # Comma-separated string
-                    entity_id_list = [e.strip() for e in entity_ids.split(",") if e.strip()]
-                else:
-                    # Single entity ID
-                    entity_id_list = [entity_ids.strip()]
-            else:
-                entity_id_list = entity_ids
-
-            if not entity_id_list:
-                return {
-                    "success": False,
-                    "error": "entity_ids is required",
-                    "suggestions": ["Provide at least one entity ID"],
-                }
-
-            # Parse time parameters
-            try:
-                start_dt = parse_relative_time(start_time, default_hours=24)
-            except ValueError as e:
-                return {
-                    "success": False,
-                    "error": str(e),
-                    "suggestions": [
-                        "Use ISO format: '2025-01-25T00:00:00Z'",
-                        "Use relative format: '24h', '7d', '2w', '1m'",
-                    ],
-                }
-
-            if end_time:
-                try:
-                    end_dt = parse_relative_time(end_time, default_hours=0)
-                except ValueError as e:
-                    return {
-                        "success": False,
-                        "error": str(e),
-                        "suggestions": ["Use ISO format: '2025-01-26T00:00:00Z'"],
-                    }
-            else:
-                end_dt = datetime.now(UTC)
-
-            # Apply limit constraints with string coercion for AI tools
-            try:
-                effective_limit = coerce_int_param(
-                    limit,
-                    param_name="limit",
-                    default=DEFAULT_HISTORY_LIMIT,
-                    min_value=1,
-                    max_value=MAX_HISTORY_LIMIT,
-                )
-                if effective_limit is None:
-                    effective_limit = DEFAULT_HISTORY_LIMIT
-            except ValueError as e:
-                return {
-                    "success": False,
-                    "error": str(e),
-                    "suggestions": ["Provide limit as an integer (e.g., 100)"],
-                }
-
-            # Connect to WebSocket
-            ws_client, error = await get_connected_ws_client(
-                client.base_url, client.token
-            )
-            if error or ws_client is None:
-                return error or {
-                    "success": False,
-                    "error": "Failed to establish WebSocket connection",
-                }
-
-            try:
-                # Build WebSocket command for history
-                # WebSocket command: history/history_during_period
-                command_params = {
-                    "start_time": start_dt.isoformat(),
-                    "end_time": end_dt.isoformat(),
-                    "entity_ids": entity_id_list,
-                    "minimal_response": minimal_response,
-                    "significant_changes_only": significant_changes_only,
-                    "no_attributes": minimal_response,
-                }
-
-                response = await ws_client.send_command(
-                    "history/history_during_period", **command_params
-                )
-
-                if not response.get("success"):
-                    error_msg = response.get("error", "Unknown error")
-                    return await add_timezone_metadata(
-                        client,
-                        {
-                            "success": False,
-                            "error": f"Failed to retrieve history: {error_msg}",
-                            "entity_ids": entity_id_list,
-                            "suggestions": [
-                                "Verify entity IDs exist using ha_search_entities()",
-                                "Check that entities are recorded (not excluded from recorder)",
-                                "Ensure time range is within recorder retention period (~10 days)",
-                            ],
-                        },
-                    )
-
-                # Process results
-                result_data = response.get("result", {})
-                entities_history = []
-
-                for entity_id in entity_id_list:
-                    entity_states = result_data.get(entity_id, [])
-
-                    # Apply limit per entity
-                    limited_states = entity_states[:effective_limit]
-
-                    # Format states for output
-                    formatted_states = []
-                    for state in limited_states:
-                        # Get timestamps - WebSocket returns short-form (lc/lu) as Unix epoch floats
-                        # or long-form (last_changed/last_updated) as strings
-                        # Note: HA WebSocket API omits 'lc' when it equals 'lu' (optimization)
-                        last_updated_raw = state.get("lu", state.get("last_updated"))
-                        last_changed_raw = state.get("lc", state.get("last_changed"))
-
-                        # If last_changed is missing, it means it equals last_updated
-                        if last_changed_raw is None and last_updated_raw is not None:
-                            last_changed_raw = last_updated_raw
-
-                        state_entry = {
-                            "state": state.get("s", state.get("state")),
-                            "last_changed": _convert_timestamp(last_changed_raw),
-                            "last_updated": _convert_timestamp(last_updated_raw),
-                        }
-                        if not minimal_response:
-                            state_entry["attributes"] = state.get("a", state.get("attributes", {}))
-                        formatted_states.append(state_entry)
-
-                    entities_history.append(
-                        {
-                            "entity_id": entity_id,
-                            "period": {
-                                "start": start_dt.isoformat(),
-                                "end": end_dt.isoformat(),
-                            },
-                            "states": formatted_states,
-                            "count": len(formatted_states),
-                            "total_available": len(entity_states),
-                            "truncated": len(entity_states) > effective_limit,
-                        }
-                    )
-
-                history_data = {
-                    "success": True,
-                    "entities": entities_history,
-                    "period": {
-                        "start": start_dt.isoformat(),
-                        "end": end_dt.isoformat(),
-                    },
-                    "query_params": {
-                        "minimal_response": minimal_response,
-                        "significant_changes_only": significant_changes_only,
-                        "limit": effective_limit,
-                    },
-                }
-
-                return await add_timezone_metadata(client, history_data)
-
-            finally:
-                if ws_client:
-                    await ws_client.disconnect()
-
-        except Exception as e:
-            logger.error(f"Failed to get history: {e}")
-            error_data = {
-                "success": False,
-                "error": f"Failed to retrieve history: {str(e)}",
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "Verify entity IDs are correct",
-                    "Ensure recorder component is enabled",
-                ],
-            }
-            return await add_timezone_metadata(client, error_data)
-
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["history"], "title": "Get Statistics"})
-    @log_tool_usage
-    async def ha_get_statistics(
-        entity_ids: Annotated[
-            str | list[str],
+        offset: Annotated[
+            int | None,
             Field(
-                description="Entity ID(s) to query. Must have state_class attribute. Can be single ID, comma-separated, or JSON array."
-            ),
-        ],
-        start_time: Annotated[
-            str | None,
-            Field(
-                description="Start time: ISO datetime or relative (e.g., '30d', '6m', '12m'). Default: 30d ago",
+                description="Number of entries to skip per entity for pagination. Default: 0. Offset > 0 requires a single entity_id. Use with limit and has_more/next_offset in the response.",
                 default=None,
+                ge=0,
             ),
         ] = None,
-        end_time: Annotated[
-            str | None,
-            Field(
-                description="End time: ISO datetime. Default: now",
-                default=None,
-            ),
-        ] = None,
+        # Statistics-specific (ignored when source="history")
         period: Annotated[
             str,
             Field(
-                description="Aggregation period: '5minute', 'hour', 'day', 'week', 'month'. Default: 'day'",
+                description='Aggregation period: "5minute", "hour", "day", "week", "month", "year". Default: "day". Ignored when source="history"',
                 default="day",
             ),
         ] = "day",
         statistic_types: Annotated[
             str | list[str] | None,
+            JSON_STRING_COERCION,
             Field(
-                description="Statistics types: 'mean', 'min', 'max', 'sum', 'state', 'change'. Default: all",
+                description='Statistics types: "mean", "min", "max", "sum", "state", "change". Default: all. Ignored when source="history"',
                 default=None,
             ),
         ] = None,
+        order: Annotated[
+            Literal["asc", "desc"],
+            Field(
+                default="desc",
+                description=(
+                    'Sort order for history entries. "desc" (default): newest first. '
+                    '"asc": oldest first (chronological, as returned by HA API). '
+                    'Ignored when source="statistics".'
+                ),
+            ),
+        ] = "desc",
+        fields: Annotated[
+            str | list[str] | None,
+            JSON_STRING_COERCION,
+            Field(
+                default=None,
+                description=(
+                    "Return only the specified top-level response keys to reduce "
+                    "response size. None = full response (default). "
+                    "History keys: success, source, entities, period, query_params. "
+                    "Statistics keys: success, source, entities, period_type, time_range, "
+                    "statistic_types, query_params, warnings."
+                ),
+            ),
+        ] = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
-        Retrieve pre-aggregated long-term statistics for trend analysis.
+        Retrieve historical data from Home Assistant's recorder.
 
-        Returns aggregated statistical data from Home Assistant's long-term statistics
-        table. This data is pre-computed and stored permanently, allowing analysis
-        of historical trends beyond the standard ~10 day recorder retention.
+        **Sources:**
+        - "history" (default): Raw state changes, ~10 day retention, full resolution
+        - "statistics": Pre-aggregated data, permanent retention, requires state_class
 
-        **Data Characteristics:**
-        - Pre-aggregated: Hourly/daily/monthly statistics
-        - Retention: Permanent - never purged
-        - Entities: Only those with state_class (measurement, total, total_increasing)
-        - Best for: Long-term trends, energy consumption, period comparisons
+        **Shared params:** entity_ids, start_time, end_time, limit, offset
+        **History params:** minimal_response, significant_changes_only
+        **Statistics params:** period, statistic_types
 
-        **Parameters:**
-        - entity_ids: Entity ID(s) with state_class attribute (required)
-        - start_time: Start of period - ISO datetime or relative ('30d', '6m', '12m'). Default: 30d ago
-        - end_time: End of period - ISO datetime. Default: now
-        - period: Aggregation: '5minute', 'hour', 'day', 'week', 'month'. Default: 'day'
-        - statistic_types: Types to include: 'mean', 'min', 'max', 'sum', 'state', 'change'. Default: all
+        **Default time range:** 24h for history, 30 days for statistics
 
-        **Statistic Types Explained:**
-        - mean: Average value over the period
-        - min: Minimum value during the period
-        - max: Maximum value during the period
-        - sum: Running total (for total_increasing entities like energy)
-        - state: Last known state value
-        - change: Change from previous period
+        **Use ha_get_history (default) when:**
+        - Troubleshooting why a value changed ("Why was my bedroom cold last night?")
+        - Checking event sequences ("Did my garage door open while I was away?")
+        - Analyzing recent patterns ("What time does motion usually trigger?")
 
-        **Use Cases:**
-        - "How much electricity did I use this month vs last month?" - Monthly sum
-        - "What's my average living room temperature?" - Daily/monthly mean
-        - "Show daily energy consumption for the past 2 weeks" - Daily sum
-        - "Has my solar production declined year over year?" - Monthly comparison
+        **Use ha_get_history(source="statistics") when:**
+        - Tracking long-term trends beyond 10 days ("Energy use this month vs last month?")
+        - Computing period averages ("Average living room temperature over 6 months?")
+        - Entities must have state_class (measurement, total, total_increasing)
 
-        **Example:**
+        **WARNING:** limit and offset apply per entity (not globally across all entities).
+        All data is fetched from HA before slicing; limit/offset are client-side.
+        With multiple entity_ids, offset must be 0 — use a single entity_id for offset > 0.
+        Use has_more and next_offset from the response to paginate.
+
+        **Example -- history (default):**
         ```python
-        # Get daily energy statistics for last 30 days
-        ha_get_statistics(entity_ids="sensor.total_energy_kwh")
-
-        # Get monthly temperature averages for 6 months
-        ha_get_statistics(
-            entity_ids="sensor.living_room_temperature",
-            start_time="6m",
-            period="month",
-            statistic_types=["mean", "min", "max"]
-        )
-
-        # Compare multiple sensors
-        ha_get_statistics(
-            entity_ids=["sensor.solar_production", "sensor.grid_consumption"],
-            start_time="12m",
-            period="month",
-            statistic_types=["sum"]
-        )
+        ha_get_history(entity_ids="sensor.bedroom_temperature", start_time="24h")
+        ha_get_history(entity_ids=["sensor.temperature", "sensor.humidity"], start_time="7d", limit=500)
+        # Default order="desc" returns newest states first.
+        # To paginate oldest-first, use order="asc":
+        ha_get_history(entity_ids="sensor.temperature", start_time="7d", limit=100, offset=100, order="asc")
         ```
 
-        **Note:** Only entities with state_class attribute support statistics.
-        Use ha_search_entities() to find entities and check their state_class.
-
-        **Returns:**
-        - List of entities with their statistics
-        - Each includes: entity_id, period type, statistics array, unit_of_measurement
+        **Example -- statistics:**
+        ```python
+        ha_get_history(source="statistics", entity_ids="sensor.total_energy_kwh", start_time="30d", period="day")
+        ha_get_history(source="statistics", entity_ids="sensor.living_room_temperature",
+                       start_time="6m", period="month", statistic_types=["mean", "min", "max"])
+        ha_get_history(source="statistics", entity_ids="sensor.energy_kwh",
+                       start_time="30d", period="5minute", limit=100, offset=200)
+        ```
         """
+        parsed_fields: list[str] | None = None
+        if fields is not None:
+            try:
+                parsed_fields = parse_string_list_param(
+                    fields, "fields", allow_csv=True
+                )
+            except ValueError as exc:
+                raise_tool_error(create_validation_error(str(exc), parameter="fields"))
         try:
             # Parse entity_ids
-            if isinstance(entity_ids, str):
-                if entity_ids.startswith("["):
-                    parsed_ids = parse_string_list_param(entity_ids, "entity_ids")
-                    if parsed_ids is None:
-                        return {
-                            "success": False,
-                            "error": "entity_ids is required",
-                            "suggestions": [
-                                "Provide at least one entity ID with state_class attribute"
-                            ],
-                        }
-                    entity_id_list = parsed_ids
-                elif "," in entity_ids:
-                    entity_id_list = [e.strip() for e in entity_ids.split(",") if e.strip()]
-                else:
-                    entity_id_list = [entity_ids.strip()]
-            else:
-                entity_id_list = entity_ids
+            entity_id_list = _parse_entity_ids(entity_ids)
 
-            if not entity_id_list:
-                return {
-                    "success": False,
-                    "error": "entity_ids is required",
-                    "suggestions": [
-                        "Provide at least one entity ID with state_class attribute"
-                    ],
-                }
-
-            # Parse time parameters (default 30 days for statistics)
-            try:
-                start_dt = parse_relative_time(start_time, default_hours=30 * 24)
-            except ValueError as e:
-                return {
-                    "success": False,
-                    "error": str(e),
-                    "suggestions": [
-                        "Use ISO format: '2025-01-01T00:00:00Z'",
-                        "Use relative format: '30d', '6m', '12m'",
-                    ],
-                }
-
-            if end_time:
-                try:
-                    end_dt = parse_relative_time(end_time, default_hours=0)
-                except ValueError as e:
-                    return {
-                        "success": False,
-                        "error": str(e),
-                        "suggestions": ["Use ISO format: '2025-01-31T23:59:59Z'"],
-                    }
-            else:
-                end_dt = datetime.now(UTC)
-
-            # Validate period
-            valid_periods = ["5minute", "hour", "day", "week", "month"]
-            if period not in valid_periods:
-                return {
-                    "success": False,
-                    "error": f"Invalid period: {period}",
-                    "valid_periods": valid_periods,
-                    "suggestions": [f"Use one of: {', '.join(valid_periods)}"],
-                }
-
-            # Parse statistic_types
-            stat_types_list = None
-            if statistic_types:
-                if isinstance(statistic_types, str):
-                    if statistic_types.startswith("["):
-                        stat_types_list = parse_string_list_param(
-                            statistic_types, "statistic_types"
-                        )
-                    elif "," in statistic_types:
-                        stat_types_list = [
-                            s.strip() for s in statistic_types.split(",") if s.strip()
-                        ]
-                    else:
-                        stat_types_list = [statistic_types.strip()]
-                else:
-                    stat_types_list = statistic_types
-
-                # Validate statistic types
-                valid_types = ["mean", "min", "max", "sum", "state", "change"]
-                if stat_types_list is None:
-                    stat_types_list = []
-                invalid_types = [t for t in stat_types_list if t not in valid_types]
-                if invalid_types:
-                    return {
-                        "success": False,
-                        "error": f"Invalid statistic types: {invalid_types}",
-                        "valid_types": valid_types,
-                        "suggestions": [f"Use one or more of: {', '.join(valid_types)}"],
-                    }
-
-            # Connect to WebSocket
-            ws_client, error = await get_connected_ws_client(
-                client.base_url, client.token
-            )
-            if error or ws_client is None:
-                return error or {
-                    "success": False,
-                    "error": "Failed to establish WebSocket connection",
-                }
-
-            try:
-                # Build WebSocket command for statistics
-                # WebSocket command: recorder/statistics_during_period
-                command_params: dict[str, Any] = {
-                    "start_time": start_dt.isoformat(),
-                    "end_time": end_dt.isoformat(),
-                    "statistic_ids": entity_id_list,
-                    "period": period,
-                }
-
-                if stat_types_list is not None:
-                    command_params["types"] = stat_types_list
-
-                response = await ws_client.send_command(
-                    "recorder/statistics_during_period", **command_params
+            # Offset > 0 is only supported for single-entity requests.
+            # build_pagination_metadata applies per entity — limit=100 across
+            # 5 entities returns up to 500 rows with no top-level has_more signal.
+            _effective_offset = offset if offset is not None else 0
+            if _effective_offset > 0 and len(entity_id_list) > 1:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "offset > 0 requires a single entity_id",
+                        context={"offset": offset, "entity_count": len(entity_id_list)},
+                        suggestions=[
+                            "Use a single entity_id when offset > 0, or use offset=0 for multi-entity requests."
+                        ],
+                    )
                 )
 
-                if not response.get("success"):
-                    error_msg = response.get("error", "Unknown error")
-                    return await add_timezone_metadata(
-                        client,
-                        {
-                            "success": False,
-                            "error": f"Failed to retrieve statistics: {error_msg}",
-                            "entity_ids": entity_id_list,
-                            "suggestions": [
-                                "Verify entities have state_class attribute (measurement, total, total_increasing)",
-                                "Use ha_search_entities() to check entity attributes",
-                                "Statistics are only available for entities that track numeric values",
-                            ],
-                        },
-                    )
+            # Source-dependent default hours
+            default_hours = _DEFAULT_START_HOURS_BY_SOURCE[source]
 
-                # Process results
-                result_data = response.get("result", {})
-                entities_statistics = []
+            # Parse time parameters
+            start_dt, end_dt = _parse_time_range(start_time, end_time, default_hours)
 
-                for entity_id in entity_id_list:
-                    entity_stats = result_data.get(entity_id, [])
+            await safe_info(
+                ctx,
+                f"ha_get_history starting: source={source} "
+                f"entities={len(entity_id_list)} "
+                f"window={start_dt.isoformat()}..{end_dt.isoformat()}",
+            )
+            await safe_progress(
+                ctx,
+                progress=0,
+                total=3,
+                message="connecting to Home Assistant WebSocket",
+            )
 
-                    # Format statistics for output
-                    formatted_stats = []
-                    unit = None
+            await safe_progress(
+                ctx,
+                progress=1,
+                total=3,
+                message=f"querying recorder ({source})",
+            )
 
-                    for stat in entity_stats:
-                        stat_entry: dict[str, Any] = {
-                            "start": stat.get("start"),
-                        }
+            # Route through the shared pooled WebSocket (issue #1813) instead of
+            # a dedicated connect/auth handshake per call. Each source issues a
+            # single request/response WS command; the pooled client owns the
+            # connection lifecycle, so there is no per-call connect/disconnect.
+            if source == "statistics":
+                inner = await _fetch_statistics(
+                    self._client,
+                    entity_id_list,
+                    start_dt,
+                    end_dt,
+                    period,
+                    statistic_types,
+                    limit,
+                    offset,
+                )
+            else:
+                inner = await _fetch_history(
+                    self._client,
+                    entity_id_list,
+                    start_dt,
+                    end_dt,
+                    minimal_response,
+                    significant_changes_only,
+                    limit,
+                    offset,
+                    _DEFAULT_HISTORY_LIMIT,
+                    _MAX_HISTORY_LIMIT,
+                    order=order,
+                )
+            await safe_progress(
+                ctx,
+                progress=3,
+                total=3,
+                message="recorder query complete",
+            )
+            # Wrap first so the outer {"data": ..., "metadata": ...} shape
+            # is always present; then project the inner data dict in-place
+            # when caller requested field projection.
+            _r = await add_timezone_metadata(self._client, inner)
+            if parsed_fields is not None:
+                _r["data"] = project_fields(_r["data"], parsed_fields)
+            return _r
 
-                        # Include requested statistic types (or all if not specified)
-                        for stat_type in stat_types_list or [
-                            "mean",
-                            "min",
-                            "max",
-                            "sum",
-                            "state",
-                            "change",
-                        ]:
-                            if stat_type in stat:
-                                stat_entry[stat_type] = stat[stat_type]
-
-                        # Capture unit from first stat
-                        if unit is None and "unit_of_measurement" in stat:
-                            unit = stat["unit_of_measurement"]
-
-                        formatted_stats.append(stat_entry)
-
-                    entities_statistics.append(
-                        {
-                            "entity_id": entity_id,
-                            "period": period,
-                            "statistics": formatted_stats,
-                            "count": len(formatted_stats),
-                            "unit_of_measurement": unit,
-                        }
-                    )
-
-                # Check if any entities had no statistics
-                empty_entities: list[str] = [
-                    str(e["entity_id"]) for e in entities_statistics if e["count"] == 0
-                ]
-
-                statistics_data: dict[str, Any] = {
-                    "success": True,
-                    "entities": entities_statistics,
-                    "period_type": period,
-                    "time_range": {
-                        "start": start_dt.isoformat(),
-                        "end": end_dt.isoformat(),
-                    },
-                    "statistic_types": stat_types_list
-                    or ["mean", "min", "max", "sum", "state", "change"],
-                }
-
-                if empty_entities:
-                    statistics_data["warnings"] = [
-                        f"No statistics found for: {', '.join(empty_entities)}. "
-                        "These entities may not have state_class attribute or may not have recorded data yet."
-                    ]
-
-                return await add_timezone_metadata(client, statistics_data)
-
-            finally:
-                if ws_client:
-                    await ws_client.disconnect()
-
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Failed to get statistics: {e}")
-            error_data = {
-                "success": False,
-                "error": f"Failed to retrieve statistics: {str(e)}",
-                "suggestions": [
+            if source == "statistics":
+                suggestions = [
                     "Check Home Assistant connection",
                     "Verify entities have state_class attribute",
                     "Ensure recorder component is enabled with statistics",
+                ]
+            else:
+                suggestions = [
+                    "Check Home Assistant connection",
+                    "Verify entity IDs are correct",
+                    "Ensure recorder component is enabled",
+                ]
+            exception_to_structured_error(e, suggestions=suggestions)
+            return (
+                None  # exception_to_structured_error always raises; explicit for CodeQL
+            )
+
+
+def register_history_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register historical data access tools with the MCP server."""
+    register_tool_methods(mcp, HistoryTools(client))
+
+
+def _parse_entity_ids(entity_ids: str | list[str]) -> list[str]:
+    """Parse entity_ids parameter into a list of strings."""
+    if isinstance(entity_ids, str):
+        if entity_ids.startswith("["):
+            # Belt-and-suspenders: JSON_STRING_COERCION on the param already
+            # parses a JSON-array string to a list upstream, so a string reaching
+            # here is normally CSV/single. This branch stays as a fallback.
+            parsed_ids = parse_string_list_param(entity_ids, "entity_ids")
+            if parsed_ids is None:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_MISSING_PARAMETER,
+                        "entity_ids is required",
+                        suggestions=["Provide at least one entity ID"],
+                    )
+                )
+            return parsed_ids
+        elif "," in entity_ids:
+            result = [e.strip() for e in entity_ids.split(",") if e.strip()]
+            if not result:
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_MISSING_PARAMETER,
+                        "entity_ids is required",
+                        suggestions=["Provide at least one entity ID"],
+                    )
+                )
+            return result
+        else:
+            return [entity_ids.strip()]
+    if not entity_ids:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.VALIDATION_MISSING_PARAMETER,
+                "entity_ids is required",
+                suggestions=["Provide at least one entity ID"],
+            )
+        )
+
+    return entity_ids
+
+
+def _parse_time_range(
+    start_time: str | None,
+    end_time: str | None,
+    default_hours: int,
+) -> tuple[datetime, datetime]:
+    """Parse start_time and end_time into datetime objects."""
+    try:
+        start_dt = parse_relative_time(start_time, default_hours=default_hours)
+    except ValueError as e:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.VALIDATION_INVALID_PARAMETER,
+                str(e),
+                context={"parameter": "start_time"},
+                suggestions=[
+                    "Use ISO format: '2025-01-25T00:00:00Z'",
+                    "Use relative format: '24h', '7d', '2w', '1m'",
                 ],
+            )
+        )
+
+    if end_time:
+        try:
+            end_dt = parse_relative_time(end_time, default_hours=0)
+        except ValueError as e:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    str(e),
+                    context={"parameter": "end_time"},
+                    suggestions=["Use ISO format: '2025-01-26T00:00:00Z'"],
+                )
+            )
+    else:
+        end_dt = datetime.now(UTC)
+
+    return start_dt, end_dt
+
+
+def _raise_recorder_ws_failure(
+    kind: str,
+    error_msg: str,
+    entity_id_list: list[str],
+    suggestions: list[str],
+) -> None:
+    """Raise the structured error for a failed recorder WS call.
+
+    The pooled ``send_websocket_message`` collapses transport failures into
+    ``{"success": False, "error": ...}`` — classify connection-shaped errors
+    as CONNECTION_FAILED (retry/connectivity guidance) instead of presenting
+    recorder-retention suggestions during an HA restart or WS outage.
+    """
+    if is_connection_error_message(error_msg):
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.CONNECTION_FAILED,
+                f"Failed to retrieve {kind}: {error_msg}",
+                context={"entity_ids": entity_id_list},
+                suggestions=[
+                    "Home Assistant may be restarting or unreachable — retry shortly",
+                    "Check the connection to Home Assistant",
+                ],
+            )
+        )
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.SERVICE_CALL_FAILED,
+            f"Failed to retrieve {kind}: {error_msg}",
+            context={"entity_ids": entity_id_list},
+            suggestions=suggestions,
+        )
+    )
+
+
+async def _fetch_history(
+    client: Any,
+    entity_id_list: list[str],
+    start_dt: datetime,
+    end_dt: datetime,
+    minimal_response: bool,
+    significant_changes_only: bool,
+    limit: int | None,
+    offset: int | None,
+    default_limit: int,
+    max_limit: int,
+    order: str = "desc",
+) -> dict[str, Any]:
+    """Execute the history/history_during_period WebSocket call.
+
+    *order* controls state-list ordering: ``"desc"`` (default) returns the
+    newest states first; ``"asc"`` returns the oldest first.
+
+    Returns the unwrapped history dict; the caller is responsible for projection
+    and wrapping with ``add_timezone_metadata``.
+    """
+    effective_limit = min(limit, max_limit) if limit is not None else default_limit
+    effective_offset = offset if offset is not None else 0
+
+    command_params = {
+        "start_time": start_dt.isoformat(),
+        "end_time": end_dt.isoformat(),
+        "entity_ids": entity_id_list,
+        "minimal_response": minimal_response,
+        "significant_changes_only": significant_changes_only,
+        "no_attributes": minimal_response,
+    }
+
+    response = await client.send_websocket_message(
+        {"type": "history/history_during_period", **command_params}
+    )
+
+    if not response.get("success"):
+        _raise_recorder_ws_failure(
+            "history",
+            response.get("error", "Unknown error"),
+            entity_id_list,
+            suggestions=[
+                "Verify entity IDs exist using ha_search()",
+                "Check that entities are recorded (not excluded from recorder)",
+                "Ensure time range is within recorder retention period (~10 days)",
+            ],
+        )
+
+    result_data = response.get("result", {})
+    entities_history = []
+
+    for entity_id in entity_id_list:
+        entity_states = result_data.get(entity_id, [])
+        if order == "desc":
+            entity_states = list(reversed(entity_states))
+        paged_states = entity_states[
+            effective_offset : effective_offset + effective_limit
+        ]
+
+        formatted_states = []
+        for state in paged_states:
+            last_updated_raw = state.get("lu", state.get("last_updated"))
+            last_changed_raw = state.get("lc", state.get("last_changed"))
+            if last_changed_raw is None and last_updated_raw is not None:
+                last_changed_raw = last_updated_raw
+
+            state_entry = {
+                "state": state.get("s", state.get("state")),
+                "last_changed": _convert_timestamp(last_changed_raw),
+                "last_updated": _convert_timestamp(last_updated_raw),
             }
-            return await add_timezone_metadata(client, error_data)
+            if not minimal_response:
+                state_entry["attributes"] = state.get("a", state.get("attributes", {}))
+            formatted_states.append(state_entry)
+
+        pagination = build_pagination_metadata(
+            total_count=len(entity_states),
+            offset=effective_offset,
+            limit=effective_limit,
+            count=len(formatted_states),
+        )
+        entities_history.append(
+            {
+                "entity_id": entity_id,
+                "period": {
+                    "start": start_dt.isoformat(),
+                    "end": end_dt.isoformat(),
+                },
+                "states": formatted_states,
+                **pagination,
+            }
+        )
+
+    history_data = {
+        "success": True,
+        "source": "history",
+        "entities": entities_history,
+        "period": {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        },
+        "query_params": {
+            "minimal_response": minimal_response,
+            "significant_changes_only": significant_changes_only,
+            "limit": effective_limit,
+            "offset": effective_offset,
+            "order": order,
+        },
+    }
+
+    return history_data
+
+
+def _parse_statistic_types(
+    statistic_types: str | list[str] | None,
+) -> list[str] | None:
+    """Parse and validate the statistic_types param into a list (or None for all)."""
+    stat_types_list: list[str] | None = None
+    if statistic_types is not None:
+        if isinstance(statistic_types, str):
+            if statistic_types.startswith("["):
+                stat_types_list = parse_string_list_param(
+                    statistic_types, "statistic_types"
+                )
+            elif "," in statistic_types:
+                stat_types_list = [
+                    s.strip() for s in statistic_types.split(",") if s.strip()
+                ]
+            else:
+                stat_types_list = [statistic_types.strip()]
+        else:
+            stat_types_list = list(statistic_types)
+
+        valid_types = ["mean", "min", "max", "sum", "state", "change"]
+        assert stat_types_list is not None
+        if not stat_types_list:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "statistic_types cannot be an empty list. "
+                    "Omit the parameter to retrieve all types, or specify at least one valid type.",
+                    context={"parameter": "statistic_types", "value": statistic_types},
+                    suggestions=[f"Use one or more of: {', '.join(valid_types)}"],
+                )
+            )
+        invalid_types = [t for t in stat_types_list if t not in valid_types]
+        if invalid_types:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Invalid statistic types: {invalid_types}",
+                    context={
+                        "invalid_types": invalid_types,
+                        "valid_types": valid_types,
+                    },
+                    suggestions=[f"Use one or more of: {', '.join(valid_types)}"],
+                )
+            )
+    return stat_types_list
+
+
+def _format_entity_statistics(
+    result_data: dict[str, Any],
+    entity_id_list: list[str],
+    all_stat_types: list[str],
+    period: str,
+    effective_offset: int,
+    effective_limit: int,
+) -> list[dict[str, Any]]:
+    """Format the per-entity statistics rows from a statistics_during_period result."""
+    entities_statistics = []
+    for entity_id in entity_id_list:
+        entity_stats = result_data.get(entity_id, [])
+        paged_stats = entity_stats[
+            effective_offset : effective_offset + effective_limit
+        ]
+        formatted_stats = []
+        unit = None
+
+        for stat in paged_stats:
+            stat_entry: dict[str, Any] = {"start": stat.get("start")}
+            for stat_type in all_stat_types:
+                if stat_type in stat:
+                    stat_entry[stat_type] = stat[stat_type]
+            if unit is None and "unit_of_measurement" in stat:
+                unit = stat["unit_of_measurement"]
+            formatted_stats.append(stat_entry)
+
+        pagination = build_pagination_metadata(
+            total_count=len(entity_stats),
+            offset=effective_offset,
+            limit=effective_limit,
+            count=len(formatted_stats),
+        )
+        entities_statistics.append(
+            {
+                "entity_id": entity_id,
+                "period": period,
+                "statistics": formatted_stats,
+                "unit_of_measurement": unit,
+                **pagination,
+            }
+        )
+    return entities_statistics
+
+
+async def _fetch_statistics(
+    client: Any,
+    entity_id_list: list[str],
+    start_dt: datetime,
+    end_dt: datetime,
+    period: str,
+    statistic_types: str | list[str] | None,
+    limit: int | None,
+    offset: int | None,
+) -> dict[str, Any]:
+    """Execute the recorder/statistics_during_period WebSocket call.
+
+    Returns the unwrapped statistics dict; the caller is responsible for projection
+    and wrapping with ``add_timezone_metadata``.
+    """
+    effective_limit = limit if limit is not None else _DEFAULT_HISTORY_LIMIT
+    effective_offset = offset if offset is not None else 0
+
+    # Validate period
+    valid_periods = ["5minute", "hour", "day", "week", "month", "year"]
+    if period not in valid_periods:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.VALIDATION_INVALID_PARAMETER,
+                f"Invalid period: {period}",
+                context={"period": period, "valid_periods": valid_periods},
+                suggestions=[f"Use one of: {', '.join(valid_periods)}"],
+            )
+        )
+
+    stat_types_list = _parse_statistic_types(statistic_types)
+
+    command_params: dict[str, Any] = {
+        "start_time": start_dt.isoformat(),
+        "end_time": end_dt.isoformat(),
+        "statistic_ids": entity_id_list,
+        "period": period,
+    }
+    if stat_types_list is not None:
+        command_params["types"] = stat_types_list
+
+    response = await client.send_websocket_message(
+        {"type": "recorder/statistics_during_period", **command_params}
+    )
+
+    if not response.get("success"):
+        _raise_recorder_ws_failure(
+            "statistics",
+            response.get("error", "Unknown error"),
+            entity_id_list,
+            suggestions=[
+                "Verify entities have state_class attribute (measurement, total, total_increasing)",
+                "Use ha_search() to check entity attributes",
+                "Statistics are only available for entities that track numeric values",
+            ],
+        )
+
+    result_data = response.get("result", {})
+    all_stat_types = stat_types_list or ["mean", "min", "max", "sum", "state", "change"]
+    entities_statistics = _format_entity_statistics(
+        result_data,
+        entity_id_list,
+        all_stat_types,
+        period,
+        effective_offset,
+        effective_limit,
+    )
+
+    empty_entities: list[str] = [
+        str(e["entity_id"]) for e in entities_statistics if e["count"] == 0
+    ]
+
+    statistics_data: dict[str, Any] = {
+        "success": True,
+        "source": "statistics",
+        "entities": entities_statistics,
+        "period_type": period,
+        "time_range": {
+            "start": start_dt.isoformat(),
+            "end": end_dt.isoformat(),
+        },
+        "statistic_types": all_stat_types,
+        "query_params": {
+            "statistic_types": stat_types_list,
+            "limit": effective_limit,
+            "offset": effective_offset,
+        },
+    }
+
+    if empty_entities:
+        statistics_data["warnings"] = [
+            f"No statistics found for: {', '.join(empty_entities)}. "
+            "These entities may not have state_class attribute or may not have recorded data yet."
+        ]
+
+    return statistics_data

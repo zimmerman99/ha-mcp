@@ -22,11 +22,11 @@ uv run hamcp-test-env --no-interactive
 ### Direct pytest
 
 ```bash
-# All E2E tests
-uv run pytest tests/src/e2e/ -v
+# All E2E tests (parallel — 2 workers)
+uv run pytest tests/src/e2e/ -n2 --dist loadscope -v
 
 # Fast tests only
-uv run pytest tests/src/e2e/ -v -m "not slow"
+uv run pytest tests/src/e2e/ -n2 --dist loadscope -v -m "not slow"
 
 # Specific categories
 uv run pytest tests/src/e2e/basic/ -v               # Basic connectivity
@@ -50,7 +50,7 @@ Replace `branchname` with the branch you want to exercise (for example,
 `feature/manual-test-instructions`). If you are working from a fork, swap
 `homeassistant-ai` with your GitHub username to target your repository in both
 commands. When using these commands, adapt the corresponding `uvx` setup in
-[README.md → Method 3: Running Python with UV](../README.md#method-3-running-python-with-uv)
+[README.md → Other install methods](../README.md#other-install-methods)
 so your environment variables and client configuration match the guidance in the
 main installation instructions. This ensures your manual testing matches the
 code under review.

@@ -2,14 +2,16 @@
 E2E tests for integration management tools.
 """
 
+import json
 import logging
 
 import pytest
 
-from tests.src.e2e.utilities.assertions import (
-    assert_mcp_failure,
+from ...utilities.assertions import (
     assert_mcp_success,
+    safe_call_tool,
 )
+from ...utilities.wait_helpers import wait_for_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +42,7 @@ class TestIntegrationManagement:
 
         # DISABLE
         disable_result = await mcp_client.call_tool(
-            "ha_set_integration_enabled", {"entry_id": entry_id, "enabled": False}
+            "ha_set_integration", {"entry_id": entry_id, "enabled": False}
         )
         assert_mcp_success(disable_result, "Disable integration")
 
@@ -54,7 +56,7 @@ class TestIntegrationManagement:
 
         # RE-ENABLE
         enable_result = await mcp_client.call_tool(
-            "ha_set_integration_enabled", {"entry_id": entry_id, "enabled": True}
+            "ha_set_integration", {"entry_id": entry_id, "enabled": True}
         )
         assert_mcp_success(enable_result, "Re-enable integration")
 
@@ -64,64 +66,214 @@ class TestIntegrationManagement:
         )
         data = assert_mcp_success(list_result, "List after enable")
         entry = next(e for e in data["entries"] if e["entry_id"] == entry_id)
-        assert (
-            entry["disabled_by"] is None
-        ), "Integration should not be disabled after re-enable"
-
-    async def test_set_integration_enabled_string_bool(self, mcp_client):
-        """Test that enabled parameter accepts string booleans."""
-        # Find suitable integration
-        list_result = await mcp_client.call_tool("ha_get_integration", {})
-        data = assert_mcp_success(list_result, "List integrations")
-
-        test_entry = None
-        for entry in data.get("entries", []):
-            if entry.get("supports_unload") and entry.get("state") == "loaded":
-                test_entry = entry
-                break
-
-        if not test_entry:
-            pytest.skip("No suitable integration found for testing")
-
-        entry_id = test_entry["entry_id"]
-
-        # Test with string "false"
-        disable_result = await mcp_client.call_tool(
-            "ha_set_integration_enabled", {"entry_id": entry_id, "enabled": "false"}
+        assert entry["disabled_by"] is None, (
+            "Integration should not be disabled after re-enable"
         )
-        assert_mcp_success(disable_result, "Disable with string false")
-
-        # Test with string "true"
-        enable_result = await mcp_client.call_tool(
-            "ha_set_integration_enabled", {"entry_id": entry_id, "enabled": "true"}
-        )
-        assert_mcp_success(enable_result, "Enable with string true")
 
     async def test_delete_config_entry_requires_confirm(self, mcp_client):
         """Test deletion safety check."""
-        result = await mcp_client.call_tool(
-            "ha_delete_config_entry", {"entry_id": "fake_id", "confirm": False}
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_remove_helpers_integrations",
+            {"target": "fake_id", "confirm": False},
         )
-        data = assert_mcp_failure(result, "Delete without confirm")
-        assert "not confirmed" in data.get("error", "").lower()
+        assert not data.get("success"), "Delete without confirm should fail"
+        error = data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "not confirmed" in error_msg.lower()
 
-    async def test_delete_config_entry_string_confirm(self, mcp_client):
-        """Test that confirm parameter accepts string booleans."""
-        # Test with string "false" - should fail
-        result = await mcp_client.call_tool(
-            "ha_delete_config_entry", {"entry_id": "fake_id", "confirm": "false"}
+    async def test_delete_config_entry_create_delete_cycle(self, mcp_client):
+        """Test full create → verify → delete → verify-gone cycle.
+
+        Regression test: the config-entry delete path previously used the WebSocket
+        command ``config_entries/delete`` which HA does not support, returning
+        "Unknown command".  The fix switches to the REST API endpoint.
+        """
+        # Create a temporary light group helper
+        config = {
+            "group_type": "light",
+            "name": "test_delete_regression_e2e",
+            "entities": [],
+            "hide_members": False,
+        }
+
+        create_result = await mcp_client.call_tool(
+            "ha_config_set_helper",
+            {
+                "helper_type": "group",
+                "name": "test_delete_regression_e2e",
+                "config": config,
+            },
         )
-        data = assert_mcp_failure(result, "Delete with string false")
-        assert "not confirmed" in data.get("error", "").lower()
+        data = assert_mcp_success(create_result, "Create light group for delete test")
+        entry_id = data["entry_id"]
+        logger.info(f"Created temporary group helper: {entry_id}")
+
+        # Wait until the entry is registered
+        await wait_for_tool_result(
+            mcp_client,
+            tool_name="ha_get_integration",
+            arguments={"entry_id": entry_id},
+            predicate=lambda d: d.get("success") is True,
+            description="group helper is registered",
+        )
+
+        # Delete the entry
+        delete_result = await mcp_client.call_tool(
+            "ha_remove_helpers_integrations",
+            {"target": entry_id, "confirm": True},
+        )
+        delete_data = assert_mcp_success(delete_result, "Delete config entry")
+        assert delete_data.get("success") is True
+        assert delete_data.get("entry_id") == entry_id
+        logger.info(f"Deleted config entry: {entry_id}")
+
+        # Verify the entry is gone
+        verify_data = await safe_call_tool(
+            mcp_client,
+            "ha_get_integration",
+            {"entry_id": entry_id},
+        )
+        assert not verify_data.get("success", False), (
+            f"Config entry {entry_id} should not exist after deletion"
+        )
 
     async def test_set_integration_enabled_nonexistent(self, mcp_client):
         """Test error handling for non-existent integration."""
-        from tests.src.e2e.utilities.assertions import parse_mcp_result
-
-        result = await mcp_client.call_tool(
-            "ha_set_integration_enabled",
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_integration",
             {"entry_id": "nonexistent_entry_id", "enabled": True},
         )
         # Should fail - either through validation or API error
-        data = parse_mcp_result(result)
         assert not data.get("success", False)
+
+    async def test_add_integration_and_update_options_cycle(self, mcp_client):
+        """Add-mode + options-mode round-trip via ha_set_integration (#1814).
+
+        Uses the ``group`` domain because it is always present in the test
+        container and its config flow exercises both a menu step
+        (``group_type``) and a form step through the generic (non-helper)
+        driver. The mechanics are identical for any integration domain —
+        unlike ha_config_set_helper, the tool does not gate the handler on
+        the helper allowlist.
+        """
+        # ADD: drive the config flow (menu -> form -> create_entry)
+        create_result = await mcp_client.call_tool(
+            "ha_set_integration",
+            {
+                "domain": "group",
+                "config": {
+                    "group_type": "light",
+                    "name": "test_set_integration_add_e2e",
+                    "entities": [],
+                    "hide_members": False,
+                },
+            },
+        )
+        data = assert_mcp_success(create_result, "Add integration via config flow")
+        entry_id = data["entry_id"]
+        assert data["domain"] == "group"
+
+        try:
+            # Wait until the entry is registered
+            await wait_for_tool_result(
+                mcp_client,
+                tool_name="ha_get_integration",
+                arguments={"entry_id": entry_id},
+                predicate=lambda d: d.get("success") is True,
+                description="added integration entry is registered",
+            )
+
+            # UPDATE OPTIONS: drive the options flow on the same entry
+            update_result = await mcp_client.call_tool(
+                "ha_set_integration",
+                {
+                    "entry_id": entry_id,
+                    "config": {"entities": [], "hide_members": True},
+                },
+            )
+            update_data = assert_mcp_success(
+                update_result, "Update integration options via options flow"
+            )
+            assert update_data.get("updated") is True
+            assert update_data.get("entry_id") == entry_id
+
+            # Verify the option persisted (single-entry mode probes options)
+            verify_data = await wait_for_tool_result(
+                mcp_client,
+                tool_name="ha_get_integration",
+                arguments={"entry_id": entry_id},
+                predicate=lambda d: (
+                    d.get("entry", {}).get("options", {}).get("hide_members") is True
+                ),
+                description="updated option is readable back",
+            )
+            assert verify_data["entry"]["options"]["hide_members"] is True
+        finally:
+            await safe_call_tool(
+                mcp_client,
+                "ha_remove_helpers_integrations",
+                {"target": entry_id, "confirm": True},
+            )
+
+    async def test_add_integration_unknown_domain_fails(self, mcp_client):
+        """Add mode surfaces a structured error for an unknown domain."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_integration",
+            {"domain": "definitely_not_a_real_domain_xyz"},
+        )
+        assert not data.get("success", False)
+
+    async def test_update_options_unsupported_entry_fails(self, mcp_client):
+        """Options mode surfaces a structured error when the entry has no
+        options flow (supports_options=false)."""
+        list_result = await mcp_client.call_tool("ha_get_integration", {})
+        data = assert_mcp_success(list_result, "List integrations")
+        no_options_entry = next(
+            (e for e in data.get("entries", []) if not e.get("supports_options")),
+            None,
+        )
+        if no_options_entry is None:
+            pytest.skip("No integration without options flow found")
+
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_set_integration",
+            {
+                "entry_id": no_options_entry["entry_id"],
+                "config": {"anything": True},
+            },
+        )
+        assert not result.get("success", False)
+
+    async def test_delete_config_entry_nonexistent_raises(self, mcp_client):
+        """
+        Pin the missing-target contract for the Path 3 (direct config
+        entry) branch: confirmed deletion of an entry that does not
+        exist raises RESOURCE_NOT_FOUND so a typo'd entry_id surfaces
+        at the caller layer instead of being silently masked as success.
+
+        Source path: confirm_bool=True bypasses the confirm guard;
+        delete_config_entry() reaches the HA REST API which returns 404
+        (HomeAssistantAPIError); _delete_direct_entry catches the 404
+        and raises RESOURCE_NOT_FOUND. Non-404 API errors surface as
+        different structured tool errors via exception_to_structured_error.
+        """
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_remove_helpers_integrations",
+            {"target": "nonexistent_entry_a7_e2e_xyz", "confirm": True},
+        )
+        assert data.get("success") is False, (
+            f"Expected raise for nonexistent entry_id, got: {data}"
+        )
+        assert data.get("error", {}).get("code") == "RESOURCE_NOT_FOUND", (
+            f"Expected RESOURCE_NOT_FOUND, got: {data!r}"
+        )
+        assert "already_deleted" not in json.dumps(data), (
+            f"Stale already_deleted marker leaked into error: {data!r}"
+        )

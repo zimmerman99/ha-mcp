@@ -10,11 +10,11 @@ The structured error format enables AI agents to:
 - Understand the context and details of failures
 """
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     """
     Standard error codes for Home Assistant MCP operations.
 
@@ -78,6 +78,52 @@ class ErrorCode(str, Enum):
     RESOURCE_ALREADY_EXISTS = "RESOURCE_ALREADY_EXISTS"
     RESOURCE_LOCKED = "RESOURCE_LOCKED"
 
+    # Image transport errors
+    IMAGE_PAYLOAD_TOO_LARGE = "IMAGE_PAYLOAD_TOO_LARGE"
+    IMAGE_SERIALIZATION_FAILED = "IMAGE_SERIALIZATION_FAILED"
+
+    # Component errors
+    COMPONENT_NOT_INSTALLED = "COMPONENT_NOT_INSTALLED"
+
+    # Code-mode sandbox errors. The sandbox is a separate execution
+    # context; runtime failures inside it map cleanly to one of these
+    # three buckets so the LLM can self-recover instead of seeing every
+    # failure as INTERNAL_ERROR.
+    SANDBOX_LIMIT_EXCEEDED = "SANDBOX_LIMIT_EXCEEDED"
+    SANDBOX_SYNTAX_UNSUPPORTED = "SANDBOX_SYNTAX_UNSUPPORTED"
+    SANDBOX_RUNTIME_ERROR = "SANDBOX_RUNTIME_ERROR"
+
+    # Tool security policy gating (#966). The middleware gates a tool
+    # call awaiting user approval, the user denied it, or the policy
+    # file itself failed to load (treated as a fail-closed safety stop).
+    USER_APPROVAL_REQUIRED = "USER_APPROVAL_REQUIRED"
+    USER_DENIED = "USER_DENIED"
+    POLICY_LOAD_FAILED = "POLICY_LOAD_FAILED"
+
+    # Read Only Mode (discussion #1569). A write operation was blocked
+    # because the server-wide Read Only Mode toggle is on.
+    READ_ONLY_MODE = "READ_ONLY_MODE"
+
+    # Strict mandatory best-practices gate (#1779). A gated write tool was
+    # blocked because strict mode is effective and the call did not carry
+    # the acknowledgment key published only in the best-practices skill
+    # content. Fail-closed: nothing was changed.
+    BPS_ACKNOWLEDGMENT_REQUIRED = "BPS_ACKNOWLEDGMENT_REQUIRED"
+
+    # Mandatory auto-backup (#1579). A write that requires a pre-write
+    # snapshot was blocked because the snapshot could not be captured
+    # (fetch failed, the snapshot write failed — e.g. disk full — or the
+    # backup directory is unusable). Fail-closed: nothing was changed.
+    BACKUP_CAPTURE_FAILED = "BACKUP_CAPTURE_FAILED"
+
+    # Entity visibility enforce mode (#2015). A read was refused because the
+    # opt-in visibility filter's enforce mode is active and the request would
+    # surface an entity the filter hides — either the tool's output references a
+    # hidden entity, or the tool's output cannot be scanned (screenshots, sandbox
+    # code). Direct reads of a hidden entity are concealed as ENTITY_NOT_FOUND
+    # instead; this code marks the refuse-on-contact case. No data was returned.
+    ENTITY_VISIBILITY_ENFORCED = "ENTITY_VISIBILITY_ENFORCED"
+
 
 # Default suggestions for common error codes
 DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
@@ -116,7 +162,7 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
         "Create a new token with required permissions",
     ],
     ErrorCode.ENTITY_NOT_FOUND: [
-        "Use ha_search_entities() to find correct entity ID",
+        "Use ha_search() to find correct entity ID",
         "Verify the entity exists in Home Assistant",
         "Check for typos in the entity ID",
     ],
@@ -127,14 +173,14 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
     ],
     ErrorCode.ENTITY_INVALID_ID: [
         "Entity ID must be in format: domain.name",
-        "Use ha_search_entities() to find valid entity IDs",
+        "Use ha_search() to find valid entity IDs",
     ],
     ErrorCode.ENTITY_DOMAIN_MISMATCH: [
         "Cannot change entity to a different domain",
         "Entity domain must match the original domain",
     ],
     ErrorCode.SERVICE_NOT_FOUND: [
-        "Use ha_get_domain_docs() to see available services",
+        "Use ha_get_skill_guide for documentation",
         "Check the service name spelling",
         "Verify the domain supports this service",
     ],
@@ -145,7 +191,7 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
     ErrorCode.SERVICE_INVALID_ACTION: [
         "Check available actions for this domain",
         "Common actions: turn_on, turn_off, toggle",
-        "Use ha_get_domain_docs() for service documentation",
+        "Use ha_get_skill_guide for documentation",
     ],
     ErrorCode.SERVICE_CALL_FAILED: [
         "Check the service parameters are correct",
@@ -158,7 +204,7 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
     ],
     ErrorCode.CONFIG_INVALID: [
         "Review the configuration format",
-        "Use ha_get_domain_docs() for configuration help",
+        "Use ha_get_skill_guide for configuration help",
     ],
     ErrorCode.CONFIG_MISSING_REQUIRED_FIELDS: [
         "Check documentation for required fields",
@@ -182,6 +228,10 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
         "An internal error occurred",
         "Check Home Assistant MCP server logs",
         "Report this issue if it persists",
+    ],
+    ErrorCode.COMPONENT_NOT_INSTALLED: [
+        "Install the required custom component via HACS",
+        "Restart Home Assistant after installation",
     ],
 }
 
@@ -219,13 +269,15 @@ def create_error_response(
                 "code": "ENTITY_NOT_FOUND",
                 "message": "Entity light.nonexistent not found",
                 "details": "No entity with this ID exists in Home Assistant",
-                "suggestion": "Use ha_search_entities() to find correct entity ID"
+                "suggestion": "Use ha_search() to find correct entity ID"
             },
             "entity_id": "light.nonexistent"
         }
     """
     # Use provided suggestions or fall back to defaults
-    error_suggestions = suggestions if suggestions else DEFAULT_SUGGESTIONS.get(code, [])
+    error_suggestions = (
+        suggestions if suggestions else DEFAULT_SUGGESTIONS.get(code, [])
+    )
 
     error_dict: dict[str, Any] = {
         "code": code.value,
@@ -257,20 +309,62 @@ def create_connection_error(
     message: str,
     details: str | None = None,
     timeout: bool = False,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a connection error response."""
     code = ErrorCode.CONNECTION_TIMEOUT if timeout else ErrorCode.CONNECTION_FAILED
-    return create_error_response(code, message, details)
+    return create_error_response(code, message, details, context=context)
+
+
+# Authentication-error suggestions for Home Assistant add-on installs. On the
+# add-on the token is managed by the Supervisor, not a user-editable
+# HOMEASSISTANT_TOKEN, so the default "verify your token / create a long-lived
+# token" guidance is a dead end. We deliberately do NOT assert a cause — issue
+# #1694's underlying cause was never reproduced or confirmed — so this points at
+# practical first steps and at where an auth problem actually surfaces
+# (home-assistant.log), without claiming to know why it happened.
+_ADDON_AUTH_INVALID_SUGGESTIONS: list[str] = [
+    "On a Home Assistant add-on install the access token is managed by the "
+    + "Supervisor, not a HOMEASSISTANT_TOKEN you can change",
+    "A Home Assistant Core restart (Settings -> System -> Restart) often "
+    + "clears transient WebSocket authentication failures — try that first",
+    "Check home-assistant.log for 'invalid authentication' or "
+    + "'InsecureKeyLengthWarning' around the time of the failure; if those "
+    + "appear, the problem is likely in Home Assistant's auth handling rather "
+    + "than ha-mcp's request — capture those lines when reporting",
+]
 
 
 def create_auth_error(
     message: str,
     details: str | None = None,
     expired: bool = False,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create an authentication error response."""
+    """Create an authentication error response.
+
+    On a Home Assistant add-on install (Supervisor-managed) the token is the
+    Supervisor token rather than a user-editable HOMEASSISTANT_TOKEN, so the
+    default token-centric suggestions don't apply. Substitute add-on-specific
+    guidance for an invalid token in that case (see issue #1694). Expired-token
+    errors keep the default guidance — token expiry is not the Supervisor-token
+    failure mode this swap targets.
+    """
     code = ErrorCode.AUTH_EXPIRED if expired else ErrorCode.AUTH_INVALID_TOKEN
-    return create_error_response(code, message, details)
+
+    suggestions: list[str] | None = None
+    if code is ErrorCode.AUTH_INVALID_TOKEN:
+        # Lazy import keeps this low-level module free of an import-time
+        # dependency on ._version; is_running_in_addon reads SUPERVISOR_TOKEN
+        # live so it reflects the current environment.
+        from ._version import is_running_in_addon
+
+        if is_running_in_addon():
+            suggestions = _ADDON_AUTH_INVALID_SUGGESTIONS
+
+    return create_error_response(
+        code, message, details, suggestions=suggestions, context=context
+    )
 
 
 def create_entity_not_found_error(
@@ -314,14 +408,20 @@ def create_validation_error(
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a validation error response."""
-    code = ErrorCode.VALIDATION_INVALID_JSON if invalid_json else ErrorCode.VALIDATION_FAILED
+    code = (
+        ErrorCode.VALIDATION_INVALID_JSON
+        if invalid_json
+        else ErrorCode.VALIDATION_FAILED
+    )
     # Build context, prioritizing explicit context but adding parameter if provided
     final_context: dict[str, Any] = {}
     if context:
         final_context.update(context)
     if parameter:
         final_context["parameter"] = parameter
-    return create_error_response(code, message, details, context=final_context if final_context else None)
+    return create_error_response(
+        code, message, details, context=final_context if final_context else None
+    )
 
 
 def create_config_error(
@@ -350,27 +450,19 @@ def create_timeout_error(
     operation: str,
     timeout_seconds: float,
     details: str | None = None,
+    context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create a timeout error response."""
+    final_context: dict[str, Any] = {}
+    if context:
+        final_context.update(context)
+    final_context["operation"] = operation
+    final_context["timeout_seconds"] = timeout_seconds
     return create_error_response(
         ErrorCode.TIMEOUT_OPERATION,
         f"Operation '{operation}' timed out after {timeout_seconds}s",
         details=details,
-        context={"operation": operation, "timeout_seconds": timeout_seconds},
-    )
-
-
-def create_resource_not_found_error(
-    resource_type: str,
-    identifier: str,
-    details: str | None = None,
-) -> dict[str, Any]:
-    """Create a resource not found error response."""
-    return create_error_response(
-        ErrorCode.RESOURCE_NOT_FOUND,
-        f"{resource_type} '{identifier}' not found",
-        details=details,
-        context={"resource_type": resource_type, "identifier": identifier},
+        context=final_context,
     )
 
 

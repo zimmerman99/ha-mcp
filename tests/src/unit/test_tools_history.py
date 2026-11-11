@@ -1,0 +1,477 @@
+"""Unit tests for ha_get_history tool exception handling."""
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from fastmcp.exceptions import ToolError
+
+from ha_mcp.client.rest_client import HomeAssistantConnectionError
+from ha_mcp.tools import tools_history
+from ha_mcp.tools.tools_history import HistoryTools
+
+
+@pytest.fixture(autouse=True)
+def _no_real_caps_probe():
+    """Keep the ``ha_mcp_tools/info`` caps probe from opening a real socket.
+
+    The mock clients here carry a real-looking ``base_url``/``token`` but
+    never patch ``get_websocket_client``, so ``get_component_caps`` (invoked
+    by ``add_timezone_metadata`` -> ``_fetch_ha_timezone`` for every test that
+    completes ``ha_get_history`` successfully) would otherwise attempt a real
+    WS connection and pay its full failure latency per test. Forcing a
+    ``HomeAssistantConnectionError`` reproduces the "component absent" outcome
+    these tests already assume (they mock the legacy ``client.get_config``
+    fallback) without the real connection attempt.
+    """
+    with patch(
+        "ha_mcp.tools.component_api.get_websocket_client",
+        AsyncMock(side_effect=HomeAssistantConnectionError("no WS in unit tests")),
+    ):
+        yield
+
+
+class TestHaGetHistoryExceptionSuggestions:
+    """Test that except Exception provides source-specific error suggestions."""
+
+    @pytest.fixture
+    def mock_client(self):
+        """Create a minimal mock HA client."""
+        client = MagicMock()
+        client.base_url = "http://homeassistant.local"
+        client.token = "test_token"
+        return client
+
+    @pytest.fixture
+    def history_tool(self, mock_client):
+        """Create HistoryTools instance and return ha_get_history."""
+        tools = HistoryTools(mock_client)
+        return tools.ha_get_history
+
+    @pytest.mark.asyncio
+    async def test_statistics_exception_includes_state_class_hint(
+        self, history_tool, mock_client
+    ):
+        """Unexpected exception with source=statistics surfaces state_class suggestion.
+
+        The pooled WS call now raises inside _fetch_statistics; the failure
+        propagates to ha_get_history's ``except Exception`` exactly as the old
+        dedicated-connection failure did.
+        """
+        mock_client.send_websocket_message = AsyncMock(
+            side_effect=RuntimeError("unexpected")
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await history_tool(entity_ids="sensor.test", source="statistics")
+
+        suggestions = json.loads(str(exc_info.value))["error"]["suggestions"]
+        assert any("state_class" in s for s in suggestions)
+
+    @pytest.mark.asyncio
+    async def test_history_exception_does_not_include_state_class_hint(
+        self, history_tool, mock_client
+    ):
+        """Unexpected exception with source=history does not surface state_class suggestion."""
+        mock_client.send_websocket_message = AsyncMock(
+            side_effect=RuntimeError("unexpected")
+        )
+        with pytest.raises(ToolError) as exc_info:
+            await history_tool(entity_ids="sensor.test", source="history")
+
+        suggestions = json.loads(str(exc_info.value))["error"]["suggestions"]
+        assert not any("state_class" in s for s in suggestions)
+        assert any("entity" in s.lower() for s in suggestions)
+
+
+# _fetch_history returns the unwrapped inner payload; ha_get_history then runs
+# project_fields and wraps with add_timezone_metadata at the call site.
+_HISTORY_INNER = {
+    "success": True,
+    "source": "history",
+    "entities": [{"entity_id": "sensor.temp", "states": []}],
+    "period": {
+        "start": "2025-01-01T00:00:00+00:00",
+        "end": "2025-01-02T00:00:00+00:00",
+    },
+    "query_params": {
+        "minimal_response": True,
+        "significant_changes_only": True,
+        "limit": 100,
+        "offset": 0,
+    },
+}
+
+
+class TestHaGetHistoryFieldsProjection:
+    """Unit tests for fields= projection in ha_get_history."""
+
+    @pytest.fixture
+    def mock_client(self):
+        client = MagicMock()
+        client.base_url = "http://homeassistant.local"
+        client.token = "test_token"
+        client.verify_ssl = True
+        # add_timezone_metadata is invoked at the projection call site and reads
+        # client.get_config(); mock it so the wrapper returns deterministically.
+        client.get_config = AsyncMock(return_value={"time_zone": "UTC"})
+        return client
+
+    @pytest.fixture
+    def history_tool(self, mock_client):
+        return HistoryTools(mock_client).ha_get_history
+
+    @pytest.mark.asyncio
+    async def test_no_fields_returns_full_response(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_HISTORY_INNER),
+            ),
+        ):
+            result = await history_tool(entity_ids="sensor.temp")
+        assert "data" in result
+        assert "metadata" in result
+        assert set(result["data"].keys()) == {
+            "success",
+            "source",
+            "entities",
+            "period",
+            "query_params",
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_field_projects_to_that_key_plus_success(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_HISTORY_INNER),
+            ),
+        ):
+            result = await history_tool(entity_ids="sensor.temp", fields=["entities"])
+        assert set(result["data"].keys()) == {"success", "entities"}
+        assert result["data"]["entities"][0]["entity_id"] == "sensor.temp"
+        assert "metadata" in result
+
+    @pytest.mark.asyncio
+    async def test_multiple_fields_projects_correctly(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_HISTORY_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.temp", fields=["source", "period"]
+            )
+        assert set(result["data"].keys()) == {"success", "source", "period"}
+        assert "metadata" in result
+
+    @pytest.mark.asyncio
+    async def test_success_always_present_regardless_of_fields(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_HISTORY_INNER),
+            ),
+        ):
+            result = await history_tool(entity_ids="sensor.temp", fields=["source"])
+        assert "success" in result["data"]
+        assert result["data"]["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_emits_warning(self, history_tool):
+        """Unknown fields key emits a diagnostic warning instead of being silently dropped."""
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_HISTORY_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.temp", fields=["nonexistent"]
+            )
+        data = result["data"]
+        assert data["success"] is True
+        assert "warnings" in data
+        assert any("nonexistent" in w for w in data["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_malformed_fields_raises_tool_error(self, history_tool):
+        with pytest.raises(ToolError):
+            await history_tool(entity_ids="sensor.temp", fields=123)
+
+    @pytest.mark.asyncio
+    async def test_bad_json_fields_raises_tool_error(self, history_tool):
+        with pytest.raises(ToolError):
+            await history_tool(entity_ids="sensor.temp", fields='["')
+
+
+_ORDER_INNER_STUB = {
+    "success": True,
+    "source": "history",
+    "entities": [{"entity_id": "sensor.temp", "states": []}],
+    "period": {
+        "start": "2025-01-01T00:00:00+00:00",
+        "end": "2025-01-02T00:00:00+00:00",
+    },
+    "query_params": {
+        "minimal_response": True,
+        "significant_changes_only": True,
+        "limit": 100,
+        "offset": 0,
+        "order": "desc",
+    },
+}
+
+_STATISTICS_INNER = {
+    "success": True,
+    "source": "statistics",
+    "entities": [{"entity_id": "sensor.energy", "statistics": []}],
+    "period_type": "hour",
+    "time_range": {
+        "start": "2025-01-01T00:00:00+00:00",
+        "end": "2025-01-02T00:00:00+00:00",
+    },
+    "statistic_types": ["mean"],
+    "query_params": {"limit": 100, "offset": 0},
+}
+
+
+class TestHaGetHistoryStatisticsFieldsProjection:
+    """Unit tests for fields= projection in ha_get_history with source='statistics'."""
+
+    @pytest.fixture
+    def mock_client(self):
+        client = MagicMock()
+        client.base_url = "http://homeassistant.local"
+        client.token = "test_token"
+        client.verify_ssl = True
+        client.get_config = AsyncMock(return_value={"time_zone": "UTC"})
+        return client
+
+    @pytest.fixture
+    def history_tool(self, mock_client):
+        return HistoryTools(mock_client).ha_get_history
+
+    @pytest.mark.asyncio
+    async def test_no_fields_returns_full_response(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=dict(_STATISTICS_INNER),
+            ),
+        ):
+            result = await history_tool(entity_ids="sensor.energy", source="statistics")
+        assert "data" in result
+        assert "metadata" in result
+        assert set(result["data"].keys()) == {
+            "success",
+            "source",
+            "entities",
+            "period_type",
+            "time_range",
+            "statistic_types",
+            "query_params",
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_field_projection(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=dict(_STATISTICS_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields=["entities"]
+            )
+        assert set(result["data"].keys()) == {"success", "entities"}
+        assert result["data"]["entities"][0]["entity_id"] == "sensor.energy"
+
+    @pytest.mark.asyncio
+    async def test_stats_specific_key_period_type(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=dict(_STATISTICS_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields=["period_type"]
+            )
+        assert set(result["data"].keys()) == {"success", "period_type"}
+        assert result["data"]["period_type"] == "hour"
+
+    @pytest.mark.asyncio
+    async def test_success_always_present(self, history_tool):
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=dict(_STATISTICS_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields=["entities"]
+            )
+        assert result["data"]["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_field_emits_warning(self, history_tool):
+        """Unknown fields key emits a diagnostic warning instead of being silently dropped."""
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=dict(_STATISTICS_INNER),
+            ),
+        ):
+            result = await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields=["nonexistent"]
+            )
+        data = result["data"]
+        assert data["success"] is True
+        assert "warnings" in data
+        assert any("nonexistent" in w for w in data["warnings"])
+
+    @pytest.mark.asyncio
+    async def test_malformed_fields_raises_tool_error(self, history_tool):
+        with pytest.raises(ToolError):
+            await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields=123
+            )
+
+    @pytest.mark.asyncio
+    async def test_bad_json_fields_raises_tool_error(self, history_tool):
+        with pytest.raises(ToolError):
+            await history_tool(
+                entity_ids="sensor.energy", source="statistics", fields='["'
+            )
+
+
+class TestHaGetHistoryOrder:
+    """Tests for the order= parameter (issue #1199).
+
+    Verifies that the order parameter is threaded through to _fetch_history
+    (which is responsible for the actual reversal).
+    """
+
+    @pytest.fixture
+    def mock_client(self):
+        client = MagicMock()
+        client.base_url = "http://homeassistant.local"
+        client.token = "test_token"
+        client.verify_ssl = True
+        client.get_config = AsyncMock(return_value={"time_zone": "UTC"})
+        return client
+
+    @pytest.fixture
+    def history_tool(self, mock_client):
+        return HistoryTools(mock_client).ha_get_history
+
+    @pytest.mark.asyncio
+    async def test_order_desc_default_passed_to_fetch_history(self, history_tool):
+        """Default order='desc' is threaded through to _fetch_history."""
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_ORDER_INNER_STUB),
+            ) as mock_fetch,
+        ):
+            await history_tool(entity_ids="sensor.temp")
+        _args, _kwargs = mock_fetch.call_args
+        assert _kwargs.get("order") == "desc" or "desc" in _args
+
+    @pytest.mark.asyncio
+    async def test_order_asc_passed_to_fetch_history(self, history_tool):
+        """order='asc' is passed through to _fetch_history unchanged."""
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_history",
+                new_callable=AsyncMock,
+                return_value=dict(_ORDER_INNER_STUB),
+            ) as mock_fetch,
+        ):
+            await history_tool(entity_ids="sensor.temp", order="asc")
+        _args, _kwargs = mock_fetch.call_args
+        assert _kwargs.get("order") == "asc" or "asc" in _args
+
+    @pytest.mark.asyncio
+    async def test_order_ignored_for_statistics_source(self, history_tool):
+        """order= is not passed to _fetch_statistics (statistics has no ordering param)."""
+        _stats_stub = {
+            "success": True,
+            "source": "statistics",
+            "entities": [],
+            "period_type": "day",
+            "time_range": {
+                "start": "2025-01-01T00:00:00+00:00",
+                "end": "2025-01-02T00:00:00+00:00",
+            },
+            "statistic_types": ["mean"],
+            "query_params": {"limit": 100, "offset": 0},
+        }
+        with (
+            patch(
+                "ha_mcp.tools.tools_history._fetch_statistics",
+                new_callable=AsyncMock,
+                return_value=_stats_stub,
+            ) as mock_stats,
+        ):
+            await history_tool(
+                entity_ids="sensor.energy", source="statistics", order="asc"
+            )
+        # _fetch_statistics should be called, not _fetch_history
+        mock_stats.assert_called_once()
+
+
+class TestHaGetHistoryPooledTransport:
+    """The single recorder query routes through the shared pooled client
+    (``client.send_websocket_message``) rather than a per-call dedicated
+    WebSocket connection (issue #1813)."""
+
+    @staticmethod
+    def _client(ws_return) -> MagicMock:
+        client = MagicMock()
+        client.base_url = "http://ha.local"
+        client.token = "tok"
+        client.get_config = AsyncMock(return_value={"time_zone": "UTC"})
+        client.send_websocket_message = AsyncMock(return_value=ws_return)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_history_routes_through_pooled_client(self):
+        client = self._client({"success": True, "result": {"sensor.temp": []}})
+        tool = HistoryTools(client).ha_get_history
+        with patch(
+            "ha_mcp.tools.tools_history.add_timezone_metadata",
+            side_effect=lambda _c, d, **_kw: d,
+        ):
+            await tool(entity_ids="sensor.temp")
+
+        client.send_websocket_message.assert_awaited_once()
+        message = client.send_websocket_message.await_args.args[0]
+        assert message["type"] == "history/history_during_period"
+        # The dedicated-connection helper is gone from the module namespace,
+        # so the tool cannot fall back to a per-call connect/auth handshake.
+        assert not hasattr(tools_history, "get_connected_ws_client")
+
+    @pytest.mark.asyncio
+    async def test_pooled_failure_surfaces_structured_error(self):
+        # send_websocket_message collapses a failed WS command into
+        # ``{"success": False, ...}``; the fetch guard raises SERVICE_CALL_FAILED.
+        client = self._client({"success": False, "error": "recorder unavailable"})
+        tool = HistoryTools(client).ha_get_history
+        with pytest.raises(ToolError) as exc_info:
+            await tool(entity_ids="sensor.temp")
+        err = json.loads(str(exc_info.value))["error"]
+        assert err["code"] == "SERVICE_CALL_FAILED"

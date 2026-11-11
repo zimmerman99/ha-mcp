@@ -10,12 +10,46 @@ and production environments. Blueprint availability may vary.
 """
 
 import logging
+import uuid
+from pathlib import Path
 
 import pytest
 
-from ...utilities.assertions import MCPAssertions, parse_mcp_result, wait_for_automation
+from ...utilities.assertions import (
+    MCPAssertions,
+    extract_error_message,
+    safe_call_tool,
+    wait_for_automation,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _blueprint_yaml(name: str, description: str, min_version: str | None = None) -> str:
+    """Render a minimal automation blueprint for import tests."""
+    homeassistant_block = (
+        f'  homeassistant:\n    min_version: "{min_version}"\n' if min_version else ""
+    )
+    return f"""blueprint:
+  name: {name}
+  description: {description}
+  domain: automation
+{homeassistant_block}  input:
+    target_entity:
+      name: Target Entity
+      description: The entity to control
+      selector:
+        entity: {{}}
+
+trigger:
+  - platform: time
+    at: "00:00:00"
+
+action:
+  - service: homeassistant.turn_on
+    target:
+      entity_id: !input target_entity
+"""
 
 
 @pytest.mark.blueprint
@@ -52,7 +86,9 @@ class TestBlueprintManagement:
                 assert "path" in first_blueprint, "Blueprint should have 'path'"
                 assert "domain" in first_blueprint, "Blueprint should have 'domain'"
                 assert "name" in first_blueprint, "Blueprint should have 'name'"
-                logger.info(f"First blueprint: {first_blueprint.get('name')} ({first_blueprint.get('path')})")
+                logger.info(
+                    f"First blueprint: {first_blueprint.get('name')} ({first_blueprint.get('path')})"
+                )
 
             logger.info("ha_get_blueprint (list mode) for automation domain succeeded")
 
@@ -98,7 +134,9 @@ class TestBlueprintManagement:
             )
 
             # Verify error response includes valid domains
-            assert "valid_domains" in result, "Error response should include valid domains"
+            assert "valid_domains" in result, (
+                "Error response should include valid domains"
+            )
             logger.info("ha_get_blueprint properly rejects invalid domain")
 
     async def test_get_blueprint_details(self, mcp_client):
@@ -136,14 +174,18 @@ class TestBlueprintManagement:
             assert "path" in detail_result, "Response should contain 'path'"
             assert "domain" in detail_result, "Response should contain 'domain'"
             assert "name" in detail_result, "Response should contain 'name'"
-            assert detail_result["path"] == first_blueprint_path, "Path should match requested path"
+            assert detail_result["path"] == first_blueprint_path, (
+                "Path should match requested path"
+            )
 
             logger.info(f"Blueprint details retrieved: {detail_result.get('name')}")
 
             # Check for metadata if available
             if "metadata" in detail_result:
                 meta = detail_result["metadata"]
-                logger.info(f"  Description: {(meta.get('description') or 'N/A')[:100]}...")
+                logger.info(
+                    f"  Description: {(meta.get('description') or 'N/A')[:100]}..."
+                )
                 logger.info(f"  Author: {meta.get('author') or 'N/A'}")
 
             # Check for inputs if available
@@ -155,9 +197,15 @@ class TestBlueprintManagement:
 
     async def test_get_blueprint_not_found(self, mcp_client):
         """
-        Test: Get blueprint that doesn't exist
+        Test: ha_get_blueprint with a nonexistent path returns a structured
+        error with code RESOURCE_NOT_FOUND, not success=True.
 
-        Validates proper error handling when blueprint path doesn't exist.
+        Source path: tools_blueprints.py — when the requested path is absent
+        from the blueprints registry, raise_tool_error is invoked with
+        ErrorCode.RESOURCE_NOT_FOUND and the message "Blueprint not found: ...".
+
+        Hardened from a single suggestions-presence check to explicit
+        error-code and structured suggestion-presence assertions.
         """
         logger.info("Testing ha_get_blueprint with non-existent path...")
 
@@ -165,12 +213,19 @@ class TestBlueprintManagement:
             # Try to get a non-existent blueprint
             result = await mcp.call_tool_failure(
                 "ha_get_blueprint",
-                {"path": "nonexistent/blueprint_xyz.yaml", "domain": "automation"},
+                {
+                    "path": "nonexistent/blueprint_a2_e2e_xyz_404.yaml",
+                    "domain": "automation",
+                },
                 expected_error="not found",
             )
 
-            # Verify error response includes suggestions
-            assert "suggestions" in result, "Error response should include suggestions"
+            assert result["error"]["code"] == "RESOURCE_NOT_FOUND", (
+                f"Expected error code RESOURCE_NOT_FOUND, got: {result['error']}"
+            )
+            assert "suggestion" in result["error"], (
+                "Error response should include a suggestion"
+            )
             logger.info("ha_get_blueprint properly handles non-existent blueprint")
 
     async def test_get_blueprint_invalid_domain(self, mcp_client):
@@ -189,7 +244,9 @@ class TestBlueprintManagement:
                 expected_error="Invalid domain",
             )
 
-            assert "valid_domains" in result, "Error response should include valid domains"
+            assert "valid_domains" in result, (
+                "Error response should include valid domains"
+            )
             logger.info("ha_get_blueprint properly rejects invalid domain")
 
     async def test_import_blueprint_invalid_url(self, mcp_client):
@@ -227,9 +284,258 @@ class TestBlueprintManagement:
                 {"url": "https://example.com/nonexistent/blueprint.yaml"},
             )
 
-            # Should fail with appropriate error
-            assert "suggestions" in result, "Error response should include suggestions"
+            # Should fail with appropriate error (suggestions nested under "error")
+            assert "suggestions" in result.get("error", {}), (
+                "Error response should include suggestions"
+            )
             logger.info("ha_import_blueprint properly handles non-existent URL")
+
+    @pytest.mark.slow
+    async def test_import_blueprint_saves_to_disk(
+        self, mcp_client, local_blueprint_server
+    ):
+        """
+        Test: Import blueprint actually saves to disk (issue #685)
+
+        Validates that ha_import_blueprint calls both blueprint/import (validate)
+        AND blueprint/save (persist), so the blueprint appears in the list.
+        Uses a blueprint file served by the test Home Assistant instance to
+        avoid external network dependencies.
+        """
+        logger.info("Testing ha_import_blueprint saves blueprint to disk...")
+
+        # Serve the blueprint through Home Assistant's own /local static path.
+        # This avoids external network dependencies and host-to-container
+        # routing differences across Docker environments.
+        test_url = f"{local_blueprint_server['base_url']}/e2e_test_blueprint.yaml"
+        logger.info(f"Using local blueprint URL: {test_url}")
+
+        async with MCPAssertions(mcp_client) as mcp:
+            # List blueprints before import
+            before = await mcp.call_tool_success(
+                "ha_get_blueprint",
+                {"domain": "automation"},
+            )
+            before_paths = [bp["path"] for bp in before.get("blueprints", [])]
+
+            # Try to import
+            result = await safe_call_tool(
+                mcp_client,
+                "ha_import_blueprint",
+                {"url": test_url},
+            )
+
+            if result.get("success"):
+                # Import succeeded - verify metadata is populated
+                imported = result.get("imported_blueprint", {})
+                assert imported.get("path", "").endswith(".yaml"), (
+                    f"Blueprint path should end with .yaml, got: {imported.get('path')}"
+                )
+                assert imported.get("domain") in ("automation", "script"), (
+                    f"Blueprint domain should be automation or script, got: {imported.get('domain')}"
+                )
+                assert imported.get("name"), "Blueprint name should not be empty"
+                assert imported["path"] not in before_paths, (
+                    f"Blueprint {imported['path']} should not have existed before import"
+                )
+                logger.info(
+                    f"Blueprint imported: {imported.get('name')} at {imported.get('path')}"
+                )
+
+                # Verify it appears in the blueprint list
+                after = await mcp.call_tool_success(
+                    "ha_get_blueprint",
+                    {"domain": imported.get("domain", "automation")},
+                )
+                after_paths = [bp["path"] for bp in after.get("blueprints", [])]
+                assert imported["path"] in after_paths, (
+                    f"Imported blueprint {imported['path']} should appear in blueprint list"
+                )
+                logger.info("Blueprint appears in list after import")
+            else:
+                # Only acceptable failure is "already exists"
+                error_msg = extract_error_message(result)
+                assert "already exists" in error_msg.lower(), (
+                    f"Expected 'already exists' error, got: {result}"
+                )
+                logger.info("Blueprint already existed (prior test run), still valid")
+
+            logger.info("ha_import_blueprint save-to-disk test completed")
+
+    @pytest.mark.slow
+    async def test_reimport_blueprint_with_overwrite(
+        self, mcp_client, local_blueprint_server
+    ):
+        """
+        Test: Re-import an installed blueprint with overwrite=true (issue #1894)
+
+        Validates the "Re-import Blueprint" equivalent: importing an already
+        installed blueprint fails with RESOURCE_ALREADY_EXISTS unless
+        overwrite=true is passed, in which case the save succeeds and reports
+        overrides_existing=True.
+        """
+        test_url = f"{local_blueprint_server['base_url']}/e2e_test_blueprint.yaml"
+        logger.info(f"Testing blueprint re-import with URL: {test_url}")
+
+        async with MCPAssertions(mcp_client) as mcp:
+            # Ensure the blueprint is installed (tolerate a prior import)
+            first = await safe_call_tool(
+                mcp_client,
+                "ha_import_blueprint",
+                {"url": test_url},
+            )
+            if not first.get("success"):
+                error_msg = extract_error_message(first)
+                assert "already exists" in error_msg.lower(), (
+                    f"Expected 'already exists' error, got: {first}"
+                )
+                logger.info("Blueprint already installed from a prior run")
+
+            # Re-import without overwrite must fail with a structured error
+            failure = await mcp.call_tool_failure(
+                "ha_import_blueprint",
+                {"url": test_url},
+                expected_error="already exists",
+            )
+            assert failure["error"]["code"] == "RESOURCE_ALREADY_EXISTS", (
+                f"Expected RESOURCE_ALREADY_EXISTS, got: {failure['error']}"
+            )
+            assert "overwrite" in str(failure["error"]).lower(), (
+                "Error should point the caller at overwrite=true"
+            )
+            logger.info("Re-import without overwrite properly rejected")
+
+            # Re-import with overwrite succeeds and reports the override
+            result = await mcp.call_tool_success(
+                "ha_import_blueprint",
+                {"url": test_url, "overwrite": True},
+            )
+            assert result.get("overrides_existing") is True, (
+                f"Expected overrides_existing=True, got: {result}"
+            )
+            imported = result.get("imported_blueprint", {})
+            assert imported.get("path", "").endswith(".yaml"), (
+                f"Blueprint path should end with .yaml, got: {imported.get('path')}"
+            )
+            logger.info("Blueprint re-imported with overwrite=true")
+
+    @pytest.mark.slow
+    async def test_reimport_updates_blueprint_content(
+        self, mcp_client, local_blueprint_server
+    ):
+        """
+        Test: Re-import actually replaces the installed blueprint content (issue #1894)
+
+        The issue-#1894 user story: a blueprint's source changed upstream and the
+        user re-imports to pick up the new version. Serves v1 of a uniquely-named
+        blueprint, imports it (overwrite=true on a fresh import must succeed with
+        overrides_existing=False), then serves changed content and re-imports,
+        verifying via ha_get_blueprint that the NEW content landed.
+        """
+        local_dir = local_blueprint_server.get("local_dir")
+        assert local_dir, (
+            "local_blueprint_server must expose local_dir (writable served directory)"
+        )
+
+        run_id = uuid.uuid4().hex[:8]
+        filename = f"e2e_reimport_{run_id}.yaml"
+        served_file = Path(local_dir) / filename
+        test_url = f"{local_blueprint_server['base_url']}/{filename}"
+        marker_v1 = f"reimport-v1-{run_id}"
+        marker_v2 = f"reimport-v2-{run_id}"
+
+        try:
+            served_file.write_text(
+                _blueprint_yaml(f"Reimport E2E {run_id}", marker_v1), encoding="utf-8"
+            )
+
+            async with MCPAssertions(mcp_client) as mcp:
+                # overwrite=true on a not-yet-installed blueprint: plain install
+                first = await mcp.call_tool_success(
+                    "ha_import_blueprint",
+                    {"url": test_url, "overwrite": True},
+                )
+                assert first.get("overrides_existing") is False, (
+                    f"Fresh import must not report an override, got: {first}"
+                )
+                blueprint_path = first["imported_blueprint"]["path"]
+
+                # Serve changed content and re-import
+                served_file.write_text(
+                    _blueprint_yaml(f"Reimport E2E {run_id}", marker_v2),
+                    encoding="utf-8",
+                )
+                second = await mcp.call_tool_success(
+                    "ha_import_blueprint",
+                    {"url": test_url, "overwrite": True},
+                )
+                assert second.get("overrides_existing") is True, (
+                    f"Re-import must report the override, got: {second}"
+                )
+                assert "reload" in second.get("message", "").lower(), (
+                    f"Override response should mention the consumer reload, got: {second}"
+                )
+
+                # The installed blueprint must now carry the v2 content
+                detail = await mcp.call_tool_success(
+                    "ha_get_blueprint",
+                    {"path": blueprint_path, "domain": "automation"},
+                )
+                description = (detail.get("metadata") or {}).get("description") or ""
+                assert marker_v2 in description, (
+                    f"Re-imported blueprint should carry '{marker_v2}', got: {description}"
+                )
+                assert marker_v1 not in description, (
+                    f"Old content '{marker_v1}' should be gone, got: {description}"
+                )
+                logger.info("Re-import replaced blueprint content on disk")
+        finally:
+            served_file.unlink(missing_ok=True)
+
+    @pytest.mark.slow
+    async def test_import_blueprint_min_version_rejected(
+        self, mcp_client, local_blueprint_server
+    ):
+        """
+        Test: import surfaces blueprint/import validation_errors
+
+        blueprint/save does not re-run the min-version check, so the tool must
+        fail the import itself instead of silently saving an unsupported
+        blueprint (found while reviewing #1894's overwrite path, where it would
+        clobber a working installed blueprint).
+        """
+        local_dir = local_blueprint_server.get("local_dir")
+        assert local_dir, (
+            "local_blueprint_server must expose local_dir (writable served directory)"
+        )
+
+        run_id = uuid.uuid4().hex[:8]
+        filename = f"e2e_minversion_{run_id}.yaml"
+        served_file = Path(local_dir) / filename
+        test_url = f"{local_blueprint_server['base_url']}/{filename}"
+
+        try:
+            served_file.write_text(
+                _blueprint_yaml(
+                    f"MinVersion E2E {run_id}",
+                    "requires an impossible HA version",
+                    min_version="9999.1.0",
+                ),
+                encoding="utf-8",
+            )
+
+            async with MCPAssertions(mcp_client) as mcp:
+                result = await mcp.call_tool_failure(
+                    "ha_import_blueprint",
+                    {"url": test_url, "overwrite": True},
+                    expected_error="Requires at least Home Assistant",
+                )
+                assert result["error"]["code"] == "VALIDATION_FAILED", (
+                    f"Expected VALIDATION_FAILED, got: {result['error']}"
+                )
+                logger.info("Unsupported blueprint properly rejected at import")
+        finally:
+            served_file.unlink(missing_ok=True)
 
 
 @pytest.mark.blueprint
@@ -283,7 +589,9 @@ async def test_blueprint_discovery_workflow(mcp_client):
                 inputs = detail_result["inputs"]
                 logger.info(f"Blueprint requires {len(inputs)} inputs:")
                 for input_name, input_config in list(inputs.items())[:3]:
-                    logger.info(f"  - {input_name}: {(input_config.get('description') or 'No description')[:50]}")
+                    logger.info(
+                        f"  - {input_name}: {(input_config.get('description') or 'No description')[:50]}"
+                    )
         else:
             logger.info("Step 3: Skipped (no blueprints available)")
 
@@ -368,23 +676,30 @@ async def test_blueprint_automation_lifecycle(mcp_client):
 
         # This should reach HA (proving our validation passed) even if HA rejects it
         # If our validation failed, we'd get a different error code
-        create_raw_result = await mcp_client.call_tool(
+        # Use safe_call_tool to handle ToolError exceptions from validation failures
+        create_result = await safe_call_tool(
+            mcp_client,
             "ha_config_set_automation",
             {"config": automation_config},
         )
-        create_result = parse_mcp_result(create_raw_result)
 
         # Check if it was our validation or HA's validation that failed
         if not create_result.get("success"):
             error_msg = str(create_result.get("error", {}).get("message", ""))
             # If error is about missing blueprint inputs, our validation passed! HA rejected it.
             if "Missing input" in error_msg or "input" in error_msg.lower():
-                logger.info("✅ Our validation passed (config reached HA), HA rejected due to missing blueprint inputs as expected")
-                logger.info("✅ Blueprint automation lifecycle test completed (validation works)")
+                logger.info(
+                    "✅ Our validation passed (config reached HA), HA rejected due to missing blueprint inputs as expected"
+                )
+                logger.info(
+                    "✅ Blueprint automation lifecycle test completed (validation works)"
+                )
                 return
             # If error is about missing trigger/action, our fix didn't work
             if "trigger" in error_msg.lower() or "action" in error_msg.lower():
-                raise AssertionError(f"Our validation failed - still requiring trigger/action: {error_msg}")
+                raise AssertionError(
+                    f"Our validation failed - still requiring trigger/action: {error_msg}"
+                )
             # Some other error
             raise AssertionError(f"Unexpected error: {create_result}")
 
@@ -396,12 +711,14 @@ async def test_blueprint_automation_lifecycle(mcp_client):
         # If we got here, the automation was created successfully
         # Step 4: Wait for automation to be registered, then verify no trigger/action fields
         config = await wait_for_automation(mcp_client, automation_id)
-        assert config is not None, f"Automation {automation_id} not found after creation"
+        assert config is not None, (
+            f"Automation {automation_id} not found after creation"
+        )
         assert "use_blueprint" in config, "Config should have use_blueprint"
         logger.info("✅ Blueprint automation config verified")
 
         # Step 5: Clean up
-        delete_result = await mcp.call_tool_success(
+        await mcp.call_tool_success(
             "ha_config_remove_automation",
             {"identifier": automation_id},
         )
@@ -446,29 +763,36 @@ async def test_blueprint_automation_with_empty_arrays(mcp_client):
 
         # The key test: This should pass our validation (not fail with "missing trigger/action")
         # It will fail HA validation due to missing blueprint inputs, but that's expected
-        create_raw_result = await mcp_client.call_tool(
+        # Use safe_call_tool to handle ToolError exceptions from validation failures
+        create_result = await safe_call_tool(
+            mcp_client,
             "ha_config_set_automation",
             {"config": automation_config},
         )
-        create_result = parse_mcp_result(create_raw_result)
 
         # If our validation works, it should reach HA (which will reject due to missing inputs)
         if not create_result.get("success"):
             error_msg = str(create_result.get("error", {}).get("message", ""))
             # If error is about missing blueprint inputs, our validation passed!
             if "Missing input" in error_msg or "input" in error_msg.lower():
-                logger.info("✅ Empty arrays were stripped (passed our validation, failed HA blueprint validation as expected)")
+                logger.info(
+                    "✅ Empty arrays were stripped (passed our validation, failed HA blueprint validation as expected)"
+                )
                 logger.info("✅ Empty arrays test completed")
                 return
             # If error is about missing trigger/action, our fix didn't work
             if "trigger" in error_msg.lower() or "action" in error_msg.lower():
-                raise AssertionError(f"Empty arrays not stripped - validation failed: {error_msg}")
+                raise AssertionError(
+                    f"Empty arrays not stripped - validation failed: {error_msg}"
+                )
             # Some other error
             raise AssertionError(f"Unexpected error: {create_result}")
 
         # If somehow it succeeded (unlikely with empty inputs)
         automation_id = create_result.get("entity_id") or create_result.get("id")
-        logger.info(f"✅ Created blueprint automation with empty arrays: {automation_id}")
+        logger.info(
+            f"✅ Created blueprint automation with empty arrays: {automation_id}"
+        )
 
         # Clean up
         await mcp.call_tool_success(

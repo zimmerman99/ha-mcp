@@ -1,6 +1,6 @@
 # Dev Channel
 
-Want to test the latest changes before the weekly Tuesday release? The dev channel provides early access to features, bug fixes, and improvements as soon as they're merged to master.
+Want to test the latest changes before the biweekly stable release? The dev channel provides early access to features, bug fixes, and improvements as soon as they're merged to master.
 
 **Who should use this:**
 - Contributors testing their PRs
@@ -14,7 +14,15 @@ Want to test the latest changes before the weekly Tuesday release? The dev chann
 | Channel | When Updated | Package/Tag |
 |---------|--------------|-------------|
 | **Dev** | Every push to master | `ha-mcp-dev` / `:dev` |
-| **Stable** | Weekly (Tuesday 10:00 UTC) | `ha-mcp` / `:latest` |
+| **Stable** | Biweekly (Wednesday 10:00 UTC) | `ha-mcp` / `:latest` |
+
+**Docker tags at a glance** (image `ghcr.io/homeassistant-ai/ha-mcp`):
+
+- `:latest` / `:stable` — the most recent stable release; both point at identical bits. `:latest` is the default tag pulled when none is given; use `:stable` to make "stable only" explicit in a compose file or config.
+- `:dev` — the rolling dev channel, rebuilt on every push to master.
+- `:dev-<sha>` — an immutable tag pinned to one specific dev build (see the Docker section below).
+
+`:latest` only ever tracks stable, never dev.
 
 ## Installation Methods
 
@@ -99,9 +107,22 @@ Dev images are published to GitHub Container Registry with the `dev` tag.
 docker pull ghcr.io/homeassistant-ai/ha-mcp:dev
 ```
 
+**Pin a specific dev build:**
+
+Every dev build is also published under an immutable `:dev-<sha>` tag (the short commit SHA), so you can pin to one exact build — handy when verifying a fix on a specific commit. Unlike `:dev`, a `:dev-<sha>` tag never moves:
+```bash
+docker pull ghcr.io/homeassistant-ai/ha-mcp:dev-a1b2c3d
+```
+
+These commands mount `ha-mcp-dev-data` rather than the `ha-mcp-data` volume the
+stable recipes use, so trying a dev build never writes to the settings your
+stable install depends on — a dev build can persist data a released version
+doesn't expect to read back.
+
 **Run in stdio mode (Claude Desktop):**
 ```bash
 docker run --rm -i \
+  -v ha-mcp-dev-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=http://your-ha-instance:8123 \
   -e HOMEASSISTANT_TOKEN=your_token \
   ghcr.io/homeassistant-ai/ha-mcp:dev
@@ -110,6 +131,7 @@ docker run --rm -i \
 **Run in HTTP mode (web clients):**
 ```bash
 docker run -d -p 8086:8086 \
+  -v ha-mcp-dev-data:/home/mcpuser/.ha-mcp \
   -e HOMEASSISTANT_URL=http://your-ha-instance:8123 \
   -e HOMEASSISTANT_TOKEN=your_token \
   ghcr.io/homeassistant-ai/ha-mcp:dev ha-mcp-web
@@ -147,7 +169,7 @@ The dev channel is available as a **separate add-on** in the Home Assistant add-
 | **Name** | Home Assistant MCP Server | Home Assistant MCP Server (Dev) |
 | **Slug** | `ha_mcp` | `ha_mcp_dev` |
 | **Stage** | Stable | Experimental |
-| **Updates** | Weekly (Tuesday) | Every master push |
+| **Updates** | Biweekly (Wednesday) | Every master push |
 
 **Can I run both?** Yes! Both add-ons can be installed simultaneously. They use different slugs and configuration.
 
@@ -159,7 +181,8 @@ If you're using Claude Desktop, update your `claude_desktop_config.json`:
 
 **Location:**
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
-- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Windows (traditional installer):** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Windows (Microsoft Store):** path varies by package — see the [Windows setup guide](https://homeassistant-ai.github.io/ha-mcp/guide-windows) for a detection snippet
 
 **For uvx (dev channel):**
 ```json

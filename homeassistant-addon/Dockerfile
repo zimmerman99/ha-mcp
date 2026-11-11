@@ -5,7 +5,7 @@
 # No bashio needed - pure Python startup script
 
 # --- Build stage: install dependencies with uv ---
-FROM ghcr.io/astral-sh/uv:0.9.29-python3.13-bookworm-slim@sha256:3133feeeaa71f24379a7c0d37c0a01195d75cfe9369b2c6df1505817f7ff51cd AS builder
+FROM ghcr.io/astral-sh/uv:0.11.33-python3.13-trixie-slim@sha256:ddcc6242921ee120cf279fdcedfc8bb917c9af4de9ad791495e4c7deb479a296 AS builder
 
 WORKDIR /app
 
@@ -23,7 +23,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
 # --- Runtime stage: clean image without uv ---
-FROM python:3.13-slim-bookworm@sha256:8092ae2ef67061f9db412458dbdce44dbf16748fb3cae5cdbd020f467a9712d0
+FROM python:3.13-slim@sha256:3de9a8d7aedbb7984dc18f2dff178a7850f16c1ae7c34ba9d7ecc23d0755e35f
 
 WORKDIR /app
 
@@ -34,9 +34,13 @@ COPY homeassistant-addon/start.py /
 # Activate virtual environment via PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Labels
+# Propagate the build version into the runtime so startup logs report the
+# correct version. The addon workflow always passes BUILD_VERSION; standalone
+# Docker pulls that don't pass it fall through to package metadata.
 ARG BUILD_VERSION
 ARG BUILD_ARCH
+ENV HA_MCP_BUILD_VERSION=${BUILD_VERSION}
+
 LABEL \
     io.hass.name="Home Assistant MCP Server" \
     io.hass.description="AI assistant integration via Model Context Protocol" \

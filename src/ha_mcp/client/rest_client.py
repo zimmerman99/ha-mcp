@@ -5,31 +5,83 @@ Home Assistant HTTP client with authentication and error handling.
 import asyncio
 import json
 import logging
-from typing import Any
+import os
+import ssl
+import time
+from dataclasses import dataclass
+from typing import Any, NoReturn
 
 import httpx
 
+from .._vendor.websockets.exceptions import WebSocketException
+from .._version import get_supervisor_base_url, is_running_in_addon
 from ..config import get_global_settings
+from .supervisor_client import make_supervisor_httpx_client
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or anything in its cause chain) is an SSL error.
+
+    httpx wraps ``ssl.SSLError`` inside ``httpx.ConnectError``; the only
+    reliable check is to walk ``__cause__`` / ``__context__``.
+    """
+    cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, ssl.SSLError):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
 
 logger = logging.getLogger(__name__)
+
+# Transient gateway statuses from a reverse proxy / Supervisor ingress — HA Core
+# restarting or briefly overloaded behind it. The upstream couldn't be reached,
+# so the request did not execute and retrying is safe even for writes.
+_RETRYABLE_STATUS = frozenset({502, 503, 504})
+_MAX_REQUEST_ATTEMPTS = 3
 
 
 class HomeAssistantError(Exception):
     """Base exception for Home Assistant API errors."""
 
-    pass
-
 
 class HomeAssistantConnectionError(HomeAssistantError):
     """Connection error to Home Assistant."""
 
-    pass
+
+class HomeAssistantCommandNotSent(HomeAssistantConnectionError):
+    """A WS command that provably never left the process.
+
+    Raised by ``HomeAssistantWebSocketClient.send_command`` ONLY at its single
+    provably-never-sent site: the entry-guard reject (socket not authenticated), where
+    nothing is transmitted. Subclass of ``HomeAssistantConnectionError`` so every
+    existing broad handler is unaffected, yet a write consumer can catch this type
+    FIRST to fall back to the legacy path safely — the write provably never happened,
+    so a legacy first fire cannot double-apply. A ``send_json_message`` failure is NOT
+    this type: ``websocket.send()`` raising does not prove the frame was untransmitted
+    (bytes may already be on the socket when the close surfaces), so send_command
+    re-raises the original exception and the consumer treats it as ambiguous. A
+    post-send socket close (mid-await) likewise raises a plain
+    ``HomeAssistantConnectionError`` (the close handler sets it on the pending future),
+    so type alone distinguishes never-sent from sent-then-dropped/ambiguous.
+    """
 
 
 class HomeAssistantAuthError(HomeAssistantError):
-    """Authentication error with Home Assistant."""
+    """Authentication error with Home Assistant.
 
-    pass
+    Sibling of ``HomeAssistantAPIError`` (not a subclass). The codebase has
+    18 ``except HomeAssistantAPIError`` sites (util_helpers polling,
+    tools_integrations registry lookups, etc.) that deliberately rely on
+    auth errors NOT matching so they can propagate to a paired
+    ``except (HomeAssistantConnectionError, HomeAssistantAuthError): raise``
+    block. Subclassing AuthError under APIError silently swallowed those
+    auth errors as part of the local "this entity is not registered yet"
+    polling logic. Sites that specifically need to catch both must list
+    them explicitly (see ``_get_supervisor_log`` and
+    ``_get_system_service_log`` in ``tools_utility.py``).
+    """
 
 
 class HomeAssistantAPIError(HomeAssistantError):
@@ -46,6 +98,105 @@ class HomeAssistantAPIError(HomeAssistantError):
         self.response_data = response_data
 
 
+@dataclass(frozen=True)
+class SceneResolution:
+    """Outcome of resolving a scene identifier via the entity registry.
+
+    ``registry_hit`` records whether ``config/entity_registry/get`` returned a
+    usable ``unique_id`` - i.e. the entity actually EXISTS. It is the signal that
+    separates a genuinely-missing scene from one that exists but is not editable
+    through HA's scene config API (a Hue/vendor scene, or a raw-YAML scene): both
+    resolve fine yet 404 on ``config/scene/config/{id}``, because that endpoint is
+    backed only by the managed ``scenes.yaml`` (issue #1971). ``platform`` carries
+    the registry entry's integration domain (``"hue"``, ``"homeassistant"``, …)
+    for error-message enrichment only - it never drives the classification, since
+    a raw-YAML scene is ``platform="homeassistant"`` yet still 404s.
+    """
+
+    storage_key: str
+    registry_hit: bool
+    platform: str | None
+
+
+class SceneStorageConfigNotFoundError(HomeAssistantAPIError):
+    """A scene entity resolved in the registry, but ``config/scene/config/{id}``
+    (backed by ``scenes.yaml``) has no matching entry.
+
+    The entity EXISTS; it is simply not an editable Home Assistant storage scene
+    (Hue/vendor scene, or a raw-YAML scene). Raised instead of a bare 404 so the
+    tools layer can surface ``CONFIG_NOT_FOUND`` rather than the misleading
+    ``ENTITY_NOT_FOUND``/``RESOURCE_NOT_FOUND`` (issue #1971). Subclasses
+    ``HomeAssistantAPIError`` so existing ``except HomeAssistantAPIError`` sites
+    keep treating it as the 404 it is.
+    """
+
+    def __init__(
+        self,
+        scene_id: str,
+        *,
+        platform: str | None = None,
+        storage_key: str | None = None,
+    ):
+        self.scene_id = scene_id
+        self.platform = platform
+        self.storage_key = storage_key
+        msg = f"Scene not found in editable storage: {scene_id}"
+        if storage_key and storage_key != scene_id:
+            msg += f" (resolved storage key: {storage_key})"
+        super().__init__(msg, status_code=404)
+
+
+class HomeAssistantCommandError(HomeAssistantError):
+    """WebSocket command returned success=False.
+
+    Raised by ``WebSocketClient.send_command`` when Home Assistant responds
+    with ``{type: "result", success: False}``. Used as a type marker in
+    ``_classify_exception``'s match dispatch; classification then falls
+    through to ``_classify_by_message`` for pattern matching on the
+    error message.
+
+    ``code`` carries HA's structured WebSocket error code (the ``code`` field
+    of the response ``error`` object — e.g. ``"unknown_command"``,
+    ``"invalid_format"``) when available, so routing decisions can key off the
+    stable code rather than pattern-matching the human-readable message. It
+    defaults to ``None`` for exceptions raised without a code (older raise
+    sites, string error payloads, or direct construction in tests), which
+    keeps the single-positional-argument constructor backward-compatible.
+    """
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
+
+
+class HomeAssistantCommandTimeout(HomeAssistantError):
+    """WebSocket ``send_command`` timed out waiting for HA's response.
+
+    Sibling of ``HomeAssistantCommandError`` (not a subclass) so existing
+    ``except HomeAssistantCommandError`` sites — including the match
+    dispatch in ``helpers._classify_exception`` — keep their original
+    semantics. Callers that specifically want to handle our 30s WS
+    round-trip timeout (e.g. short-lived waiter cleanup that should
+    swallow a timeout instead of masking the real wait result) catch
+    this type directly. Replaces a bare ``Exception("Command timeout")``
+    string-match pattern (#1382 Patch76 review).
+    """
+
+
+# Exception classes that are evidence no answer came back from Home Assistant,
+# as opposed to Home Assistant answering with a rejection. ``OSError`` covers
+# ``ConnectionResetError``; ``WebSocketException`` covers the
+# ``ConnectionClosed`` family that ``send_command`` re-raises unwrapped;
+# ``HomeAssistantCommandTimeout`` covers a socket that is still open but has
+# stopped answering, which leaves a caller just as blind as a closed one.
+_NO_ANSWER_ERRORS = (
+    HomeAssistantConnectionError,
+    HomeAssistantCommandTimeout,
+    OSError,
+    WebSocketException,
+)
+
+
 class HomeAssistantClient:
     """Authenticated HTTP client for Home Assistant API."""
 
@@ -54,6 +205,7 @@ class HomeAssistantClient:
         base_url: str | None = None,
         token: str | None = None,
         timeout: int | None = None,
+        verify_ssl: bool | None = None,
     ):
         """
         Initialize Home Assistant client.
@@ -62,18 +214,31 @@ class HomeAssistantClient:
             base_url: Home Assistant URL (defaults to config)
             token: Long-lived access token (defaults to config)
             timeout: Request timeout in seconds (defaults to config)
+            verify_ssl: Whether to verify the HA server's TLS certificate
+                (defaults to ``settings.verify_ssl``). Pass False to allow
+                self-signed certs or hostname mismatches.
         """
-        # Only load settings if we need to use fallback values
-        if base_url is None or token is None:
+        if base_url is None or token is None or verify_ssl is None:
             settings = get_global_settings()
             self.base_url = (base_url or settings.homeassistant_url).rstrip("/")
             self.token = token or settings.homeassistant_token
             self.timeout = timeout if timeout is not None else settings.timeout
+            self.verify_ssl = (
+                verify_ssl if verify_ssl is not None else settings.verify_ssl
+            )
         else:
-            # All required parameters provided, use them directly without loading settings
             self.base_url = base_url.rstrip("/")
             self.token = token
             self.timeout = timeout if timeout is not None else 30  # Default timeout
+            self.verify_ssl = verify_ssl
+
+        if not self.verify_ssl:
+            logger.warning(
+                "TLS verification disabled for Home Assistant REST client "
+                "(HA_VERIFY_SSL=false). Connections to %s will accept "
+                "self-signed and mismatched certificates.",
+                self.base_url,
+            )
 
         # Create HTTP client with authentication headers
         self.httpx_client = httpx.AsyncClient(
@@ -83,11 +248,19 @@ class HomeAssistantClient:
                 "Content-Type": "application/json",
             },
             timeout=httpx.Timeout(self.timeout),
+            verify=self.verify_ssl,
         )
+
+        # Lazy-populated by ``_is_supervised_install``. ``None`` means
+        # "not probed yet"; ``True`` is cached for the session lifetime
+        # (HAOS-ness can't change at runtime). ``False`` is NOT cached so a
+        # transient probe failure on the first call doesn't permanently
+        # disable the supervised branch — subsequent calls re-probe.
+        self._supervised_detected: bool | None = None
 
         logger.info(f"Initialized Home Assistant client for {self.base_url}")
 
-    async def __aenter__(self) -> 'HomeAssistantClient':
+    async def __aenter__(self) -> "HomeAssistantClient":
         """Async context manager entry."""
         return self
 
@@ -100,9 +273,96 @@ class HomeAssistantClient:
         await self.httpx_client.aclose()
         logger.debug("Closed Home Assistant client")
 
-    async def _request(self, method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
+    @staticmethod
+    def _error_message_from_response(
+        response: httpx.Response,
+    ) -> tuple[str, dict[str, Any]]:
+        """Build a human message and structured error data from a 4xx/5xx body.
+
+        Prefers the JSON ``message`` field; falls back to reason phrase or a
+        placeholder when the body is empty or unparseable.
         """
-        Make authenticated request to Home Assistant API.
+        try:
+            error_data = response.json()
+        except Exception:
+            error_data = {"message": response.text}
+
+        message = error_data.get("message")
+        if not message or not message.strip():
+            message = response.reason_phrase or "<empty body>"
+        return message, error_data
+
+    async def _raw_request(
+        self, method: str, endpoint: str, **kwargs: Any
+    ) -> httpx.Response:
+        """Authenticated request that returns the raw httpx.Response.
+
+        Handles auth, HTTP 4xx/5xx, and transport errors in one place.
+        Callers parse the body themselves (JSON via `_request`, text via
+        `get_addon_logs`, etc.). Transient gateway errors (502/503/504) are
+        retried with bounded exponential backoff before surfacing.
+
+        Raises:
+            HomeAssistantAuthError: 401 response.
+            HomeAssistantAPIError: Non-2xx response (with status_code and
+                response_data set from JSON body when possible).
+            HomeAssistantConnectionError: Network, timeout, or transport error.
+        """
+        backoff = 0.5
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            try:
+                response = await self.httpx_client.request(method, endpoint, **kwargs)
+
+                if response.status_code == 401:
+                    raise HomeAssistantAuthError("Invalid authentication token")
+
+                if response.status_code >= 400:
+                    message, error_data = self._error_message_from_response(response)
+
+                    if (
+                        response.status_code in _RETRYABLE_STATUS
+                        and attempt < _MAX_REQUEST_ATTEMPTS
+                    ):
+                        logger.warning(
+                            f"Transient {response.status_code} from Home Assistant "
+                            f"(attempt {attempt}/{_MAX_REQUEST_ATTEMPTS}), retrying "
+                            f"in {backoff}s: {message}"
+                        )
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+
+                    raise HomeAssistantAPIError(
+                        f"API error: {response.status_code} - {message}",
+                        status_code=response.status_code,
+                        response_data=error_data,
+                    )
+
+                return response
+
+            except httpx.ConnectError as e:
+                if _is_ssl_error(e) and self.verify_ssl:
+                    raise HomeAssistantConnectionError(
+                        f"TLS verification failed for {self.base_url}: {e}. "
+                        "If this is a self-signed certificate or hostname "
+                        "mismatch, set HA_VERIFY_SSL=false to skip verification."
+                    ) from e
+                raise HomeAssistantConnectionError(
+                    f"Failed to connect to Home Assistant: {e}"
+                ) from e
+            except httpx.TimeoutException as e:
+                raise HomeAssistantConnectionError(f"Request timeout: {e}") from e
+            except httpx.HTTPError as e:
+                raise HomeAssistantConnectionError(f"HTTP error: {e}") from e
+
+        # Unreachable: the final attempt takes the non-retry branch and raises.
+        raise AssertionError("_raw_request retry loop exhausted without returning")
+
+    async def _request(
+        self, method: str, endpoint: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        """
+        Make authenticated request to Home Assistant API and parse JSON body.
 
         Args:
             method: HTTP method (GET, POST, etc.)
@@ -117,42 +377,13 @@ class HomeAssistantClient:
             HomeAssistantAuthError: Authentication failed
             HomeAssistantAPIError: API error
         """
+        response = await self._raw_request(method, endpoint, **kwargs)
         try:
-            response = await self.httpx_client.request(method, endpoint, **kwargs)
-
-            # Handle authentication errors
-            if response.status_code == 401:
-                raise HomeAssistantAuthError("Invalid authentication token")
-
-            # Handle other HTTP errors
-            if response.status_code >= 400:
-                try:
-                    error_data = response.json()
-                except Exception:
-                    error_data = {"message": response.text}
-
-                raise HomeAssistantAPIError(
-                    f"API error: {response.status_code} - {error_data.get('message', 'Unknown error')}",
-                    status_code=response.status_code,
-                    response_data=error_data,
-                )
-
-            # Parse JSON response
-            try:
-                result: dict[str, Any] = response.json()
-                return result
-            except json.JSONDecodeError:
-                # Some endpoints return empty responses
-                return {}
-
-        except httpx.ConnectError as e:
-            raise HomeAssistantConnectionError(
-                f"Failed to connect to Home Assistant: {e}"
-            ) from e
-        except httpx.TimeoutException as e:
-            raise HomeAssistantConnectionError(f"Request timeout: {e}") from e
-        except httpx.HTTPError as e:
-            raise HomeAssistantConnectionError(f"HTTP error: {e}") from e
+            result: dict[str, Any] = response.json()
+            return result
+        except json.JSONDecodeError:
+            # Some endpoints return empty responses
+            return {}
 
     async def get_config(self) -> dict[str, Any]:
         """Get Home Assistant configuration."""
@@ -181,31 +412,12 @@ class HomeAssistantClient:
         logger.debug(f"Fetching state for entity: {entity_id}")
         return await self._request("GET", f"/states/{entity_id}")
 
-    async def set_entity_state(
-        self, entity_id: str, state: str, attributes: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """
-        Set entity state.
-
-        Args:
-            entity_id: Entity ID
-            state: New state value
-            attributes: Optional attributes dictionary
-
-        Returns:
-            Updated entity state
-        """
-        logger.debug(f"Setting state for entity {entity_id} to {state}")
-
-        payload: dict[str, Any] = {"state": state}
-        if attributes:
-            payload["attributes"] = attributes
-
-        return await self._request("POST", f"/states/{entity_id}", json=payload)
-
     async def call_service(
-        self, domain: str, service: str, data: dict[str, Any] | None = None,
-        return_response: bool = False
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any] | None = None,
+        return_response: bool = False,
     ) -> list[dict[str, Any]] | dict[str, Any]:
         """
         Call Home Assistant service.
@@ -221,7 +433,9 @@ class HomeAssistantClient:
             Service response data - list of affected states normally, or dict with
             service response if return_response=True
         """
-        logger.debug(f"Calling service {domain}.{service} (return_response={return_response})")
+        logger.debug(
+            f"Calling service {domain}.{service} (return_response={return_response})"
+        )
 
         payload = data or {}
 
@@ -231,7 +445,10 @@ class HomeAssistantClient:
             params["return_response"] = "true"
 
         result = await self._request(
-            "POST", f"/services/{domain}/{service}", json=payload, params=params if params else None
+            "POST",
+            f"/services/{domain}/{service}",
+            json=payload,
+            params=params if params else None,
         )
 
         # When return_response is True, HA returns a dict with service_response key
@@ -251,41 +468,6 @@ class HomeAssistantClient:
         logger.debug("Fetching available services")
         return await self._request("GET", "/services")
 
-    async def get_history(
-        self,
-        entity_id: str | None = None,
-        start_time: str | None = None,
-        end_time: str | None = None,
-    ) -> list[list[dict[str, Any]]]:
-        """
-        Get historical data.
-
-        Args:
-            entity_id: Optional entity ID to filter
-            start_time: Optional start time (ISO format)
-            end_time: Optional end time (ISO format)
-
-        Returns:
-            Historical data
-        """
-        logger.debug(f"Fetching history for entity: {entity_id}")
-
-        params = {}
-        if start_time:
-            params["start_time"] = start_time
-        if end_time:
-            params["end_time"] = end_time
-
-        endpoint = "/history/period"
-        if entity_id:
-            endpoint += f"/{entity_id}"
-
-        result = await self._request("GET", endpoint, params=params)
-        if isinstance(result, list):
-            return result
-        else:
-            return []
-
     async def get_logbook(
         self,
         entity_id: str | None = None,
@@ -303,7 +485,9 @@ class HomeAssistantClient:
         Returns:
             Logbook entries
         """
-        logger.debug(f"Fetching logbook entries for entity: {entity_id}, start: {start_time}, end: {end_time}")
+        logger.debug(
+            f"Fetching logbook entries for entity: {entity_id}, start: {start_time}, end: {end_time}"
+        )
 
         # Build endpoint - start_time goes in URL path if provided
         if start_time:
@@ -365,10 +549,338 @@ class HomeAssistantClient:
         return await self._request("POST", "/config/core/check_config")
 
     async def get_error_log(self) -> str:
-        """Get Home Assistant error log."""
-        logger.debug("Fetching error log")
-        response = await self._request("GET", "/error_log")
-        return response if isinstance(response, str) else str(response)
+        """Get Home Assistant error log.
+
+        Three-way branch depending on how this client reaches HA:
+
+        - **Addon context** (``is_running_in_addon()`` True — i.e.
+          ``SUPERVISOR_TOKEN`` is set, meaning this process is the
+          ha-mcp add-on container talking to the Supervisor sibling):
+          go direct to Supervisor REST at
+          ``http://supervisor/core/logs``.
+        - **External client → HAOS/Supervised** (``is_running_in_addon()``
+          False AND ``hassio`` is listed in HA's loaded components): use
+          the HA Core hassio proxy at ``/api/hassio/core/logs`` with the
+          user LLA. ``/api/error_log`` is unregistered by design on
+          Supervised installs — HA Core's ``bootstrap.py:646-671`` sets
+          ``err_log_path = None`` when ``SUPERVISOR`` is in the env, so
+          ``hass.data[DATA_LOGGING]`` is never populated and the
+          ``APIErrorLog`` view (``api/__init__.py:89-90``) never registers.
+          The hassio proxy reaches the same underlying log stream.
+        - **External client → Container/pip HA** (neither of the above):
+          keep the historical ``/api/error_log`` proxy path.
+
+        The middle branch was discovered by the HAOS E2E tier (#1326): the
+        test harness runs ha-mcp externally against a booted HAOS, hits
+        the unregistered endpoint, and the old binary branch surfaced as
+        a confusing 404. Verified end-to-end with the user's real HAOS
+        and against HA Core source.
+
+        Raises:
+            HomeAssistantAuthError: 401, or empty ``SUPERVISOR_TOKEN`` on
+                the addon branch.
+            HomeAssistantAPIError: 403 (role too low — addon needs
+                ``hassio_role: manager``), 404, other non-2xx.
+            HomeAssistantConnectionError: Network, timeout, or transport
+                error.
+        """
+        if is_running_in_addon():
+            logger.debug("Fetching error log via Supervisor direct (core service)")
+            return await self._supervisor_logs_get("core")
+
+        if await self._is_supervised_install():
+            logger.debug(
+                "Fetching error log via HA Core /hassio/core/logs proxy (supervised)"
+            )
+            raw_response = await self._raw_request(
+                "GET",
+                "/hassio/core/logs?lines=20000",
+                headers={"Accept": "text/plain"},
+            )
+            return raw_response.text
+
+        logger.debug("Fetching error log via HA Core proxy (Container/pip)")
+        raw_response = await self._raw_request(
+            "GET", "/error_log", headers={"Accept": "text/plain"}
+        )
+        return raw_response.text
+
+    async def _is_supervised_install(self) -> bool:
+        """Detect whether the target HA is a Supervised / HAOS install.
+
+        Probes ``/api/config`` once per client instance and returns
+        ``"hassio" in components``. Cached for the session lifetime on
+        BOTH definite outcomes (True or False), since a successful
+        ``/api/config`` response with or without ``hassio`` is a
+        definitive signal — HA's loaded-components set doesn't change
+        between Supervised and Container at runtime.
+
+        Cache is NOT poisoned on probe failure: a transient network
+        glitch or HTTP error returns False without setting the cache,
+        so the next call re-probes. This is the only path that
+        intentionally fails open — caller proceeds on the historical
+        Container branch (which on HAOS will also fail, but with a
+        clearer 404 than a probe-side exception would surface).
+
+        Auth / connection / HTTP errors are caught explicitly; runtime
+        bugs (TypeError, AttributeError) and BaseException derivatives
+        (KeyboardInterrupt, CancelledError) deliberately propagate so
+        they're not silenced as "not supervised".
+        """
+        if self._supervised_detected is not None:
+            return self._supervised_detected
+        try:
+            config = await self._request("GET", "/config")
+        except (
+            HomeAssistantAuthError,
+            HomeAssistantAPIError,
+            HomeAssistantConnectionError,
+            httpx.HTTPError,
+            TimeoutError,
+        ) as exc:
+            # Fail-open on transport / HTTP-layer failures only. Note:
+            # a 401 here likely means the LLA is bad and the /error_log
+            # fallback will also 401 — the user gets a clearer auth error
+            # from that path than a swallowed probe error would surface.
+            # Logged at WARNING so it's visible at default log levels
+            # without spamming on every call (probe runs at most once
+            # per session per outcome).
+            logger.warning(
+                "Supervised-install probe failed (fail-open to non-supervised): %r",
+                exc,
+            )
+            return False
+        components = config.get("components", []) if isinstance(config, dict) else []
+        is_supervised = isinstance(components, list) and "hassio" in components
+        self._supervised_detected = is_supervised
+        return is_supervised
+
+    async def get_addon_logs(self, slug: str, lines: int | None = None) -> str:
+        """Fetch an add-on's container logs.
+
+        Branch on ``is_running_in_addon()`` (which keys off ``SUPERVISOR_TOKEN``
+        in env): inside the add-on container goes directly to the Supervisor
+        REST API at ``http://supervisor/addons/{slug}/logs`` with the
+        Supervisor token. The HA Core proxy at
+        ``/api/hassio/addons/{slug}/logs`` rejects this token+path combination
+        on current HA Core releases (see #1116) — the direct path bypasses
+        HA Core entirely and is the documented Supervisor contract.
+
+        On non-addon installs (Docker, pyinstaller, pip pointing at a normal
+        HA URL), falls back to the HA Core proxy path. That path requires an
+        admin LLA but works fine when not invoked from the add-on container.
+
+        ``lines`` sets the journald window Supervisor serves via its
+        ``?lines=`` query param (supervisor/api/host.py). Without it,
+        Supervisor returns only its default window (``DEFAULT_LINES = 100``
+        in supervisor/api/const.py) — which silently capped every larger
+        caller-side limit before this param existed. Both branches carry
+        it: the direct endpoint parses the query natively, and HA Core's
+        hassio proxy forwards ``request.query`` upstream
+        (homeassistant/components/hassio/http.py).
+
+        Both branches return ``text/plain`` log content.
+
+        Raises:
+            HomeAssistantAuthError: 401 response, or ``SUPERVISOR_TOKEN`` empty
+                at call time on the addon branch.
+            HomeAssistantAPIError: 403 (role too low — addon needs hassio_role
+                ``manager``), 404 (unknown slug), or other non-2xx. The
+                ``status_code`` attribute lets callers map to specific
+                suggestions.
+            HomeAssistantConnectionError: Network, timeout, or transport error.
+        """
+        if is_running_in_addon():
+            return await self._get_addon_logs_via_supervisor(slug, lines=lines)
+
+        logger.debug(f"Fetching addon logs for slug={slug} via HA Core proxy")
+        response = await self._raw_request(
+            "GET",
+            f"/hassio/addons/{slug}/logs",
+            headers={"Accept": "text/plain"},
+            params={"lines": lines} if lines is not None else None,
+        )
+        return response.text
+
+    @staticmethod
+    def _supervisor_error_message(text_body: str, reason_phrase: str) -> str:
+        """Extract a human message from a Supervisor 4xx/5xx body.
+
+        Supervisor returns ``{"result":"error","message":"..."}`` on some paths;
+        prefer that message, then fall back to the raw text, reason phrase, or a
+        placeholder.
+        """
+        message = ""
+        try:
+            envelope = json.loads(text_body) if text_body else None
+            if isinstance(envelope, dict):
+                msg = envelope.get("message")
+                if isinstance(msg, str) and msg:
+                    message = msg
+        except json.JSONDecodeError:
+            # Body wasn't a JSON envelope; fall back to raw text below.
+            pass
+        if not message:
+            message = text_body.strip() or reason_phrase or "<empty body>"
+        return message
+
+    async def _supervisor_logs_get(self, path: str, lines: int | None = None) -> str:
+        """Fetch ``text/plain`` logs from a Supervisor REST endpoint.
+
+        ``path`` is everything between ``http://supervisor/`` and ``/logs``:
+
+        - ``"addons/<slug>"`` for add-on container logs
+        - ``"<service>"`` (where service ∈ {supervisor, host, core, dns, audio,
+          cli, multicast, observer}) for system-service logs
+
+        ``lines`` maps to the endpoint's ``?lines=`` journald-window query
+        param; omitted → Supervisor's 100-line default window.
+
+        Bypasses ``HomeAssistantClient.httpx_client`` because the Supervisor
+        endpoint uses a different base URL (``http://supervisor``) and a
+        different token (``SUPERVISOR_TOKEN``) than HA Core REST. Both
+        endpoints require the addon's ``hassio_role`` to be ``manager`` (not
+        ``default``); a ``default`` role gets a 403 here — see #1116.
+
+        Raises:
+            HomeAssistantAuthError: ``SUPERVISOR_TOKEN`` absent at call time,
+                or 401 from Supervisor.
+            HomeAssistantAPIError: 403 (role too low — distinct branch with
+                role hint), 404, other 4xx/5xx. Tries to parse Supervisor's
+                ``{"result":"error","message":"..."}`` JSON envelope before
+                falling back to text body / reason phrase / placeholder.
+            HomeAssistantConnectionError: Timeout or transport error, with
+                distinct messages so callers can tell them apart.
+        """
+        token = os.environ.get("SUPERVISOR_TOKEN", "")
+        if not token:
+            # The is_running_in_addon() gate already keys off SUPERVISOR_TOKEN
+            # being truthy, so a direct caller landing here without one is a
+            # detection/config mismatch — fail-fast with a distinct message
+            # so operators don't read it as "token rejected".
+            raise HomeAssistantAuthError(
+                f"Supervisor token absent at call time for /{path}/logs "
+                "(addon-mode gate fired but SUPERVISOR_TOKEN env var not set)"
+            )
+
+        relative_path = f"/{path}/logs"
+        logger.debug(
+            "Fetching %s%s via Supervisor direct (lines=%s)",
+            get_supervisor_base_url(),
+            relative_path,
+            lines,
+        )
+
+        try:
+            async with make_supervisor_httpx_client(
+                timeout=httpx.Timeout(self.timeout),
+                verify=self.verify_ssl,
+            ) as client:
+                response = await client.get(
+                    relative_path,
+                    headers={"Accept": "text/plain"},
+                    params={"lines": lines} if lines is not None else None,
+                )
+        except httpx.TimeoutException as e:
+            raise HomeAssistantConnectionError(
+                f"Timeout fetching /{path}/logs from Supervisor: {e}"
+            ) from e
+        except httpx.HTTPError as e:
+            raise HomeAssistantConnectionError(
+                f"Transport error fetching /{path}/logs from Supervisor: {e}"
+            ) from e
+
+        if response.status_code == 401:
+            raise HomeAssistantAuthError(f"Invalid Supervisor token for /{path}/logs")
+        if response.status_code == 403:
+            # Distinct from 401: token is valid but addon's hassio_role isn't
+            # high enough. Most-likely cause for this exact endpoint at the
+            # time #1116 surfaced (default → manager bump in addon config.yaml
+            # is the same-PR companion fix).
+            logger.warning(
+                "Supervisor returned 403 for /%s/logs — addon hassio_role may "
+                "be too low (need 'manager')",
+                path,
+            )
+            raise HomeAssistantAPIError(
+                f"Supervisor forbids /{path}/logs (403) — addon's hassio_role "
+                "may be 'default'; need 'manager' or higher",
+                status_code=403,
+                response_data={"path": path},
+            )
+        if response.status_code >= 400:
+            text_body = response.text
+            message = self._supervisor_error_message(text_body, response.reason_phrase)
+            logger.warning(
+                "Supervisor returned %s for /%s/logs: %s",
+                response.status_code,
+                path,
+                message,
+            )
+            raise HomeAssistantAPIError(
+                f"API error: {response.status_code} - {message}",
+                status_code=response.status_code,
+                response_data={"message": text_body, "path": path},
+            )
+        return response.text
+
+    async def _get_addon_logs_via_supervisor(
+        self, slug: str, lines: int | None = None
+    ) -> str:
+        """Fetch add-on container logs directly from Supervisor's REST API.
+
+        Distinct from ``tools_bug_report._fetch_addon_logs``: that helper is
+        hardcoded to ``/addons/self/logs`` and silently swallows failures
+        (it's an aux-data fetch for bug reports, fine to skip on error). This
+        helper takes arbitrary slugs and surfaces failures as exceptions
+        because callers (``ha_get_logs(source="supervisor", slug=...)``) need
+        them. Both endpoints require ``hassio_role: manager``.
+
+        Delegates to ``_supervisor_logs_get`` so error handling stays in
+        lockstep with ``_get_system_service_logs``.
+        """
+        return await self._supervisor_logs_get(f"addons/{slug}", lines=lines)
+
+    async def _get_system_service_logs(
+        self, service: str, lines: int | None = None
+    ) -> str:
+        """Fetch HA system-service logs.
+
+        ``service`` must be one of the eight Supervisor-managed services:
+        ``supervisor``, ``host``, ``core``, ``dns``, ``audio``, ``cli``,
+        ``multicast``, ``observer``. Caller is responsible for validating
+        ``service`` against the allowed set; this helper does no validation
+        and will raise ``HomeAssistantAPIError`` on any unknown path (404).
+
+        Branch on ``is_running_in_addon()`` — mirror of ``get_addon_logs``:
+        inside the addon container goes directly to Supervisor at
+        ``http://supervisor/{service}/logs`` with the Supervisor token
+        (``hassio_role: manager`` required). On non-addon installs (Docker
+        without Supervisor, pyinstaller, pip pointing at a normal HA URL),
+        falls back to the HA Core proxy at ``/api/hassio/{service}/logs``.
+
+        All seven slugs are whitelisted in HA Core's hassio proxy
+        (``homeassistant/components/hassio/http.py`` — ``PATHS_ADMIN``), so
+        an admin LLA is sufficient to reach any of them from outside the
+        addon.
+
+        Closes #1260: pre-fix this method had only the addon-direct branch,
+        so non-addon installs (the Docker image, uvx ha-mcp, etc.) hit the
+        ``SUPERVISOR_TOKEN``-absent fail-fast in ``_supervisor_logs_get`` for
+        every service, while the sibling ``source="supervisor"`` (addon
+        logs) call kept working through its own Core-proxy fallback.
+        """
+        if is_running_in_addon():
+            return await self._supervisor_logs_get(service, lines=lines)
+
+        logger.debug(f"Fetching {service} logs via HA Core proxy")
+        response = await self._raw_request(
+            "GET",
+            f"/hassio/{service}/logs",
+            headers={"Accept": "text/plain"},
+            params={"lines": lines} if lines is not None else None,
+        )
+        return response.text
 
     async def test_connection(self) -> tuple[bool, str | None]:
         """
@@ -387,17 +899,11 @@ class HomeAssistantClient:
             else:
                 return False, "Invalid response from Home Assistant"
         except Exception as e:
+            # Intentional broad-catch: is_connected() contract maps any failure
+            # to (False, error_msg); styleguide § "broad except at top-level
+            # setup/teardown handlers" applies (connection probe is the analog).
             logger.error(f"Failed to connect to Home Assistant: {e}")
             return False, str(e)
-
-    async def get_system_health(self) -> dict[str, Any]:
-        """Get system health information."""
-        logger.debug("Fetching system health")
-        try:
-            return await self._request("GET", "/system_health/info")
-        except HomeAssistantAPIError:
-            # System health might not be available in all HA instances
-            return {"status": "unknown", "message": "System health not available"}
 
     # Automation Configuration Management
 
@@ -428,11 +934,11 @@ class HomeAssistantClient:
                     f"Converted entity_id {identifier} to unique_id {unique_id}"
                 )
                 return str(unique_id)
-            except Exception as e:
+            except HomeAssistantError as e:
                 raise HomeAssistantAPIError(
                     f"Failed to resolve automation {identifier}: {str(e)}",
                     status_code=404,
-                )
+                ) from e
         else:
             # Assume it's already a unique_id
             return identifier
@@ -458,16 +964,20 @@ class HomeAssistantClient:
                 "GET", f"/config/automation/config/{unique_id}"
             )
             return response
-        except Exception as e:
-            if "404" in str(e):
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
                 raise HomeAssistantAPIError(
                     f"Automation not found: {identifier} (unique_id: {unique_id})",
                     status_code=404,
-                )
+                ) from e
             raise
 
     async def upsert_automation_config(
-        self, config: dict[str, Any], identifier: str | None = None
+        self,
+        config: dict[str, Any],
+        identifier: str | None = None,
+        *,
+        _resolved: bool = False,
     ) -> dict[str, Any]:
         """
         Create new automation or update existing one.
@@ -475,6 +985,12 @@ class HomeAssistantClient:
         Args:
             config: Automation configuration dictionary
             identifier: Optional automation entity_id or unique_id (None = create new)
+            _resolved: When True, ``identifier`` is already the resolved unique_id
+                (the caller ran ``_resolve_automation_id``), so the redundant
+                entity_id→unique_id lookup is skipped. Ignored on the create path
+                (``identifier is None``). The #1404 config-id mismatch guard below
+                is unaffected — it still compares ``config['id']`` to the resolved
+                unique_id.
 
         Returns:
             Result with automation unique_id and status
@@ -482,17 +998,43 @@ class HomeAssistantClient:
         Raises:
             HomeAssistantAPIError: If configuration invalid or API error
         """
-        import time
-
         # Generate unique_id for new automation if not provided
         if identifier is None:
             unique_id = str(int(time.time() * 1000))
             operation = "created"
             logger.debug(f"Creating new automation with unique_id: {unique_id}")
         else:
-            unique_id = await self._resolve_automation_id(identifier)
+            unique_id = (
+                identifier
+                if _resolved
+                else await self._resolve_automation_id(identifier)
+            )
             operation = "updated"
             logger.debug(f"Updating automation with unique_id: {unique_id}")
+
+        # Reject mismatch between resolved storage key and inner ``config["id"]``.
+        # HA stores by the inner id field even though the URL carries one too —
+        # a divergence silently overwrites the automation whose unique_id matches
+        # the inner id, while reporting success for the URL target (#1404).
+        config_id = config.get("id")
+        if config_id is not None and str(config_id) != str(unique_id):
+            if identifier is None:
+                raise HomeAssistantAPIError(
+                    "Cannot create automation with explicit config['id']="
+                    f"{config_id!r}: Home Assistant stores by the inner id, "
+                    "which would silently overwrite an existing automation. "
+                    "Omit 'id' from config to auto-generate, or pass identifier "
+                    "to update an existing automation.",
+                    status_code=400,
+                )
+            raise HomeAssistantAPIError(
+                f"Mismatched automation id: identifier={identifier!r} resolves "
+                f"to unique_id={unique_id!r}, but config['id']={config_id!r}. "
+                "Refusing to write to prevent overwriting the wrong automation. "
+                f"Remove 'id' from config or set it to the resolved unique_id "
+                f"({unique_id!r}).",
+                status_code=400,
+            )
 
         # Add unique_id to config for updates
         if unique_id and "id" not in config:
@@ -505,51 +1047,73 @@ class HomeAssistantClient:
 
             # For new automations, query Home Assistant to get the actual entity_id that was assigned
             actual_entity_id = None
+            entity_not_verified = False
             if operation == "created":
-                try:
-                    # Give Home Assistant a moment to register the entity
-                    import asyncio
+                actual_entity_id = await self._poll_for_automation_entity(unique_id)
+                if not actual_entity_id:
+                    entity_not_verified = True
 
-                    await asyncio.sleep(1)
-
-                    # Get all automations and find the one with our unique_id
-                    states = await self.get_states()
-                    for state in states:
-                        if state.get("entity_id", "").startswith("automation."):
-                            attributes = state.get("attributes", {})
-                            if attributes.get("id") == unique_id:
-                                actual_entity_id = state.get("entity_id")
-                                logger.debug(
-                                    f"Found actual entity_id for unique_id {unique_id}: {actual_entity_id}"
-                                )
-                                break
-
-                    if not actual_entity_id:
-                        # Fallback to predicted entity_id if we can't find it
-                        actual_entity_id = f"automation.{config.get('alias', unique_id).lower().replace(' ', '_').replace('-', '_')}"
-                        logger.warning(
-                            f"Could not find actual entity_id for unique_id {unique_id}, using predicted: {actual_entity_id}"
-                        )
-
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to query actual entity_id for unique_id {unique_id}: {e}"
-                    )
-                    # Fallback to predicted entity_id
-                    actual_entity_id = f"automation.{config.get('alias', unique_id).lower().replace(' ', '_').replace('-', '_')}"
-
-            return {
+            result: dict[str, Any] = {
                 "unique_id": unique_id,
                 "entity_id": actual_entity_id,
                 "result": response.get("result", "ok"),
                 "operation": operation,
             }
-        except Exception as e:
-            if "400" in str(e):
+            if entity_not_verified:
+                result["entity_not_verified"] = True
+            return result
+        except HomeAssistantAPIError as e:
+            if e.status_code == 400:
                 raise HomeAssistantAPIError(
                     f"Invalid automation configuration: {str(e)}", status_code=400
-                )
+                ) from e
             raise
+
+    # Upper-bound budget for the WS-driven discovery wait (and its REST
+    # fallback). Preserves the 6s ceiling PR #1384 tuned for the legacy
+    # cadence loop; the WS path resolves in <1s on the happy path because
+    # ``state_changed`` fires as soon as HA hydrates the new entity. The
+    # cadence tuple itself is gone — uniform polling at ``poll_interval``
+    # is fine when the WS happy path is the primary route. #1389's
+    # cadence-measurement instrumentation also retired with the loop;
+    # the WS waiter logs `time.monotonic()` elapsed via its own debug
+    # line at ``util_helpers._ws_wait_for_condition``.
+    _POLL_BUDGET_S: float = 6.0
+
+    async def _poll_for_automation_entity(self, unique_id: str) -> str | None:
+        """Discover the entity_id assigned to a newly created automation.
+
+        Delegates to ``wait_for_automation_entity_by_unique_id`` which uses
+        a ``state_changed`` WebSocket subscription filtered on
+        ``new_state.attributes.id == unique_id`` and falls back to REST
+        polling of ``get_states()`` when the WebSocket is unavailable.
+        See #1152 / #1395 for context.
+        """
+        # Local import: ``util_helpers`` imports from ``rest_client`` for
+        # the typed-error classes, so a module-level import here would be
+        # circular. Mirrors the same pattern in ``_get_waiter_ws_client``.
+        from ..tools.util_helpers import wait_for_automation_entity_by_unique_id
+
+        try:
+            entity_id = await wait_for_automation_entity_by_unique_id(
+                self, unique_id, timeout=self._POLL_BUDGET_S
+            )
+        except HomeAssistantError as e:
+            # Narrow catch: programming bugs (TypeError/KeyError/etc.) propagate.
+            # Mirrors test-side _POLLING_TRANSIENT_ERRORS in
+            # tests/src/e2e/utilities/wait_helpers.py and styleguide §
+            # "Exception Handling in Test Polling Loops".
+            logger.warning(
+                f"Failed to discover entity_id for unique_id {unique_id}: {e}",
+                exc_info=True,
+            )
+            return None
+
+        if entity_id is not None:
+            logger.debug(
+                f"Found actual entity_id for unique_id {unique_id}: {entity_id}"
+            )
+        return entity_id
 
     async def delete_automation_config(self, identifier: str) -> dict[str, Any]:
         """
@@ -582,7 +1146,7 @@ class HomeAssistantClient:
                 raise HomeAssistantAPIError(
                     f"Automation not found: {identifier} (unique_id: {unique_id})",
                     status_code=404,
-                )
+                ) from e
             elif e.status_code == 405:
                 raise HomeAssistantAPIError(
                     f"Cannot delete automation '{identifier}': The HTTP DELETE method is blocked. "
@@ -595,14 +1159,14 @@ class HomeAssistantClient:
                     f"(e.g., 'DELETE_{identifier}') so you can identify and manually delete it later "
                     f"via the Home Assistant UI (Settings > Automations & Scenes).",
                     status_code=405,
-                )
+                ) from e
             raise
         except Exception as e:
             if "404" in str(e):
                 raise HomeAssistantAPIError(
                     f"Automation not found: {identifier} (unique_id: {unique_id})",
                     status_code=404,
-                )
+                ) from e
             raise
 
     async def start_config_flow(
@@ -621,7 +1185,7 @@ class HomeAssistantClient:
         Raises:
             HomeAssistantAPIError: If flow start fails
         """
-        payload = {"handler": handler}
+        payload: dict[str, Any] = {"handler": handler}
         if context:
             payload["context"] = context
 
@@ -639,7 +1203,7 @@ class HomeAssistantClient:
             user_input: Form data for current step
 
         Returns:
-            Flow result: type = "create_entry" | "form" | "abort"
+            Flow result: type = "create_entry" | "form" | "menu" | "abort"
 
         Raises:
             HomeAssistantAPIError: If flow submission fails
@@ -647,6 +1211,156 @@ class HomeAssistantClient:
         logger.debug(f"Submitting flow step for flow_id: {flow_id}")
         return await self._request(
             "POST", f"/config/config_entries/flow/{flow_id}", json=user_input
+        )
+
+    async def abort_config_flow(self, flow_id: str) -> dict[str, Any]:
+        """
+        Abort an in-progress config entry flow.
+
+        Args:
+            flow_id: Flow ID to abort
+
+        Returns:
+            Abort confirmation
+
+        Raises:
+            HomeAssistantAPIError: If flow not found or API error
+        """
+        logger.debug(f"Aborting config flow: {flow_id}")
+        return await self._request("DELETE", f"/config/config_entries/flow/{flow_id}")
+
+    async def start_options_flow(self, entry_id: str) -> dict[str, Any]:
+        """
+        Start an options flow for a config entry.
+
+        The options flow allows configuring an existing integration
+        (equivalent to clicking "Configure" in the HA UI).
+
+        Args:
+            entry_id: Config entry ID to configure
+
+        Returns:
+            Flow data with flow_id, step_id, type (form|menu),
+            and data_schema or menu_options
+
+        Raises:
+            HomeAssistantAPIError: If flow start fails
+        """
+        logger.debug(f"Starting options flow for entry: {entry_id}")
+        return await self._request(
+            "POST",
+            "/config/config_entries/options/flow",
+            json={"handler": entry_id},
+        )
+
+    async def submit_options_flow_step(
+        self, flow_id: str, user_input: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        Submit data for an options flow step.
+
+        Args:
+            flow_id: Flow ID from start_options_flow or previous step
+            user_input: Form data or menu selection
+
+        Returns:
+            Flow result: type = "create_entry" | "form" | "menu" | "abort"
+
+        Raises:
+            HomeAssistantAPIError: If flow submission fails
+        """
+        logger.debug(f"Submitting options flow step for flow_id: {flow_id}")
+        return await self._request(
+            "POST",
+            f"/config/config_entries/options/flow/{flow_id}",
+            json=user_input,
+        )
+
+    async def abort_options_flow(self, flow_id: str) -> dict[str, Any]:
+        """
+        Abort an in-progress options flow without saving changes.
+
+        Args:
+            flow_id: Flow ID to abort
+
+        Returns:
+            Abort confirmation
+
+        Raises:
+            HomeAssistantAPIError: If flow not found or API error
+        """
+        logger.debug(f"Aborting options flow: {flow_id}")
+        return await self._request(
+            "DELETE", f"/config/config_entries/options/flow/{flow_id}"
+        )
+
+    async def start_config_subentry_flow(
+        self,
+        entry_id: str,
+        subentry_type: str,
+        *,
+        subentry_id: str | None = None,
+        show_advanced_options: bool | None = None,
+    ) -> dict[str, Any]:
+        """Start a config subentry create or reconfigure flow."""
+        # HA 2026.6+ treats show_advanced_options as a no-op; keep passing it
+        # for older HA versions until the server-side property is removed.
+        # HA requires the handler as [parent_entry_id, subentry_type].
+        payload: dict[str, Any] = {"handler": [entry_id, subentry_type]}
+        if subentry_id is not None:
+            payload["subentry_id"] = subentry_id
+        if show_advanced_options is not None:
+            payload["show_advanced_options"] = show_advanced_options
+
+        logger.debug(
+            "Starting config subentry flow for entry %s and type %s",
+            entry_id,
+            subentry_type,
+        )
+        return await self._request(
+            "POST",
+            "/config/config_entries/subentries/flow",
+            json=payload,
+        )
+
+    async def submit_config_subentry_flow_step(
+        self, flow_id: str, user_input: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Submit data for a config subentry flow step."""
+        logger.debug("Submitting config subentry flow step for flow_id: %s", flow_id)
+        return await self._request(
+            "POST",
+            f"/config/config_entries/subentries/flow/{flow_id}",
+            json=user_input,
+        )
+
+    async def abort_config_subentry_flow(self, flow_id: str) -> dict[str, Any]:
+        """Abort an in-progress config subentry flow."""
+        logger.debug("Aborting config subentry flow: %s", flow_id)
+        return await self._request(
+            "DELETE", f"/config/config_entries/subentries/flow/{flow_id}"
+        )
+
+    async def list_config_subentries(self, entry_id: str) -> dict[str, Any]:
+        """List subentries for a config entry."""
+        logger.debug("Listing config subentries for entry: %s", entry_id)
+        return await self.send_websocket_message(
+            {"type": "config_entries/subentries/list", "entry_id": entry_id}
+        )
+
+    async def delete_config_subentry(
+        self,
+        entry_id: str,
+        subentry_id: str,
+    ) -> dict[str, Any]:
+        """Delete a config subentry."""
+        logger.debug("Deleting config subentry %s for entry %s", subentry_id, entry_id)
+        return await self.send_websocket_message(
+            {
+                "type": "config_entries/subentries/delete",
+                "entry_id": entry_id,
+                "subentry_id": subentry_id,
+            }
         )
 
     async def get_config_entry(self, entry_id: str) -> dict[str, Any]:
@@ -666,8 +1380,10 @@ class HomeAssistantClient:
             HomeAssistantAPIError: If entry not found or API error
         """
         logger.debug(f"Getting config entry: {entry_id}")
-        # List all entries and filter by entry_id
-        entries = await self._request("GET", "/config/config_entries/entry")
+        # List all entries and filter by entry_id.
+        # Typed as Any because _request returns dict[str, Any] generically,
+        # but this endpoint actually returns a list.
+        entries: Any = await self._request("GET", "/config/config_entries/entry")
 
         if not isinstance(entries, list):
             raise HomeAssistantAPIError(
@@ -675,20 +1391,43 @@ class HomeAssistantClient:
                 status_code=500,
             )
 
-        for entry in entries:
-            if entry.get("entry_id") == entry_id:
-                return entry
-
-        raise HomeAssistantAPIError(
-            f"Config entry not found: {entry_id}",
-            status_code=404,
+        found: dict[str, Any] | None = next(
+            (dict(e) for e in entries if e.get("entry_id") == entry_id), None
         )
+        if found is None:
+            raise HomeAssistantAPIError(
+                f"Config entry not found: {entry_id}",
+                status_code=404,
+            )
+        return found
+
+    async def delete_config_entry(self, entry_id: str) -> dict[str, Any]:
+        """Delete a config entry via REST API.
+
+        The WebSocket command ``config_entries/delete`` is not supported by
+        Home Assistant.  The REST endpoint ``DELETE /api/config/config_entries/
+        entry/{entry_id}`` is the correct way to remove a config entry.
+
+        Args:
+            entry_id: Config entry ID to delete.
+
+        Returns:
+            Result dict with ``require_restart`` flag.
+
+        Raises:
+            HomeAssistantAPIError: If the entry is not found or the API
+                returns an error status.
+        """
+        logger.debug(f"Deleting config entry: {entry_id}")
+        return await self._request("DELETE", f"/config/config_entries/entry/{entry_id}")
 
     async def send_websocket_message(self, message: dict[str, Any]) -> dict[str, Any]:
         """Send message via WebSocket and wait for response.
 
-        Uses the global WebSocket singleton to avoid race conditions from
-        parallel tool calls creating multiple simultaneous connections.
+        Uses a per-client WebSocket connection keyed to the client's own
+        credentials (base_url + token). This ensures OAuth mode uses the
+        real HA credentials from the token claims, not the global sentinel
+        settings.
         """
         from .websocket_client import get_websocket_client
 
@@ -696,9 +1435,21 @@ class HomeAssistantClient:
         retry_delay = 0.5  # seconds
 
         for attempt in range(max_retries):
+            # Whether the failure happened before a usable connection existed.
+            # Failing to obtain one is transport death whatever class the
+            # manager raises, and it raises a bare ``Exception`` when
+            # ``connect()`` returns False, so this cannot be decided by type.
+            acquiring = True
             try:
-                # Use singleton WebSocket client (shared, reused connection)
-                ws_client = await get_websocket_client()
+                # Use per-client WebSocket keyed to this client's credentials
+                # (verify_ssl included so a verify_ssl=False client never
+                # shares a default-verification pooled connection).
+                ws_client = await get_websocket_client(
+                    url=self.base_url,
+                    token=self.token,
+                    verify_ssl=self.verify_ssl,
+                )
+                acquiring = False
 
                 # Special handling for render_template which returns an event with the actual result
                 if message.get("type") == "render_template":
@@ -713,152 +1464,240 @@ class HomeAssistantClient:
 
             except Exception as e:
                 error_str = str(e)
+                is_403 = "403" in error_str and "Forbidden" in error_str
 
-                # Detect transient 403 errors (rate limiting / reverse proxy throttling)
-                if "403" in error_str and "Forbidden" in error_str:
-                    if attempt < max_retries - 1:
-                        logger.warning(
-                            f"WebSocket 403 error (attempt {attempt + 1}/{max_retries}), "
-                            f"retrying after {retry_delay}s: {error_str}"
-                        )
-                        await asyncio.sleep(retry_delay)
-                        continue
-                    else:
-                        logger.error(f"WebSocket 403 error after {max_retries} attempts: {error_str}")
-                        return {
-                            "success": False,
-                            "error": f"WebSocket request blocked (403 Forbidden): {error_str}",
-                            "suggestions": [
-                                "This may be caused by a reverse proxy or security filter",
-                                "Try simplifying the request (e.g., shorter templates, fewer parameters)",
-                                "If using complex templates, try breaking them into smaller parts",
-                                "Check if your Home Assistant is behind a reverse proxy with security rules",
-                            ],
-                        }
+                # Transient 403 (rate limiting / reverse proxy throttling): retry
+                # before deciding anything, since the next attempt may succeed.
+                if is_403 and attempt < max_retries - 1:
+                    logger.warning(
+                        f"WebSocket 403 error (attempt {attempt + 1}/{max_retries}), "
+                        f"retrying after {retry_delay}s: {error_str}"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    continue
 
-                logger.error(f"WebSocket message failed: {e}")
-                return {"success": False, "error": str(e)}
+                # Phase first, type second. Failing before a client exists is
+                # evidence about the transport whatever class was raised, and
+                # the pooled manager raises a bare ``Exception`` when
+                # ``connect()`` returns False, so that case cannot be decided
+                # by type. Past acquisition only the no-answer classes count:
+                # ``send_command`` deliberately re-raises the original
+                # ``ConnectionClosed`` / ``ConnectionResetError`` from the send
+                # rather than wrapping it, to keep at-most-once semantics for
+                # write callers, so those arrive here untranslated. Anything
+                # else (a ``ValueError`` from building the message, say) is a
+                # bug rather than evidence about the connection.
+                if acquiring or isinstance(e, _NO_ANSWER_ERRORS):
+                    # One error channel for "no answer came back" (#1947): the
+                    # caller decides the policy, rather than every consumer
+                    # having to notice a marker on an otherwise ordinary
+                    # failure envelope. Callers that legitimately continue on a
+                    # missing answer catch this and say in ``warnings`` what
+                    # they skipped; callers whose output would read as a
+                    # negative finding let it propagate.
+                    logger.error(
+                        f"WebSocket transport failed ({message.get('type')}): {e}"
+                    )
+                    if isinstance(e, HomeAssistantConnectionError):
+                        # Already the right class — re-raise unchanged so
+                        # subtypes (``HomeAssistantCommandNotSent``) and the
+                        # original traceback survive.
+                        raise
+                    raise HomeAssistantConnectionError(error_str) from e
+
+                # Deliberate asymmetry (#1966 review item 8): a 403 that
+                # exhausts its retries DURING acquisition is transport death -
+                # no client was ever obtained - so it raises and loses the
+                # reverse-proxy suggestions below. The 403 text survives in the
+                # message, and returning a soft envelope there instead would
+                # put a blocked transport back on the degrade path this change
+                # exists to close. Past acquisition the socket is alive and HA
+                # (or a proxy) answered, so the tailored suggestions apply.
+                if is_403:
+                    logger.error(
+                        f"WebSocket 403 error after {max_retries} attempts: {error_str}"
+                    )
+                    return {
+                        "success": False,
+                        "error": f"WebSocket request blocked (403 Forbidden): {error_str}",
+                        "error_code": getattr(e, "code", None),
+                        "suggestions": [
+                            "This may be caused by a reverse proxy or security filter",
+                            "Try simplifying the request (e.g., shorter templates, fewer parameters)",
+                            "If using complex templates, try breaking them into smaller parts",
+                            "Check if your Home Assistant is behind a reverse proxy with security rules",
+                        ],
+                    }
+
+                # Name the command in the log line: a bare "Command failed:
+                # Unknown command." is undiagnosable from a user's log
+                # (issue #1889 took a live reproduction to attribute).
+                logger.error(f"WebSocket message failed ({message.get('type')}): {e}")
+                # Preserve HA's structured error code (e.g. ``not_found``) so callers
+                # can distinguish HA's authoritative verdict from a transient failure
+                # instead of only seeing the stringified message.
+                return {
+                    "success": False,
+                    "error": str(e),
+                    "error_code": getattr(e, "code", None),
+                }
+
+        # Unreachable: every attempt either returns, raises, or ``continue``s,
+        # and the last attempt cannot ``continue`` (the 403 branch guards on
+        # ``attempt < max_retries - 1``). Assert rather than return a
+        # contextless failure envelope that would read as a soft error.
+        raise AssertionError("send_websocket_message loop exited without a result")
 
     async def _handle_render_template(
         self, ws_client: Any, message: dict[str, Any]
     ) -> dict[str, Any]:
         """Handle render_template WebSocket command with event-based response."""
-
-        # Generate our own message ID to track the response
-        message_id = ws_client.get_next_message_id()
-
-        # Construct the full message with proper ID
-        full_message = {
-            "id": message_id,
-            "type": "render_template",
-            "template": message.get("template"),
-            "timeout": message.get("timeout", 3),
-            "report_errors": message.get("report_errors", True),
-        }
-
-        # Create futures for both result and event responses
-        result_future = ws_client.register_pending_response(message_id)
-        event_future = ws_client.register_render_template_event(message_id)
-
-        # Use WebSocket client's send helper to transmit the message
-        try:
-            await ws_client.send_json_message(full_message)
-        except Exception as e:
-            ws_client.cancel_pending_response(message_id)
-            ws_client.cancel_render_template_event(message_id)
-            raise e
+        template_timeout = message.get("timeout", 3)
 
         try:
-            # Wait for the initial result response (should be success with null result)
-            result_response = await asyncio.wait_for(
-                result_future, timeout=message.get("timeout", 3) + 2
+            _, event_response = await ws_client.send_command_with_event(
+                "render_template",
+                wait_timeout=template_timeout + 2,
+                template=message.get("template"),
+                timeout=template_timeout,
+                report_errors=message.get("report_errors", True),
             )
-            logger.debug(f"WebSocket render_template result: {result_response}")
+            logger.debug(f"WebSocket render_template event: {event_response}")
 
-            if not result_response.get("success"):
-                ws_client.cancel_render_template_event(message_id)
-                error = result_response.get("error", "Unknown error")
+            # Extract template result from event
+            if "event" in event_response and "result" in event_response["event"]:
+                template_result = event_response["event"]["result"]
+                listeners_info = event_response["event"].get("listeners", {})
+
                 return {
-                    "success": False,
-                    "error": str(error),
+                    "success": True,
+                    "result": template_result,
                     "template": message.get("template"),
+                    "listeners": listeners_info,
                 }
-
-            # Wait for the event with the actual template result
-            try:
-                event_response = await asyncio.wait_for(
-                    event_future, timeout=message.get("timeout", 3) + 1
-                )
-                logger.debug(f"WebSocket render_template event: {event_response}")
-
-                # Extract template result from event
-                if "event" in event_response and "result" in event_response["event"]:
-                    template_result = event_response["event"]["result"]
-                    listeners_info = event_response["event"].get("listeners", {})
-
-                    return {
-                        "success": True,
-                        "result": template_result,
-                        "template": message.get("template"),
-                        "listeners": listeners_info,
-                    }
-                else:
-                    return {
-                        "success": False,
-                        "error": "Invalid event response format",
-                        "template": message.get("template"),
-                    }
-
-            except TimeoutError:
-                ws_client.cancel_render_template_event(message_id)
+            else:
                 return {
                     "success": False,
-                    "error": "Event timeout - template result not received",
+                    "error": "Invalid event response format",
                     "template": message.get("template"),
                 }
 
         except TimeoutError:
-            ws_client.cancel_pending_response(message_id)
-            ws_client.cancel_render_template_event(message_id)
+            # Template-level, not transport-level: the wait budget here is the
+            # caller's own ``timeout`` (default 3s) plus two seconds, and a
+            # template that is merely slow to render leaves the socket healthy.
+            # Deliberately NOT treated as a dead transport, unlike the 30s
+            # round-trip ``HomeAssistantCommandTimeout`` in ``send_command``.
             return {
                 "success": False,
-                "error": "Command timeout",
+                "error": "Event timeout - template result not received",
                 "template": message.get("template"),
             }
         except Exception as e:
-            ws_client.cancel_pending_response(message_id)
-            ws_client.cancel_render_template_event(message_id)
+            if isinstance(e, _NO_ANSWER_ERRORS):
+                # Let the caller's classification decide. Returning an envelope
+                # here would route a transport death around the fail-loud policy
+                # in ``send_websocket_message`` — the very swallow this branch
+                # used to hide (#1947).
+                raise
             return {
                 "success": False,
                 "error": str(e),
                 "template": message.get("template"),
             }
 
+    async def _resolve_script_id(self, identifier: str) -> str:
+        """
+        Resolve a script identifier to its storage key via the entity registry.
+
+        Scripts may be renamed in the HA UI, changing the entity_id but keeping
+        the original storage key. This method looks up the entity registry via
+        WebSocket to find the actual storage key (unique_id).
+
+        Unlike automations (which expose their storage key in state attributes),
+        scripts require a WebSocket entity registry lookup.
+
+        Args:
+            identifier: Script ID (with or without 'script.' prefix)
+
+        Returns:
+            The storage key for the configuration API
+        """
+        bare_id = identifier.removeprefix("script.")
+        entity_id = f"script.{bare_id}"
+        try:
+            result = await self.send_websocket_message(
+                {"type": "config/entity_registry/get", "entity_id": entity_id}
+            )
+            if result.get("success") is not False:
+                unique_id = result.get("result", {}).get("unique_id")
+                if unique_id:
+                    if unique_id != bare_id:
+                        logger.debug(
+                            f"Resolved script entity_id {entity_id} to storage key {unique_id}"
+                        )
+                    return str(unique_id)
+        except HomeAssistantConnectionError:
+            # A dead transport must not become a silent guess: the fallback
+            # below assumes the storage key equals the bare entity_id, which is
+            # exactly what a UI rename breaks. Guessing it on a write path
+            # writes a NEW object under the wrong key instead of updating the
+            # renamed one, so let the caller fail loud (#1947).
+            raise
+        except Exception:
+            logger.debug(
+                f"Entity registry lookup failed for {entity_id}, using bare id: {bare_id}",
+                exc_info=True,  # Log full traceback for better debugging
+            )
+        return bare_id
+
     async def get_script_config(self, script_id: str) -> dict[str, Any]:
         """Get Home Assistant script configuration by script_id."""
+        resolved_id = await self._resolve_script_id(script_id)
         try:
-            endpoint = f"config/script/config/{script_id}"
+            endpoint = f"config/script/config/{resolved_id}"
             response = await self._request("GET", endpoint)
 
-            return {"success": True, "script_id": script_id, "config": response}
+            return {"success": True, "script_id": resolved_id, "config": response}
         except HomeAssistantAPIError as e:
             if e.status_code == 404:
-                raise HomeAssistantAPIError(
-                    f"Script not found: {script_id}", status_code=404
-                )
+                msg = f"Script not found: {script_id}"
+                if resolved_id != script_id:
+                    msg += f" (resolved storage key: {resolved_id})"
+                raise HomeAssistantAPIError(msg, status_code=404) from e
             raise
         except Exception as e:
             logger.error(f"Failed to get script config for {script_id}: {e}")
             raise
 
     async def upsert_script_config(
-        self, config: dict[str, Any], script_id: str
+        self,
+        config: dict[str, Any],
+        script_id: str,
+        *,
+        resolved_id: str | None = None,
     ) -> dict[str, Any]:
-        """Create or update Home Assistant script configuration."""
-        try:
-            endpoint = f"config/script/config/{script_id}"
+        """Create or update Home Assistant script configuration.
 
-            # Validate required fields
+        ``resolved_id``, when provided, is the already-resolved storage key used
+        as the write target (the caller ran :meth:`_resolve_script_id`),
+        skipping the redundant entity-registry lookup. ``script_id`` stays the
+        CALLER's identifier and is used only to default a missing ``alias`` — a
+        renamed script (whose storage key differs from the entity slug the
+        caller passed) keeps its caller-facing name rather than resetting the
+        user-visible alias to the stale storage key (#1935).
+        """
+        write_id = (
+            resolved_id
+            if resolved_id is not None
+            else await self._resolve_script_id(script_id)
+        )
+        try:
+            endpoint = f"config/script/config/{write_id}"
+
+            # Default a missing alias from the CALLER's ``script_id`` (not
+            # ``write_id``) so a renamed script's user-visible name is preserved
+            # instead of being reset to the storage key.
             if "alias" not in config:
                 config["alias"] = script_id
 
@@ -873,7 +1712,7 @@ class HomeAssistantClient:
 
             return {
                 "success": True,
-                "script_id": script_id,
+                "script_id": write_id,
                 "result": response.get("result", "ok"),
                 "operation": "created" if response.get("result") == "ok" else "updated",
             }
@@ -883,21 +1722,23 @@ class HomeAssistantClient:
 
     async def delete_script_config(self, script_id: str) -> dict[str, Any]:
         """Delete Home Assistant script configuration."""
+        resolved_id = await self._resolve_script_id(script_id)
         try:
-            endpoint = f"config/script/config/{script_id}"
+            endpoint = f"config/script/config/{resolved_id}"
             response = await self._request("DELETE", endpoint)
 
             return {
                 "success": True,
-                "script_id": script_id,
+                "script_id": resolved_id,
                 "result": response.get("result", "ok"),
                 "operation": "deleted",
             }
         except HomeAssistantAPIError as e:
             if e.status_code == 404:
-                raise HomeAssistantAPIError(
-                    f"Script not found: {script_id}", status_code=404
-                )
+                msg = f"Script not found: {script_id}"
+                if resolved_id != script_id:
+                    msg += f" (resolved storage key: {resolved_id})"
+                raise HomeAssistantAPIError(msg, status_code=404) from e
             elif e.status_code == 405:
                 raise HomeAssistantAPIError(
                     f"Cannot delete script '{script_id}': The HTTP DELETE method is blocked. "
@@ -912,18 +1753,281 @@ class HomeAssistantClient:
                     f"(e.g., 'DELETE_{script_id}') so you can identify and manually delete it later "
                     f"via the Home Assistant UI (Settings > Automations & Scenes > Scripts).",
                     status_code=405,
+                ) from e
+            raise
+
+    async def _resolve_scene(self, identifier: str) -> SceneResolution:
+        """Resolve a scene identifier to its storage key AND registry metadata.
+
+        Backs :meth:`resolve_scene_id`. Returns the storage key together with
+        ``registry_hit`` (did the entity actually resolve?) and ``platform`` - the
+        two signals a bare storage key throws away. Callers that hit a config-API
+        404 need ``registry_hit`` to tell "entity missing" from "entity exists but
+        has no editable storage config", and ``platform`` to name the owning
+        integration in the resulting error (issue #1971).
+
+        Args:
+            identifier: Scene ID (with or without ``scene.`` prefix)
+
+        Returns:
+            A :class:`SceneResolution`. On any lookup failure it falls back to the
+            bare id with ``registry_hit=False`` - a write path must not treat the
+            guessed bare id as a confirmed resolve.
+        """
+        bare_id = identifier.removeprefix("scene.")
+        entity_id = f"scene.{bare_id}"
+        try:
+            result = await self.send_websocket_message(
+                {"type": "config/entity_registry/get", "entity_id": entity_id}
+            )
+            if result.get("success") is not False:
+                entry = result.get("result") or {}
+                unique_id = entry.get("unique_id")
+                if unique_id:
+                    if unique_id != bare_id:
+                        logger.debug(
+                            f"Resolved scene entity_id {entity_id} to storage key {unique_id}"
+                        )
+                    return SceneResolution(
+                        storage_key=str(unique_id),
+                        registry_hit=True,
+                        platform=entry.get("platform"),
+                    )
+        except HomeAssistantConnectionError:
+            # A dead transport must not become a silent guess: the fallback
+            # below assumes the storage key equals the bare entity_id, which is
+            # exactly what a UI rename breaks. Guessing it on a write path
+            # writes a NEW object under the wrong key instead of updating the
+            # renamed one, so let the caller fail loud (#1947).
+            raise
+        except Exception:
+            logger.debug(
+                f"Entity registry lookup failed for {entity_id}, using bare id: {bare_id}",
+                exc_info=True,
+            )
+        return SceneResolution(storage_key=bare_id, registry_hit=False, platform=None)
+
+    async def resolve_scene_id(self, identifier: str) -> str:
+        """
+        Resolve a scene identifier to its storage key via the entity registry.
+
+        Scenes may be renamed in the HA UI, changing the entity_id but keeping
+        the original storage key. Like :meth:`_resolve_script_id`, this returns
+        the bare storage key and needs a WebSocket entity registry lookup because
+        the state attributes do not surface it; the parity ends there, since the
+        underlying :meth:`_resolve_scene` additionally carries registry metadata
+        (``registry_hit``/``platform``) that the script resolver has no analogue for.
+
+        Thin wrapper over :meth:`_resolve_scene` for callers that only need the
+        storage key (e.g. the write path); the read/delete paths use the richer
+        :class:`SceneResolution` directly.
+
+        Args:
+            identifier: Scene ID (with or without ``scene.`` prefix)
+
+        Returns:
+            The storage key for the configuration API
+        """
+        return (await self._resolve_scene(identifier)).storage_key
+
+    async def _scene_state_exists(self, storage_key: str) -> bool:
+        """Return True if ``scene.<storage_key>`` exists in the state machine.
+
+        An ``id``-less YAML scene has no registry ``unique_id`` (so
+        ``registry_hit`` is False) yet still registers a state-machine entity.
+        This one-shot existence check separates that real-but-not-storage scene
+        from a genuinely-absent one after a config-API 404 (issue #1971). A 404
+        here is a clean "absent"; a transport failure propagates (fail loud).
+        """
+        try:
+            await self.get_entity_state(f"scene.{storage_key}")
+            return True
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                return False
+            raise
+
+    async def _raise_scene_config_404(
+        self,
+        scene_id: str,
+        resolved_id: str,
+        resolution: SceneResolution | None,
+    ) -> NoReturn:
+        """Translate a scene config-API 404 into the right exception.
+
+        When the registry resolve succeeded (``registry_hit``), the entity exists
+        and the 404 means "no editable storage config" → raise
+        :class:`SceneStorageConfigNotFoundError` carrying the platform. On a
+        registry miss the entity may still be an ``id``-less YAML scene, which has
+        no registry ``unique_id`` yet exists in the state machine: a state hit
+        upgrades the 404 to the same not-storage-scene case with ``platform=None``
+        (issue #1971). Only a state miss too is the historic genuinely-absent bare
+        404. The state check is skipped when ``resolution`` is None (the internal
+        ``_resolved`` re-fetch fast path, where a 404 is a genuine disappearance).
+        Always raises.
+        """
+        if resolution is not None:
+            if resolution.registry_hit:
+                raise SceneStorageConfigNotFoundError(
+                    scene_id, platform=resolution.platform, storage_key=resolved_id
                 )
+            if await self._scene_state_exists(resolved_id):
+                raise SceneStorageConfigNotFoundError(
+                    scene_id, platform=None, storage_key=resolved_id
+                )
+        msg = f"Scene not found: {scene_id}"
+        if resolved_id != scene_id:
+            msg += f" (resolved storage key: {resolved_id})"
+        raise HomeAssistantAPIError(msg, status_code=404)
+
+    async def get_scene_config(
+        self,
+        scene_id: str,
+        *,
+        _resolved: bool = False,
+        resolution: SceneResolution | None = None,
+    ) -> dict[str, Any]:
+        """Get Home Assistant scene configuration by scene_id.
+
+        ``resolution`` lets a caller that already ran :meth:`_resolve_scene` pass
+        the full outcome through: the endpoint uses its ``storage_key`` and its
+        ``registry_hit``/``platform`` drive the config-404 classification (issue
+        #1971) with no extra lookup. It takes precedence over ``_resolved``.
+
+        ``_resolved=True`` signals ``scene_id`` is already the resolved storage
+        key (the caller ran :meth:`resolve_scene_id`), skipping the redundant
+        registry lookup. ``resolve_scene_id`` is idempotent, so the result is
+        identical either way. This fast path is the internal re-fetch of an
+        already-resolved scene (its sole caller is the post-write re-fetch), where
+        a subsequent 404 is a genuine disappearance, not the not-storage-scene
+        case; the ``registry_hit``/``platform`` signals a config 404 needs are
+        deliberately unavailable there.
+        """
+        if resolution is not None:
+            resolved_id = resolution.storage_key
+        elif _resolved:
+            resolved_id = scene_id
+        else:
+            resolution = await self._resolve_scene(scene_id)
+            resolved_id = resolution.storage_key
+        try:
+            endpoint = f"config/scene/config/{resolved_id}"
+            response = await self._request("GET", endpoint)
+
+            return {"success": True, "scene_id": resolved_id, "config": response}
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                await self._raise_scene_config_404(scene_id, resolved_id, resolution)
             raise
         except Exception as e:
+            logger.error(f"Failed to get scene config for {scene_id}: {e}")
             raise
 
+    async def upsert_scene_config(
+        self,
+        config: dict[str, Any],
+        scene_id: str,
+        *,
+        resolved_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create or update Home Assistant scene configuration.
 
-async def create_client() -> HomeAssistantClient:
-    """Create and return a new Home Assistant client."""
-    return HomeAssistantClient()
+        ``resolved_id``, when provided, is the already-resolved storage key used
+        as the write target (the caller ran :meth:`resolve_scene_id`), skipping
+        the redundant registry lookup. ``scene_id`` stays the CALLER's identifier
+        and is used only to default a missing ``name`` — a renamed scene (whose
+        storage key differs from the slug the caller passed) keeps its
+        caller-facing name rather than resetting to the stale storage key
+        (#1935, mirrors the script fix).
+        """
+        write_id = (
+            resolved_id
+            if resolved_id is not None
+            else await self.resolve_scene_id(scene_id)
+        )
+        try:
+            endpoint = f"config/scene/config/{write_id}"
 
+            # Default a name when missing from the CALLER's ``scene_id`` (not
+            # ``write_id``) — mirrors the script upsert behaviour so a bare
+            # config dict is acceptable, without resetting a renamed scene's
+            # name to the storage key. Strip the ``scene.`` prefix: a caller may
+            # pass the entity_id form (``resolve_scene_id`` accepts it), and HA
+            # derives the entity_id from the name slug — persisting the prefixed
+            # form would rename the scene and change its entity_id on a plain update.
+            if "name" not in config:
+                config["name"] = scene_id.removeprefix("scene.")
 
-async def test_connection_with_config() -> tuple[bool, str | None]:
-    """Test connection using configuration settings."""
-    async with HomeAssistantClient() as client:
-        return await client.test_connection()
+            # Validate required field. ``entities`` is a dict keyed by entity_id,
+            # not a list — distinct from script ``sequence`` and automation ``action``.
+            if "entities" not in config:
+                raise ValueError(
+                    "Scene configuration must include an 'entities' field "
+                    "(a dict keyed by entity_id)"
+                )
+
+            response = await self._request("POST", endpoint, json=config)
+
+            # Issue #1168 R3 blocker 4: HA's POST /config/scene/config/<id>
+            # returns the same ``"ok"`` for both create and update — the
+            # previous ``"created" if "ok" else "updated"`` heuristic was a
+            # tautology that always reported "created". Drop the field
+            # rather than ship a misleading signal; callers tracking write
+            # activity should diff before/after via ``ha_config_get_scene``.
+            return {
+                "success": True,
+                "scene_id": write_id,
+                "result": response.get("result", "ok"),
+            }
+        except Exception as e:
+            logger.error(f"Failed to upsert scene config for {scene_id}: {e}")
+            raise
+
+    async def delete_scene_config(
+        self,
+        scene_id: str,
+        *,
+        resolution: SceneResolution | None = None,
+    ) -> dict[str, Any]:
+        """Delete Home Assistant scene configuration.
+
+        ``resolution`` lets a caller that already ran :meth:`_resolve_scene` pass
+        the full outcome through - the endpoint uses its ``storage_key`` while
+        ``scene_id`` stays the caller's slug for messages, and its ``registry_hit``
+        drives the config-404 classification (issue #1971) with no extra lookup.
+        Otherwise the id is resolved here.
+        """
+        if resolution is not None:
+            resolved_id = resolution.storage_key
+        else:
+            resolution = await self._resolve_scene(scene_id)
+            resolved_id = resolution.storage_key
+        try:
+            endpoint = f"config/scene/config/{resolved_id}"
+            response = await self._request("DELETE", endpoint)
+
+            return {
+                "success": True,
+                "scene_id": resolved_id,
+                "result": response.get("result", "ok"),
+                "operation": "deleted",
+            }
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                await self._raise_scene_config_404(scene_id, resolved_id, resolution)
+            elif e.status_code == 405:
+                raise HomeAssistantAPIError(
+                    f"Cannot delete scene '{scene_id}': The HTTP DELETE method is blocked. "
+                    f"This typically occurs when running ha-mcp as a Home Assistant add-on, because "
+                    f"the Supervisor ingress proxy only allows GET and POST requests. "
+                    f"It may also occur if the scene is defined in YAML configuration files. "
+                    f"WORKAROUNDS: "
+                    f"(1) Use ha-mcp via pip, Docker, or as an external MCP server instead of the add-on. "
+                    f"(2) Use a long-lived access token to connect directly to Home Assistant's API. "
+                    f"(3) If the scene is YAML-defined, edit the configuration file directly. "
+                    f"(4) As a fallback, rename the scene with a 'DELETE_' prefix "
+                    f"(e.g., 'DELETE_{scene_id}') so you can identify and manually delete it later "
+                    f"via the Home Assistant UI (Settings > Automations & Scenes > Scenes).",
+                    status_code=405,
+                ) from e
+            raise

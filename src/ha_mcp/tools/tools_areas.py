@@ -5,481 +5,830 @@ This module provides tools for listing, creating, updating, and deleting
 Home Assistant areas and floors - essential organizational features for smart homes.
 """
 
+import asyncio
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
 from pydantic import Field
 
-from ..errors import ErrorCode, create_error_response
-from .helpers import log_tool_usage
-from .util_helpers import parse_string_list_param
+from ..errors import ErrorCode, create_error_response, create_validation_error
+from .auto_backup import with_auto_backup
+from .component_registries import fetch_registries_via_component
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    validate_identifier_not_empty,
+)
+from .tools_config_helpers import validate_registry_ids
+from .util_helpers import (
+    JSON_STRING_COERCION,
+    parse_string_list_param,
+    project_fields,
+    project_records,
+    result_fields_warning,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def register_area_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register Home Assistant area and floor management tools."""
-
-    # ============================================================
-    # AREA TOOLS
-    # ============================================================
-
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["area"], "title": "List Areas"})
-    @log_tool_usage
-    async def ha_config_list_areas() -> dict[str, Any]:
-        """
-        List all Home Assistant areas (rooms).
-
-        Returns area ID, name, icon, floor assignment, aliases, and picture URL.
-        """
+def _parse_projection_params(
+    fields: str | list[str] | None,
+    area_fields: str | list[str] | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Validate the fields/area_fields projection params, raising on a bad shape."""
+    parsed_fields: list[str] | None = None
+    if fields is not None:
         try:
-            message: dict[str, Any] = {
-                "type": "config/area_registry/list",
-            }
+            parsed_fields = parse_string_list_param(fields, "fields", allow_csv=True)
+            if parsed_fields is not None and len(parsed_fields) == 0:
+                raise ValueError("fields must contain at least one key")
+        except ValueError as exc:
+            raise_tool_error(create_validation_error(str(exc), parameter="fields"))
+    parsed_area_fields: list[str] | None = None
+    if area_fields is not None:
+        try:
+            parsed_area_fields = parse_string_list_param(
+                area_fields, "area_fields", allow_csv=True
+            )
+            if parsed_area_fields is not None and len(parsed_area_fields) == 0:
+                raise ValueError("area_fields must contain at least one key")
+        except ValueError as exc:
+            raise_tool_error(create_validation_error(str(exc), parameter="area_fields"))
+    return parsed_fields, parsed_area_fields
 
-            result = await client.send_websocket_message(message)
 
-            if result.get("success"):
-                areas = result.get("result", [])
-                return {
-                    "success": True,
-                    "count": len(areas),
-                    "areas": areas,
-                    "message": f"Found {len(areas)} area(s)",
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"Failed to list areas: {result.get('error', 'Unknown error')}",
-                }
+def _partition_areas_by_floor(
+    areas: list[dict[str, Any]], valid_floor_ids: set[Any]
+) -> tuple[
+    dict[str, list[dict[str, Any]]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    """Partition areas into (floor_map, unassigned_areas, orphaned_areas).
 
-        except Exception as e:
-            logger.error(f"Error listing areas: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to list areas: {str(e)}",
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "Verify WebSocket connection is active",
+    Partitions areas into three disjoint sets:
+      - nested:    floor_id present AND points to a known floor
+      - orphaned:  floor_id present BUT points to a non-existent floor
+                   (race between the concurrent reads, or manual
+                   .storage inconsistency)
+      - unassigned: no floor_id at all
+    Orphaned is surfaced as a separate key so the LLM can diagnose
+    registry drift without introspecting individual area fields.
+    Use `is None` rather than falsy-check so that a floor_id of ""
+    (valid but unusual) is treated as orphaned if it does not resolve,
+    not as unassigned.
+    """
+    floor_map: dict[str, list[dict[str, Any]]] = {}
+    unassigned_areas: list[dict[str, Any]] = []
+    orphaned_areas: list[dict[str, Any]] = []
+    for area in areas:
+        fid = area.get("floor_id")
+        if fid is None:
+            unassigned_areas.append(area)
+        elif fid in valid_floor_ids:
+            floor_map.setdefault(fid, []).append(area)
+        else:
+            orphaned_areas.append(area)
+    return floor_map, unassigned_areas, orphaned_areas
+
+
+# Sort by level ascending; coerce defensively so a malformed
+# string `level` cannot raise TypeError mid-sort and get
+# flattened by the broad `except Exception` in the caller.
+def _floor_sort_key(floor: dict[str, Any]) -> int:
+    raw = floor.get("level")
+    if raw is None:
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Floor {floor.get('floor_id')!r} has non-numeric "
+            f"level {raw!r}; treating as 0 for sort"
+        )
+        return 0
+
+
+def _validate_cross_kind_params(
+    kind: str,
+    level: int | None,
+    floor_id: str | None,
+    picture: str | None,
+) -> None:
+    """Reject params that don't belong to *kind* before building a set message."""
+    # Reject cross-kind params loudly so silent intent loss can't happen
+    # (e.g., kind='floor' with picture='...' previously dropped the picture
+    # without a diagnostic).
+    cross_kind_params: list[str] = []
+    if kind == "area" and level is not None:
+        cross_kind_params.append("level")
+    elif kind == "floor":
+        if floor_id is not None:
+            cross_kind_params.append("floor_id")
+        if picture is not None:
+            cross_kind_params.append("picture")
+    if cross_kind_params:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.VALIDATION_INVALID_PARAMETER,
+                f"Parameter(s) {cross_kind_params} are not valid for kind={kind!r}",
+                context={"kind": kind, "invalid_parameters": cross_kind_params},
+                suggestions=[
+                    "For kind='area' use: name, id, floor_id, icon, aliases, picture",
+                    "For kind='floor' use: name, id, level, icon, aliases",
                 ],
-            }
+            )
+        )
 
-    @mcp.tool(annotations={"destructiveHint": True, "tags": ["area"], "title": "Create or Update Area"})
+
+class AreaTools:
+    """Area and floor management tools for Home Assistant."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @staticmethod
+    def _build_area_update_message(
+        area_id: str,
+        name: str | None,
+        floor_id: str | None,
+        icon: str | None,
+        parsed_aliases: list[str] | None,
+        picture: str | None,
+    ) -> dict[str, Any]:
+        """Build a WebSocket message for updating an existing area."""
+        message: dict[str, Any] = {
+            "type": "config/area_registry/update",
+            "area_id": area_id,
+        }
+        if name is not None:
+            message["name"] = name
+        if floor_id is not None:
+            message["floor_id"] = floor_id if floor_id else None
+        if icon is not None:
+            message["icon"] = icon if icon else None
+        if parsed_aliases is not None:
+            message["aliases"] = parsed_aliases
+        if picture is not None:
+            message["picture"] = picture if picture else None
+        return message
+
+    @staticmethod
+    def _build_area_create_message(
+        name: str,
+        floor_id: str | None,
+        icon: str | None,
+        parsed_aliases: list[str] | None,
+        picture: str | None,
+    ) -> dict[str, Any]:
+        """Build a WebSocket message for creating a new area."""
+        message: dict[str, Any] = {
+            "type": "config/area_registry/create",
+            "name": name,
+        }
+        if floor_id:
+            message["floor_id"] = floor_id
+        if icon:
+            message["icon"] = icon
+        if parsed_aliases:
+            message["aliases"] = parsed_aliases
+        if picture:
+            message["picture"] = picture
+        return message
+
+    @staticmethod
+    def _build_floor_update_message(
+        floor_id: str,
+        name: str | None,
+        level: int | None,
+        icon: str | None,
+        parsed_aliases: list[str] | None,
+    ) -> dict[str, Any]:
+        """Build a WebSocket message for updating an existing floor."""
+        message: dict[str, Any] = {
+            "type": "config/floor_registry/update",
+            "floor_id": floor_id,
+        }
+        if name is not None:
+            message["name"] = name
+        if level is not None:
+            message["level"] = level
+        if icon is not None:
+            message["icon"] = icon if icon else None
+        if parsed_aliases is not None:
+            message["aliases"] = parsed_aliases
+        return message
+
+    @staticmethod
+    def _build_floor_create_message(
+        name: str,
+        level: int | None,
+        icon: str | None,
+        parsed_aliases: list[str] | None,
+    ) -> dict[str, Any]:
+        """Build a WebSocket message for creating a new floor."""
+        message: dict[str, Any] = {
+            "type": "config/floor_registry/create",
+            "name": name,
+        }
+        if level is not None:
+            message["level"] = level
+        if icon:
+            message["icon"] = icon
+        if parsed_aliases:
+            message["aliases"] = parsed_aliases
+        return message
+
+    # ============================================================
+    # AREA & FLOOR LISTING
+    # ============================================================
+
+    @tool(
+        name="ha_list_floors_areas",
+        tags={"Areas & Floors"},
+        annotations={
+            "openWorldHint": False,
+            "idempotentHint": True,
+            "readOnlyHint": True,
+            "title": "List Floors and Areas",
+        },
+    )
     @log_tool_usage
-    async def ha_config_set_area(
-        name: Annotated[
-            str | None,
-            Field(
-                description="Name for the area (required for create, optional for update, e.g., 'Living Room', 'Kitchen')",
-                default=None,
-            ),
-        ] = None,
-        area_id: Annotated[
-            str | None,
-            Field(
-                description="Area ID to update (omit to create new area, use ha_config_list_areas to find IDs)",
-                default=None,
-            ),
-        ] = None,
-        floor_id: Annotated[
-            str | None,
-            Field(
-                description="Floor ID to assign this area to (use ha_config_list_floors to find IDs, empty string to remove)",
-                default=None,
-            ),
-        ] = None,
-        icon: Annotated[
-            str | None,
-            Field(
-                description="Material Design Icon (e.g., 'mdi:sofa', 'mdi:bed', empty string to remove)",
-                default=None,
-            ),
-        ] = None,
-        aliases: Annotated[
+    async def ha_list_floors_areas(
+        self,
+        fields: Annotated[
             str | list[str] | None,
+            JSON_STRING_COERCION,
             Field(
-                description="Alternative names for voice assistant recognition (e.g., ['lounge', 'family room'], empty list to clear)",
                 default=None,
+                description=(
+                    "Return only the specified top-level response keys to reduce "
+                    'response size (e.g. ["floors"]). '
+                    "None = full response (default). "
+                    "Available keys: success, floor_count, area_count, "
+                    "unassigned_count, orphaned_count, floors, unassigned_areas, "
+                    "orphaned_areas, message."
+                ),
             ),
         ] = None,
-        picture: Annotated[
-            str | None,
+        area_fields: Annotated[
+            str | list[str] | None,
+            JSON_STRING_COERCION,
             Field(
-                description="URL to a picture representing the area (empty string to remove)",
                 default=None,
+                description=(
+                    "Project each area record (in floors[].areas, unassigned_areas, "
+                    'and orphaned_areas) to only the specified keys. E.g. ["area_id", '
+                    '"name"] returns slim area records. None = full records (default). '
+                    "Unknown keys yield empty records. Available keys: area_id, name, "
+                    "icon, floor_id, aliases, picture, labels."
+                ),
             ),
         ] = None,
     ) -> dict[str, Any]:
         """
-        Create or update a Home Assistant area (room).
+        List floors sorted by level ascending, each with their assigned areas nested, plus areas without a floor.
 
-        Provide name only to create a new area. Provide area_id to update existing.
-        Areas organize entities by physical location for room-based control.
+        Use for location-based reasoning where floor-to-area relationships matter, such as "which rooms are on the ground floor" or operations scoped to a level. Optionally project the response with fields= (top-level keys) or area_fields= (per-area-record keys, applied uniformly across nested, unassigned, and orphaned buckets).
+
+        Floors with level=None sort alongside level 0 (ground floor). Areas without a floor assignment appear in unassigned_areas; areas whose floor_id points to a non-existent floor appear in orphaned_areas. When the ha_mcp_tools component's registries capability is available, both registries come from a single in-process snapshot, so this classification is always consistent. Without it (legacy path), the two registries are fetched via independent WebSocket calls and a registry change between reads may transiently misclassify an area.
         """
+        # Validate projection params before any WS round-trips so a bad shape
+        # fails fast without burning two registry reads.
+        parsed_fields, parsed_area_fields = _parse_projection_params(
+            fields, area_fields
+        )
+
+        progress: dict[str, Any] = {
+            "operation": "list_floors_areas",
+            "phase": "start",
+        }
         try:
-            # Parse aliases if provided as string
-            try:
-                parsed_aliases = parse_string_list_param(aliases, "aliases")
-            except ValueError as e:
-                return create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"Invalid aliases parameter: {e}",
-                )
+            areas, floors = await self._fetch_area_floor_registries(progress)
 
-            # Determine if this is a create or update operation
-            if area_id:
-                # UPDATE operation
-                message: dict[str, Any] = {
-                    "type": "config/area_registry/update",
-                    "area_id": area_id,
+            valid_floor_ids = {
+                f.get("floor_id") for f in floors if f.get("floor_id") is not None
+            }
+            floor_map, unassigned_areas, orphaned_areas = _partition_areas_by_floor(
+                areas, valid_floor_ids
+            )
+            progress["phase"] = "partitioned"
+
+            # Build nested hierarchy, preserving all floor-registry fields for
+            # forward compatibility with future HA Core additions
+            topology = [
+                {
+                    **floor,
+                    "areas": floor_map.get(fid, [])
+                    if (fid := floor.get("floor_id")) is not None
+                    else [],
                 }
+                for floor in floors
+            ]
 
-                # Only add fields that were explicitly provided
-                if name is not None:
-                    message["name"] = name
-                if floor_id is not None:
-                    message["floor_id"] = floor_id if floor_id else None
-                if icon is not None:
-                    message["icon"] = icon if icon else None
-                if parsed_aliases is not None:
-                    message["aliases"] = parsed_aliases
-                if picture is not None:
-                    message["picture"] = picture if picture else None
+            topology.sort(key=_floor_sort_key)
+            progress["phase"] = "sorted"
 
+            # Apply per-area projection across all 3 buckets uniformly.
+            # Snapshot pre-projection areas for the typo-guard warning.
+            _orig_all_areas = list(areas)
+            if parsed_area_fields is not None:
+                for floor in topology:
+                    floor["areas"] = project_records(floor["areas"], parsed_area_fields)
+                unassigned_areas = project_records(unassigned_areas, parsed_area_fields)
+                orphaned_areas = project_records(orphaned_areas, parsed_area_fields)
+
+            response: dict[str, Any] = {
+                "success": True,
+                "floor_count": len(topology),
+                "area_count": len(_orig_all_areas),
+                "unassigned_count": len(unassigned_areas),
+                "orphaned_count": len(orphaned_areas),
+                "floors": topology,
+                "unassigned_areas": unassigned_areas,
+                "orphaned_areas": orphaned_areas,
+                "message": (
+                    f"Found {len(topology)} floor(s), {len(_orig_all_areas)} area(s), "
+                    f"{len(unassigned_areas)} unassigned, "
+                    f"{len(orphaned_areas)} orphaned"
+                ),
+            }
+
+            # Typo-guard: combine projected areas across buckets to detect the
+            # all-empty-records situation that signals an unknown area_fields key.
+            if parsed_area_fields is not None:
+                _projected_all = (
+                    [a for f in topology for a in f["areas"]]
+                    + unassigned_areas
+                    + orphaned_areas
+                )
+                _warn = result_fields_warning(
+                    _orig_all_areas,
+                    _projected_all,
+                    parsed_area_fields,
+                    param_name="area_fields",
+                )
+                if _warn:
+                    response.setdefault("warnings", []).append(_warn)
+
+            return project_fields(response, parsed_fields)
+
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"Error listing floors and areas in phase {progress['phase']!r}: {e} "
+                f"(progress={progress})"
+            )
+            exception_to_structured_error(
+                e,
+                context=progress,
+                suggestions=[
+                    "Check Home Assistant connection",
+                    "Verify WebSocket connection is active",
+                ],
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+
+    async def _fetch_area_floor_registries(
+        self, progress: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return ``(areas, floors)`` as one consistent snapshot when possible.
+
+        Prefers the ``ha_mcp_tools`` component's ``registries`` capability — a
+        single in-process read of both registries, closing the TOCTOU window
+        between two independent list calls. Falls back to the legacy 2-call
+        ``asyncio.gather`` when the component is unavailable, downgraded, or
+        errors on this frame. Updates ``progress["phase"]`` for the caller's
+        error-context reporting either way.
+        """
+        component_result = await fetch_registries_via_component(
+            self._client, ["area", "floor"]
+        )
+        if component_result is not None:
+            progress["phase"] = "registries_fetched"
+            return (
+                component_result.get("areas") or [],
+                component_result.get("floors") or [],
+            )
+
+        # Fetch both registries concurrently. Sequential awaits add a
+        # round-trip per call on the WS transport; gather halves the
+        # tool-side latency. Use return_exceptions=True so a failure on
+        # one side doesn't cancel the other — the post-fetch guard
+        # below reports both registries' state in the error context for
+        # diagnosis. Indexed access + explicit annotations rather than
+        # tuple-unpack — gather returns list[Any] which mypy can't
+        # statically narrow to a 2-tuple.
+        results = await asyncio.gather(
+            self._client.send_websocket_message({"type": "config/area_registry/list"}),
+            self._client.send_websocket_message({"type": "config/floor_registry/list"}),
+            return_exceptions=True,
+        )
+        progress["phase"] = "registries_fetched"
+
+        # Re-raise transport-level exceptions from either fetch so the
+        # outer except handler classifies them via exception_to_structured_error.
+        if isinstance(results[0], BaseException):
+            raise results[0]
+        if isinstance(results[1], BaseException):
+            raise results[1]
+        areas_result: dict[str, Any] = results[0]
+        floors_result: dict[str, Any] = results[1]
+
+        # A response with success=True but no "result" key is malformed —
+        # treat it as a service call failure rather than silently returning
+        # floor_count=0, area_count=0 on a populated instance.
+        areas_ok = areas_result.get("success") and "result" in areas_result
+        floors_ok = floors_result.get("success") and "result" in floors_result
+        if not (areas_ok and floors_ok):
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    "Failed to retrieve area or floor registry",
+                    context={
+                        "areas_success": areas_result.get("success"),
+                        "floors_success": floors_result.get("success"),
+                        "areas_response_keys": sorted(areas_result.keys()),
+                        "floors_response_keys": sorted(floors_result.keys()),
+                    },
+                    suggestions=[
+                        "Check Home Assistant connection",
+                        "Verify WebSocket connection is active",
+                    ],
+                )
+            )
+
+        return areas_result["result"], floors_result["result"]
+
+    def _build_area_or_floor_message(
+        self,
+        kind: str,
+        identifier: str | None,
+        name: str | None,
+        floor_id: str | None,
+        level: int | None,
+        icon: str | None,
+        parsed_aliases: list[str] | None,
+        picture: str | None,
+    ) -> tuple[dict[str, Any], str, str, str, str | None]:
+        """Build the WS message plus (result_key, id_key, operation, name) for a set.
+
+        ``name`` is returned because the create branches narrow it from
+        ``str | None`` to ``str`` via ``validate_identifier_not_empty``.
+        """
+        if kind == "area":
+            if identifier:
+                message = self._build_area_update_message(
+                    identifier,
+                    name,
+                    floor_id,
+                    icon,
+                    parsed_aliases,
+                    picture,
+                )
                 operation = "update"
             else:
-                # CREATE operation - name is required
-                if not name:
-                    return {
-                        "success": False,
-                        "error": "name is required when creating a new area",
-                    }
-
-                message: dict[str, Any] = {
-                    "type": "config/area_registry/create",
-                    "name": name,
-                }
-
-                if floor_id:
-                    message["floor_id"] = floor_id
-                if icon:
-                    message["icon"] = icon
-                if parsed_aliases:
-                    message["aliases"] = parsed_aliases
-                if picture:
-                    message["picture"] = picture
-
+                # Reassignment narrows ``name`` from ``str | None`` to
+                # ``str`` for the build-message call below.
+                name = validate_identifier_not_empty(
+                    name,
+                    "name",
+                    message="name is required when creating a new area",
+                    context={"operation": "create_area"},
+                    suggestions=["Provide a non-empty name for the new area"],
+                )
+                message = self._build_area_create_message(
+                    name,
+                    floor_id,
+                    icon,
+                    parsed_aliases,
+                    picture,
+                )
                 operation = "create"
-
-            result = await client.send_websocket_message(message)
-
-            if result.get("success"):
-                area_data = result.get("result", {})
-                area_name = name or area_data.get("name", area_id)
-                return {
-                    "success": True,
-                    "area": area_data,
-                    "area_id": area_data.get("area_id", area_id),
-                    "message": f"Successfully {operation}d area: {area_name}",
-                }
+            result_key = "area"
+            id_key = "area_id"
+        else:  # kind == "floor"
+            if identifier:
+                message = self._build_floor_update_message(
+                    identifier,
+                    name,
+                    level,
+                    icon,
+                    parsed_aliases,
+                )
+                operation = "update"
             else:
-                error = result.get("error", {})
-                error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
-                error_response = {
-                    "success": False,
-                    "error": f"Failed to {operation} area: {error_msg}",
-                }
-                if name:
-                    error_response["name"] = name
-                return error_response
+                name = validate_identifier_not_empty(
+                    name,
+                    "name",
+                    message="name is required when creating a new floor",
+                    context={"operation": "create_floor"},
+                    suggestions=["Provide a non-empty name for the new floor"],
+                )
+                message = self._build_floor_create_message(
+                    name,
+                    level,
+                    icon,
+                    parsed_aliases,
+                )
+                operation = "create"
+            result_key = "floor"
+            id_key = "floor_id"
+        return message, result_key, id_key, operation, name
 
-        except Exception as e:
-            logger.error(f"Error in ha_config_set_area: {e}")
-            error_response = {
-                "success": False,
-                "error": f"Failed to set area: {str(e)}",
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "For create: Verify the name is unique",
-                    "For update: Verify the area_id exists using ha_config_list_areas()",
-                    "If assigning to a floor, verify floor_id exists",
-                ],
-            }
-            if name:
-                error_response["name"] = name
-            return error_response
+    # ============================================================
+    # COMBINED SET / REMOVE
+    # ============================================================
 
-    @mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True, "tags": ["area"], "title": "Remove Area"})
+    @tool(
+        name="ha_set_area_or_floor",
+        tags={"Areas & Floors"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "title": "Create or Update Area or Floor",
+        },
+    )
+    @with_auto_backup(
+        domain="area_or_floor",
+        # Return "" when either discriminator is missing so the capture
+        # pipeline skips cleanly. ``f"{a}:{b}"`` would otherwise produce
+        # a truthy literal `":"` and trigger a useless lookup.
+        id_fn=lambda kw: (
+            f"{kw['kind']}:{kw['id']}" if kw.get("kind") and kw.get("id") else ""
+        ),
+    )
     @log_tool_usage
-    async def ha_config_remove_area(
-        area_id: Annotated[
-            str,
-            Field(description="Area ID to delete (use ha_config_list_areas to find IDs)"),
+    async def ha_set_area_or_floor(
+        self,
+        kind: Annotated[
+            Literal["area", "floor"],
+            Field(
+                description="Which registry to operate on: 'area' for rooms, 'floor' for building levels",
+            ),
         ],
-    ) -> dict[str, Any]:
-        """
-        Delete a Home Assistant area.
-
-        Entities and devices in the area are not deleted, just unassigned.
-        May break automations referencing this area.
-        """
-        try:
-            message: dict[str, Any] = {
-                "type": "config/area_registry/delete",
-                "area_id": area_id,
-            }
-
-            result = await client.send_websocket_message(message)
-
-            if result.get("success"):
-                return {
-                    "success": True,
-                    "area_id": area_id,
-                    "message": f"Successfully deleted area: {area_id}",
-                }
-            else:
-                error = result.get("error", {})
-                error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
-                return {
-                    "success": False,
-                    "error": f"Failed to delete area: {error_msg}",
-                    "area_id": area_id,
-                }
-
-        except Exception as e:
-            logger.error(f"Error deleting area: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to delete area: {str(e)}",
-                "area_id": area_id,
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "Verify the area_id exists using ha_config_list_areas()",
-                ],
-            }
-
-    # ============================================================
-    # FLOOR TOOLS
-    # ============================================================
-
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["floor"], "title": "List Floors"})
-    @log_tool_usage
-    async def ha_config_list_floors() -> dict[str, Any]:
-        """
-        List all Home Assistant floors.
-
-        Returns floor ID, name, icon, level (0=ground, 1=first, -1=basement), and aliases.
-        """
-        try:
-            message: dict[str, Any] = {
-                "type": "config/floor_registry/list",
-            }
-
-            result = await client.send_websocket_message(message)
-
-            if result.get("success"):
-                floors = result.get("result", [])
-                return {
-                    "success": True,
-                    "count": len(floors),
-                    "floors": floors,
-                    "message": f"Found {len(floors)} floor(s)",
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"Failed to list floors: {result.get('error', 'Unknown error')}",
-                }
-
-        except Exception as e:
-            logger.error(f"Error listing floors: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to list floors: {str(e)}",
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "Verify WebSocket connection is active",
-                ],
-            }
-
-    @mcp.tool(annotations={"destructiveHint": True, "tags": ["floor"], "title": "Create or Update Floor"})
-    @log_tool_usage
-    async def ha_config_set_floor(
         name: Annotated[
             str | None,
             Field(
-                description="Name for the floor (required for create, optional for update, e.g., 'Ground Floor', 'Basement')",
+                description="Name (required when creating; optional when updating, e.g., 'Living Room', 'Ground Floor')",
+                default=None,
+            ),
+        ] = None,
+        id: Annotated[  # noqa: A002
+            str | None,
+            Field(
+                description="Existing area_id or floor_id to update (omit to create a new entry; use ha_list_floors_areas to find IDs)",
                 default=None,
             ),
         ] = None,
         floor_id: Annotated[
             str | None,
             Field(
-                description="Floor ID to update (omit to create new floor, use ha_config_list_floors to find IDs)",
+                description="Floor assignment when kind='area' (use empty string to clear). Only valid when kind='area'.",
                 default=None,
             ),
         ] = None,
         level: Annotated[
             int | None,
             Field(
-                description="Numeric level for ordering (0=ground, 1=first, -1=basement, etc.)",
+                description="Numeric level when kind='floor' (0=ground, 1=first, -1=basement). Only valid when kind='floor'.",
                 default=None,
             ),
         ] = None,
         icon: Annotated[
             str | None,
             Field(
-                description="Material Design Icon (e.g., 'mdi:home-floor-1', 'mdi:home-floor-b', empty string to remove)",
+                description="Material Design Icon (e.g., 'mdi:sofa', 'mdi:home-floor-1', empty string to remove)",
                 default=None,
             ),
         ] = None,
         aliases: Annotated[
             str | list[str] | None,
+            JSON_STRING_COERCION,
             Field(
-                description="Alternative names for voice assistant recognition (e.g., ['downstairs', 'main level'], empty list to clear)",
+                description="Alternative names for voice assistant recognition (e.g., ['lounge'], empty list to clear)",
+                default=None,
+            ),
+        ] = None,
+        picture: Annotated[
+            str | None,
+            Field(
+                description="Picture URL when kind='area' (empty string to remove). Only valid when kind='area'.",
                 default=None,
             ),
         ] = None,
     ) -> dict[str, Any]:
-        """
-        Create or update a Home Assistant floor.
+        """Create or update a Home Assistant area or floor.
 
-        Provide name only to create a new floor. Provide floor_id to update existing.
-        Floors organize areas into vertical levels for building-wide control.
+        Pass kind='area' (with optional floor_id, picture) or kind='floor' (with optional level).
+        Provide name only to create a new entry; provide id to update an existing one.
+        Cross-kind parameters (e.g., picture under kind='floor') are rejected with VALIDATION_INVALID_PARAMETER.
+
+        EXAMPLES:
+        ha_set_area_or_floor(kind="area", name="Kitchen")
+        ha_set_area_or_floor(kind="area", id="kitchen", floor_id="ground_floor")
+        ha_set_area_or_floor(kind="floor", name="Basement", level=-1)
+        ha_set_area_or_floor(kind="floor", id="ground_floor", level=0)
         """
+        operation = "create"
         try:
-            # Parse aliases if provided as string
             try:
                 parsed_aliases = parse_string_list_param(aliases, "aliases")
             except ValueError as e:
-                return create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"Invalid aliases parameter: {e}",
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        f"Invalid aliases parameter: {e}",
+                    )
                 )
 
-            # Determine if this is a create or update operation
-            if floor_id:
-                # UPDATE operation
-                message: dict[str, Any] = {
-                    "type": "config/floor_registry/update",
-                    "floor_id": floor_id,
-                }
+            _validate_cross_kind_params(kind, level, floor_id, picture)
 
-                # Only add fields that were explicitly provided
-                if name is not None:
-                    message["name"] = name
-                if level is not None:
-                    message["level"] = level
-                if icon is not None:
-                    message["icon"] = icon if icon else None
-                if parsed_aliases is not None:
-                    message["aliases"] = parsed_aliases
+            # ``None`` stays the documented "create-new" sentinel; explicit
+            # empty/whitespace would silently route to the ``if id:`` create
+            # branch below and lose update intent.
+            if id is not None:
+                validate_identifier_not_empty(
+                    id,
+                    "id",
+                    suggestions=[
+                        "Omit id entirely to create a new entry",
+                        "Pass a real area_id/floor_id to update an existing entry",
+                    ],
+                    context={"kind": kind},
+                )
 
-                operation = "update"
-            else:
-                # CREATE operation - name is required
-                if not name:
-                    return {
-                        "success": False,
-                        "error": "name is required when creating a new floor",
-                    }
+            message, result_key, id_key, operation, name = (
+                self._build_area_or_floor_message(
+                    kind,
+                    id,
+                    name,
+                    floor_id,
+                    level,
+                    icon,
+                    parsed_aliases,
+                    picture,
+                )
+            )
 
-                message: dict[str, Any] = {
-                    "type": "config/floor_registry/create",
-                    "name": name,
-                }
+            # Issue #2159: the area registry stores an unknown floor_id
+            # verbatim, orphaning the area. ``_validate_cross_kind_params``
+            # already rejected floor_id for kind='floor', so this only ever
+            # runs for areas; None and "" (clear) skip the lookup.
+            await validate_registry_ids(
+                self._client, None, None, None, floor_id=floor_id, fail_closed=True
+            )
 
-                if level is not None:
-                    message["level"] = level
-                if icon:
-                    message["icon"] = icon
-                if parsed_aliases:
-                    message["aliases"] = parsed_aliases
-
-                operation = "create"
-
-            result = await client.send_websocket_message(message)
+            result = await self._client.send_websocket_message(message)
 
             if result.get("success"):
-                floor_data = result.get("result", {})
-                floor_name = name or floor_data.get("name", floor_id)
+                data = result.get("result", {})
+                returned_id = data.get(id_key, id)
+                display_name = name or data.get("name", returned_id)
                 return {
                     "success": True,
-                    "floor": floor_data,
-                    "floor_id": floor_data.get("floor_id", floor_id),
-                    "message": f"Successfully {operation}d floor: {floor_name}",
+                    result_key: data,
+                    id_key: returned_id,
+                    "kind": kind,
+                    "message": f"Successfully {operation}d {kind}: {display_name}",
                 }
-            else:
-                error = result.get("error", {})
-                error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
-                error_response = {
-                    "success": False,
-                    "error": f"Failed to {operation} floor: {error_msg}",
-                }
-                if name:
-                    error_response["name"] = name
-                return error_response
 
-        except Exception as e:
-            logger.error(f"Error in ha_config_set_floor: {e}")
-            error_response = {
-                "success": False,
-                "error": f"Failed to set floor: {str(e)}",
-                "suggestions": [
-                    "Check Home Assistant connection",
-                    "For create: Verify the name is unique",
-                    "For update: Verify the floor_id exists using ha_config_list_floors()",
-                ],
-            }
+            error = result.get("error", {})
+            error_msg = (
+                error.get("message", str(error))
+                if isinstance(error, dict)
+                else str(error)
+            )
+            ctx: dict[str, Any] = {"operation": operation, "kind": kind}
             if name:
-                error_response["name"] = name
-            return error_response
+                ctx["name"] = name
+            if id:
+                ctx[id_key] = id
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    f"Failed to {operation} {kind}: {error_msg}",
+                    context=ctx,
+                )
+            )
 
-    @mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True, "tags": ["floor"], "title": "Remove Floor"})
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error(f"Error {operation} {kind} {name!r}: {e}")
+            suggestions = [
+                "Check Home Assistant connection",
+                "For create: Verify the name is unique",
+                f"For update: Verify the {kind} id exists using ha_list_floors_areas()",
+            ]
+            if kind == "area":
+                suggestions.append("If assigning to a floor, verify floor_id exists")
+            exception_to_structured_error(
+                e,
+                context={"operation": operation, "kind": kind, "name": name, "id": id},
+                suggestions=suggestions,
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
+
+    @tool(
+        name="ha_remove_area_or_floor",
+        tags={"Areas & Floors"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "title": "Remove Area or Floor",
+        },
+    )
+    @with_auto_backup(
+        domain="area_or_floor",
+        id_fn=lambda kw: (
+            f"{kw['kind']}:{kw['id']}" if kw.get("kind") and kw.get("id") else ""
+        ),
+    )
     @log_tool_usage
-    async def ha_config_remove_floor(
-        floor_id: Annotated[
+    async def ha_remove_area_or_floor(
+        self,
+        kind: Annotated[
+            Literal["area", "floor"],
+            Field(description="Which registry to delete from: 'area' or 'floor'"),
+        ],
+        id: Annotated[  # noqa: A002
             str,
-            Field(description="Floor ID to delete (use ha_config_list_floors to find IDs)"),
+            Field(
+                description="Area ID or floor ID to delete (use ha_list_floors_areas to find IDs)"
+            ),
         ],
     ) -> dict[str, Any]:
-        """
-        Delete a Home Assistant floor.
+        """Remove a Home Assistant area or floor.
 
-        Areas on this floor are not deleted, just unassigned.
-        May break automations referencing this floor.
+        Removing an area unassigns its entities and devices (the entities and
+        devices themselves are not removed). Removing a floor unassigns its
+        areas. May break automations referencing the removed area/floor.
         """
+        registry = "area_registry" if kind == "area" else "floor_registry"
+        id_key = "area_id" if kind == "area" else "floor_id"
         try:
+            # Empty/whitespace would surface as a misleading HA delete-failure.
+            validate_identifier_not_empty(
+                id,
+                "id",
+                suggestions=[
+                    f"Pass a valid {id_key} (use ha_list_floors_areas() to list)",
+                ],
+                context={"action": "remove", "kind": kind},
+            )
             message: dict[str, Any] = {
-                "type": "config/floor_registry/delete",
-                "floor_id": floor_id,
+                "type": f"config/{registry}/delete",
+                id_key: id,
             }
 
-            result = await client.send_websocket_message(message)
+            result = await self._client.send_websocket_message(message)
 
             if result.get("success"):
                 return {
                     "success": True,
-                    "floor_id": floor_id,
-                    "message": f"Successfully deleted floor: {floor_id}",
-                }
-            else:
-                error = result.get("error", {})
-                error_msg = error.get("message", str(error)) if isinstance(error, dict) else str(error)
-                return {
-                    "success": False,
-                    "error": f"Failed to delete floor: {error_msg}",
-                    "floor_id": floor_id,
+                    id_key: id,
+                    "kind": kind,
+                    "message": f"Successfully removed {kind}: {id}",
                 }
 
+            error = result.get("error", {})
+            error_msg = (
+                error.get("message", str(error))
+                if isinstance(error, dict)
+                else str(error)
+            )
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.SERVICE_CALL_FAILED,
+                    f"Failed to remove {kind}: {error_msg}",
+                    context={"kind": kind, id_key: id},
+                )
+            )
+
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error deleting floor: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to delete floor: {str(e)}",
-                "floor_id": floor_id,
-                "suggestions": [
+            logger.error(f"Error removing {kind} {id!r}: {e}")
+            exception_to_structured_error(
+                e,
+                context={"kind": kind, id_key: id},
+                suggestions=[
                     "Check Home Assistant connection",
-                    "Verify the floor_id exists using ha_config_list_floors()",
+                    f"Verify the {kind} id exists using ha_list_floors_areas()",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
+
+
+def register_area_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register Home Assistant area and floor management tools."""
+    register_tool_methods(mcp, AreaTools(client))

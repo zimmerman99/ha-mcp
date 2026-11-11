@@ -1,7 +1,7 @@
 """
 Helper Integration E2E Tests
 
-Comprehensive tests for Home Assistant helper management via the ha_manage_helper MCP tool.
+Comprehensive tests for the Home Assistant helper configuration tool family.
 Tests all supported helper types: input_boolean, input_number, input_select, input_text,
 input_datetime, and input_button.
 
@@ -14,12 +14,13 @@ This test suite validates:
 - Field validation and constraints
 """
 
+import asyncio
 import logging
 from typing import Any
 
 import pytest
 
-from ...utilities.assertions import parse_mcp_result
+from ...utilities.assertions import parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ logger = logging.getLogger(__name__)
 async def wait_for_entity_state(
     mcp_client,
     entity_id: str,
-    max_retries: int = 5,
+    max_retries: int = 10,
     delay: float = 1.0,
     expected_state: str | None = None,
 ) -> dict[str, Any] | None:
@@ -36,7 +37,7 @@ async def wait_for_entity_state(
     Args:
         mcp_client: MCP client instance
         entity_id: Entity ID to check
-        max_retries: Maximum number of retries
+        max_retries: Maximum number of retries (default: 10 for CI robustness)
         delay: Delay between retries in seconds
         expected_state: If provided, wait for this specific state
 
@@ -45,10 +46,10 @@ async def wait_for_entity_state(
     """
     for attempt in range(max_retries):
         try:
-            state_result = await mcp_client.call_tool(
-                "ha_get_state", {"entity_id": entity_id}
+            # Use safe_call_tool to handle ToolError exceptions
+            state_data = await safe_call_tool(
+                mcp_client, "ha_get_state", {"entity_id": entity_id}
             )
-            state_data = parse_mcp_result(state_result)
 
             # Check if we have valid entity data
             if "data" in state_data and "state" in state_data["data"]:
@@ -95,6 +96,33 @@ def assert_state_response_success(data, operation_description="state operation")
         assert False, f"{operation_description} failed: {data}"
 
 
+def _build_datetime_create_params(
+    helper_name: str, has_date: bool, has_time: bool
+) -> dict[str, Any]:
+    """Build the ha_config_set_helper params for an input_datetime helper."""
+    create_params = {
+        "helper_type": "input_datetime",
+        "name": helper_name,
+        "icon": "mdi:calendar-clock",
+    }
+
+    # Set explicit date/time parameters (at least one required)
+    if has_date:
+        create_params["has_date"] = True
+    if has_time:
+        create_params["has_time"] = True
+
+    # Add appropriate initial values
+    if has_date and has_time:
+        create_params["initial"] = "2025-01-01 12:00:00"
+    elif has_date:
+        create_params["initial"] = "2025-01-01"
+    elif has_time:
+        create_params["initial"] = "12:00:00"
+
+    return create_params
+
+
 @pytest.mark.helper
 @pytest.mark.cleanup
 class TestHelperIntegration:
@@ -113,17 +141,17 @@ class TestHelperIntegration:
         logger.info(f"🔘 Testing input_boolean lifecycle: {helper_name}")
 
         # 1. CREATE: Basic boolean helper
-        create_result = await mcp_client.call_tool(
+        # Use safe_call_tool to handle ToolError exceptions gracefully
+        create_data = await safe_call_tool(
+            mcp_client,
             "ha_config_set_helper",
             {
                 "helper_type": "input_boolean",
                 "name": helper_name,
                 "icon": "mdi:toggle-switch",
-                "initial": "false",  # String representation for boolean initial value
+                "initial": False,  # Native boolean type
             },
         )
-
-        create_data = parse_mcp_result(create_result)
         assert create_data.get("success"), (
             f"Failed to create input_boolean: {create_data}"
         )
@@ -133,8 +161,9 @@ class TestHelperIntegration:
         logger.info(f"✅ Created input_boolean: {helper_entity}")
 
         # 2. VERIFY: Helper exists and has correct initial state
+        # Use longer wait times for CI robustness (entity registration can be slow)
         state_data = await wait_for_entity_state(
-            mcp_client, helper_entity, max_retries=6, delay=0.5
+            mcp_client, helper_entity, max_retries=12, delay=1.0
         )
         assert state_data is not None, (
             f"Helper {helper_entity} was not created or not accessible after retries"
@@ -182,10 +211,11 @@ class TestHelperIntegration:
         # 4. DELETE: Clean up helper
         logger.info("🗑️ Deleting helper...")
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_boolean",
-                "helper_id": helper_name
+                "target": helper_name,
+                "confirm": True,
             },
         )
 
@@ -194,10 +224,10 @@ class TestHelperIntegration:
         logger.info("✅ Helper deleted successfully")
 
         # 5. VERIFY: Helper is gone - wait a moment for deletion to propagate
-        final_state_result = await mcp_client.call_tool(
-            "ha_get_state", {"entity_id": helper_entity}
+        # Use safe_call_tool since we expect this to fail (entity deleted)
+        final_state_data = await safe_call_tool(
+            mcp_client, "ha_get_state", {"entity_id": helper_entity}
         )
-        final_state_data = parse_mcp_result(final_state_result)
         # Should fail or return error since helper no longer exists
         has_error = (
             not final_state_data.get("success")
@@ -228,10 +258,11 @@ class TestHelperIntegration:
                 "min_value": 0,
                 "max_value": 100,
                 "step": 5,
-                "initial": "25",
+                "initial": 25,
                 "mode": "slider",
                 "unit_of_measurement": "%",
-                "icon": "mdi:brightness-percent"},
+                "icon": "mdi:brightness-percent",
+            },
         )
 
         create_data = parse_mcp_result(create_result)
@@ -357,10 +388,11 @@ class TestHelperIntegration:
 
         # Cleanup
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_number",
-                "helper_id": helper_name
+                "target": helper_name,
+                "confirm": True,
             },
         )
         delete_data = parse_mcp_result(delete_result)
@@ -388,7 +420,8 @@ class TestHelperIntegration:
                 "name": helper_name,
                 "options": options,
                 "initial": "Option 2",
-                "icon": "mdi:format-list-bulleted"},
+                "icon": "mdi:format-list-bulleted",
+            },
         )
 
         create_data = parse_mcp_result(create_result)
@@ -472,10 +505,11 @@ class TestHelperIntegration:
 
         # Cleanup
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_select",
-                "helper_id": helper_name
+                "target": helper_name,
+                "confirm": True,
             },
         )
         delete_data = parse_mcp_result(delete_result)
@@ -502,7 +536,8 @@ class TestHelperIntegration:
                 "name": helper_name,
                 "initial": "Test",
                 "mode": "text",
-                "icon": "mdi:text-box"},
+                "icon": "mdi:text-box",
+            },
         )
 
         create_data = parse_mcp_result(create_result)
@@ -592,10 +627,11 @@ class TestHelperIntegration:
 
         # Cleanup
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_text",
-                "helper_id": helper_name
+                "target": helper_name,
+                "confirm": True,
             },
         )
         delete_data = parse_mcp_result(delete_result)
@@ -622,25 +658,9 @@ class TestHelperIntegration:
             logger.info(f"📅 Testing datetime mode: {description}")
 
             # 1. CREATE: DateTime helper with specific mode
-            create_params = {
-                "helper_type": "input_datetime",
-                "name": helper_name,
-                "icon": "mdi:calendar-clock",
-            }
-
-            # Set explicit date/time parameters (at least one required)
-            if has_date:
-                create_params["has_date"] = True
-            if has_time:
-                create_params["has_time"] = True
-
-            # Add appropriate initial values
-            if has_date and has_time:
-                create_params["initial"] = "2025-01-01 12:00:00"
-            elif has_date:
-                create_params["initial"] = "2025-01-01"
-            elif has_time:
-                create_params["initial"] = "12:00:00"
+            create_params = _build_datetime_create_params(
+                helper_name, has_date, has_time
+            )
 
             create_result = await mcp_client.call_tool(
                 "ha_config_set_helper", create_params
@@ -714,10 +734,11 @@ class TestHelperIntegration:
 
             # 4. CLEANUP: Delete this datetime helper
             delete_result = await mcp_client.call_tool(
-                "ha_config_remove_helper",
+                "ha_remove_helpers_integrations",
                 {
                     "helper_type": "input_datetime",
-                    "helper_id": helper_name
+                    "target": helper_name,
+                    "confirm": True,
                 },
             )
             delete_data = parse_mcp_result(delete_result)
@@ -742,7 +763,8 @@ class TestHelperIntegration:
             {
                 "helper_type": "input_button",
                 "name": helper_name,
-                "icon": "mdi:button-pointer"},
+                "icon": "mdi:button-pointer",
+            },
         )
 
         create_data = parse_mcp_result(create_result)
@@ -822,10 +844,11 @@ class TestHelperIntegration:
 
         # Cleanup
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": "input_button",
-                "helper_id": helper_name
+                "target": helper_name,
+                "confirm": True,
             },
         )
         delete_data = parse_mcp_result(delete_result)
@@ -850,17 +873,17 @@ class TestHelperIntegration:
             (
                 "input_boolean",
                 "bulk_bool_1",
-                {"name": "bulk_bool_1", "initial": "true"},
+                {"name": "bulk_bool_1", "initial": True},
             ),
             (
                 "input_boolean",
                 "bulk_bool_2",
-                {"name": "bulk_bool_2", "initial": "false"},
+                {"name": "bulk_bool_2", "initial": False},
             ),
             (
                 "input_number",
                 "bulk_num_1",
-                {"name": "bulk_num_1", "min_value": 0, "max_value": 10, "initial": "5"},
+                {"name": "bulk_num_1", "min_value": 0, "max_value": 10, "initial": 5},
             ),
             (
                 "input_select",
@@ -933,15 +956,15 @@ class TestHelperIntegration:
                 )
                 logger.info(f"✅ Toggled: {helper_entity}")
 
-
         # 4. CLEANUP: Bulk deletion
         logger.info(f"🗑️ Bulk deleting {len(created_helpers)} helpers...")
         for helper_type, helper_id, helper_entity in created_helpers:
             delete_result = await mcp_client.call_tool(
-                "ha_config_remove_helper",
+                "ha_remove_helpers_integrations",
                 {
                     "helper_type": helper_type,
-                    "helper_id": helper_id
+                    "target": helper_id,
+                    "confirm": True,
                 },
             )
 
@@ -979,23 +1002,14 @@ async def test_helper_search_and_discovery(mcp_client):
     for domain in helper_domains:
         logger.info(f"🔍 Searching for {domain} helpers...")
         search_result = await mcp_client.call_tool(
-            "ha_search_entities", {"query": "", "domain_filter": domain, "limit": 10}
+            "ha_search", {"domain_filter": domain, "limit": 10}
         )
 
         search_data = parse_mcp_result(search_result)
-        # Handle different response formats - search might return data directly or nested
-        if "data" in search_data and "results" in search_data["data"]:
-            data_section = search_data["data"]
-            assert data_section.get("success", True), (
-                f"Helper search failed for {domain}: {search_data}"
-            )
-            results = data_section.get("results", [])
-        elif "results" in search_data:
-            # Direct results format
-            results = search_data.get("results", [])
-        else:
-            # Fallback - no results found
-            results = []
+        assert search_data.get("success", True), (
+            f"Helper search failed for {domain}: {search_data}"
+        )
+        results = search_data.get("entities", [])
         logger.info(f"🔍 Found {len(results)} {domain} helpers")
 
         # If helpers exist, verify their structure
@@ -1012,7 +1026,9 @@ async def test_helper_search_and_discovery(mcp_client):
 
     # Get system overview to see helper information (use standard level for full domain listing)
     logger.info("🔍 Getting system overview...")
-    overview_result = await mcp_client.call_tool("ha_get_overview", {"detail_level": "standard"})
+    overview_result = await mcp_client.call_tool(
+        "ha_get_overview", {"detail_level": "standard"}
+    )
     overview_data = parse_mcp_result(overview_result)
 
     # If helpers were found, they should appear in overview
@@ -1023,7 +1039,9 @@ async def test_helper_search_and_discovery(mcp_client):
         )
         logger.info("✅ System overview includes helper data")
     else:
-        logger.info("ℹ️ No helpers found in test environment, skipping overview validation")
+        logger.info(
+            "ℹ️ No helpers found in test environment, skipping overview validation"
+        )
 
     logger.info("✅ Helper search and discovery tests completed")
 
@@ -1078,7 +1096,7 @@ async def test_helper_list_functionality(mcp_client, cleanup_tracker):
             "name": "test_list_num",
             "min_value": 0,
             "max_value": 100,
-            "initial": "50",
+            "initial": 50,
             "icon": "mdi:test-tube",
         },
     )
@@ -1162,10 +1180,11 @@ async def test_helper_list_functionality(mcp_client, cleanup_tracker):
     logger.info("🗑️ Cleaning up test helpers...")
     for helper_type, helper_name in test_helpers_created:
         delete_result = await mcp_client.call_tool(
-            "ha_config_remove_helper",
+            "ha_remove_helpers_integrations",
             {
                 "helper_type": helper_type,
-                "helper_id": helper_name,
+                "target": helper_name,
+                "confirm": True,
             },
         )
         delete_data = parse_mcp_result(delete_result)

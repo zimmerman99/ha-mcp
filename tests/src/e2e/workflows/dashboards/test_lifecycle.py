@@ -18,13 +18,12 @@ production-level functionality and compatibility.
 import ast
 import json
 import logging
-import sys
 from typing import Any
 
 import pytest
 
 # Import test utilities
-from tests.src.e2e.utilities.assertions import MCPAssertions
+from ...utilities.assertions import MCPAssertions, extract_error_message, safe_call_tool
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +32,10 @@ logger = logging.getLogger(__name__)
 
 def parse_mcp_result(result) -> dict[str, Any]:
     """Parse MCP result from tool response."""
+    # Same passthrough contract as the shared utilities.assertions helper:
+    # an already-parsed dict comes back unchanged.
+    if isinstance(result, dict):
+        return result
     try:
         if hasattr(result, "content") and result.content:
             response_text = str(result.content[0].text)
@@ -51,7 +54,9 @@ def parse_mcp_result(result) -> dict[str, Any]:
                     return {"raw_response": response_text, "parse_error": True}
 
         return {
-            "content": str(result.content[0]) if hasattr(result, "content") else str(result)
+            "content": str(result.content[0])
+            if hasattr(result, "content")
+            else str(result)
         }
     except Exception as e:
         logger.warning(f"Failed to parse MCP result: {e}")
@@ -76,14 +81,20 @@ class TestDashboardLifecycle:
                 "icon": "mdi:test-tube",
                 "config": {
                     "views": [
-                        {"title": "Test View", "cards": [{"type": "markdown", "content": "Test"}]}
+                        {
+                            "title": "Test View",
+                            "cards": [{"type": "markdown", "content": "Test"}],
+                        }
                     ]
                 },
             },
         )
         assert create_data["success"] is True
         assert create_data["action"] in ["create", "set"]
-        assert create_data.get("dashboard_created") is True or create_data.get("action") == "create"
+        assert (
+            create_data.get("dashboard_created") is True
+            or create_data.get("action") == "create"
+        )
 
         # Extract dashboard ID for later operations
         dashboard_id = create_data.get("dashboard_id")
@@ -93,10 +104,13 @@ class TestDashboardLifecycle:
 
         # 2. List dashboards - verify exists
         logger.info("Listing dashboards...")
-        list_data = await mcp.call_tool_success("ha_config_get_dashboard", {"list_only": True})
+        list_data = await mcp.call_tool_success(
+            "ha_config_get_dashboard", {"list_only": True}
+        )
         assert list_data["success"] is True
         assert any(
-            d.get("url_path") == "test-e2e-dashboard" for d in list_data.get("dashboards", [])
+            d.get("url_path") == "test-e2e-dashboard"
+            for d in list_data.get("dashboards", [])
         )
 
         # 3. Get dashboard config
@@ -129,23 +143,26 @@ class TestDashboardLifecycle:
         )
         assert update_data["success"] is True
 
-        # 5. Update metadata (change title)
+        # 5. Update metadata (change title) via ha_config_set_dashboard
         logger.info("Updating dashboard metadata...")
         meta_data = await mcp.call_tool_success(
-            "ha_config_update_dashboard_metadata",
-            {"dashboard_id": dashboard_id, "title": "Updated E2E Dashboard"},
+            "ha_config_set_dashboard",
+            {"url_path": "test-e2e-dashboard", "title": "Updated E2E Dashboard"},
         )
         assert meta_data["success"] is True
+        assert meta_data.get("metadata_updated") is True
 
         # 6. Delete dashboard
         logger.info("Deleting test dashboard...")
         delete_data = await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"dashboard_id": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id}
         )
         assert delete_data["success"] is True
 
         # 7. Verify deletion
-        list_after_data = await mcp.call_tool_success("ha_config_get_dashboard", {"list_only": True})
+        list_after_data = await mcp.call_tool_success(
+            "ha_config_get_dashboard", {"list_only": True}
+        )
         assert not any(
             d.get("url_path") == "test-e2e-dashboard"
             for d in list_after_data.get("dashboards", [])
@@ -171,9 +188,10 @@ class TestDashboardLifecycle:
         dashboard_id = create_data.get("dashboard_id")
         assert dashboard_id is not None
 
-
         # Verify it exists
-        list_data = await mcp.call_tool_success("ha_config_get_dashboard", {"list_only": True})
+        list_data = await mcp.call_tool_success(
+            "ha_config_get_dashboard", {"list_only": True}
+        )
         assert any(
             d.get("url_path") == "test-strategy-dashboard"
             for d in list_data.get("dashboards", [])
@@ -181,25 +199,66 @@ class TestDashboardLifecycle:
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"dashboard_id": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id}
         )
 
         logger.info("Strategy-based dashboard test completed successfully")
 
     async def test_url_path_validation(self, mcp_client):
-        """Test that url_path must contain hyphen."""
-        logger.info("Starting url_path validation test")
+        """Test that 'lovelace' and 'default' are not rejected by hyphen validation (#591)."""
+        logger.info("Starting default dashboard hyphen validation test")
+        mcp = MCPAssertions(mcp_client)
 
-        # Try to create dashboard without hyphen
-        result = await mcp_client.call_tool(
+        # "lovelace" should NOT be rejected by the hyphen validation
+        # (it may fail for other reasons on fresh HA, but not the hyphen check)
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_config_set_dashboard",
+            {"url_path": "lovelace", "title": "Default Dashboard"},
+        )
+        # The key assertion: error must NOT be about hyphens
+        if not data.get("success", False):
+            error_msg = extract_error_message(data)
+            assert "hyphen" not in error_msg.lower(), (
+                f"'lovelace' should not be rejected by hyphen validation, got: {error_msg}"
+            )
+
+        # "default" alias should also not be rejected by hyphen validation
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_config_set_dashboard",
+            {"url_path": "default", "title": "Default Dashboard"},
+        )
+        if not data.get("success", False):
+            error_msg = extract_error_message(data)
+            assert "hyphen" not in error_msg.lower(), (
+                f"'default' should not be rejected by hyphen validation, got: {error_msg}"
+            )
+
+        # The seeded Map dashboard is a real storage dashboard whose url_path
+        # predates the creation-only hyphen rule. Exact-path updates must work
+        # without being reported as identifier canonicalization.
+        data = await mcp.call_tool_success(
+            "ha_config_set_dashboard",
+            {"url_path": "map", "title": "Map"},
+        )
+        assert data["success"] is True
+        assert data["action"] == "update"
+        assert data["url_path"] == "map"
+        assert data["metadata_updated"] is True
+        assert "resolved_from" not in data
+
+        # "nodash" (non-existent, no hyphen) SHOULD still be rejected
+        data = await safe_call_tool(
+            mcp_client,
             "ha_config_set_dashboard",
             {"url_path": "nodash", "title": "Invalid Dashboard"},
         )
-        data = parse_mcp_result(result)
         assert data["success"] is False
-        assert "hyphen" in data.get("error", "").lower()
+        error_msg = extract_error_message(data)
+        assert "hyphen" in error_msg.lower()
 
-        logger.info("url_path validation test completed successfully")
+        logger.info("Default dashboard hyphen validation test completed successfully")
 
     async def test_partial_metadata_update(self, mcp_client):
         """Test updating only some metadata fields."""
@@ -214,26 +273,33 @@ class TestDashboardLifecycle:
         dashboard_id = create_data.get("dashboard_id")
         assert dashboard_id is not None
 
-
-        # Update only title
+        # Update only title via ha_config_set_dashboard
         meta_data = await mcp.call_tool_success(
-            "ha_config_update_dashboard_metadata",
-            {"dashboard_id": dashboard_id, "title": "New Title"},
+            "ha_config_set_dashboard",
+            {"url_path": "test-partial-update", "title": "New Title"},
         )
         assert meta_data["success"] is True
-        assert "title" in meta_data.get("updated_fields", {})
+        assert meta_data.get("metadata_updated") is True
 
         # Cleanup
         await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"dashboard_id": dashboard_id}
+            "ha_config_delete_dashboard", {"url_path": dashboard_id}
         )
 
         logger.info("Partial metadata update test completed successfully")
 
-    async def test_dashboard_without_initial_config(self, mcp_client):
-        """Test creating dashboard without initial configuration."""
+    async def test_dashboard_without_initial_config_can_be_populated(self, mcp_client):
+        """A dashboard created without config accepts its first full config later."""
         logger.info("Starting dashboard without config test")
         mcp = MCPAssertions(mcp_client)
+        replacement = {
+            "views": [
+                {
+                    "title": "Populated",
+                    "cards": [{"type": "markdown", "content": "First config"}],
+                }
+            ]
+        }
 
         # Create dashboard without config
         create_data = await mcp.call_tool_success(
@@ -244,31 +310,61 @@ class TestDashboardLifecycle:
         dashboard_id = create_data.get("dashboard_id")
         assert dashboard_id is not None
 
+        try:
+            # Verify the metadata-only dashboard exists before its config does.
+            list_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"list_only": True}
+            )
+            assert any(
+                d.get("url_path") == "test-no-config"
+                for d in list_data.get("dashboards", [])
+            )
 
-        # Verify it exists
-        list_data = await mcp.call_tool_success("ha_config_get_dashboard", {"list_only": True})
-        assert any(d.get("url_path") == "test-no-config" for d in list_data.get("dashboards", []))
+            update_data = await mcp.call_tool_success(
+                "ha_config_set_dashboard",
+                {"url_path": "test-no-config", "config": replacement},
+            )
+            assert update_data["action"] == "update"
+            assert update_data["config_updated"] is True
 
-        # Cleanup
-        await mcp.call_tool_success(
-            "ha_config_delete_dashboard", {"dashboard_id": dashboard_id}
-        )
+            get_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-no-config"}
+            )
+            assert get_data["config"] == replacement
+        finally:
+            await mcp.call_tool_success(
+                "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            )
 
         logger.info("Dashboard without config test completed successfully")
 
-    async def test_metadata_update_requires_at_least_one_field(self, mcp_client):
-        """Test that metadata update requires at least one field."""
-        logger.info("Starting metadata update validation test")
+    async def test_metadata_update_via_set_dashboard(self, mcp_client):
+        """Test updating dashboard metadata via ha_config_set_dashboard."""
+        logger.info("Starting metadata update via set_dashboard test")
+        mcp = MCPAssertions(mcp_client)
 
-        # Try to update metadata with no fields
-        result = await mcp_client.call_tool(
-            "ha_config_update_dashboard_metadata", {"dashboard_id": "test-dashboard"}
+        # Create dashboard
+        create_data = await mcp.call_tool_success(
+            "ha_config_set_dashboard",
+            {"url_path": "test-meta-via-set", "title": "Original Title"},
         )
-        data = parse_mcp_result(result)
-        assert data["success"] is False
-        assert "at least one field" in data.get("error", "").lower()
+        dashboard_id = create_data.get("dashboard_id")
+        assert dashboard_id is not None
 
-        logger.info("Metadata update validation test completed successfully")
+        # Update title without changing config
+        meta_data = await mcp.call_tool_success(
+            "ha_config_set_dashboard",
+            {"url_path": "test-meta-via-set", "title": "Updated Title"},
+        )
+        assert meta_data["success"] is True
+        assert meta_data.get("metadata_updated") is True
+
+        # Cleanup
+        await mcp.call_tool_success(
+            "ha_config_delete_dashboard", {"url_path": dashboard_id}
+        )
+
+        logger.info("Metadata update via set_dashboard test completed successfully")
 
 
 class TestDashboardErrorHandling:
@@ -278,333 +374,204 @@ class TestDashboardErrorHandling:
         """Test getting config for non-existent dashboard."""
         logger.info("Starting get nonexistent dashboard test")
 
-        result = await mcp_client.call_tool(
-            "ha_config_get_dashboard", {"url_path": "nonexistent-dashboard-12345"}
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_config_get_dashboard",
+            {"url_path": "nonexistent-dashboard-12345"},
         )
-        data = parse_mcp_result(result)
         # May succeed but return empty/error config, or fail - either is acceptable
         assert "success" in data or "error" in data
 
         logger.info("Get nonexistent dashboard test completed successfully")
 
     async def test_delete_nonexistent_dashboard(self, mcp_client):
-        """Test deleting non-existent dashboard."""
+        """Test deleting non-existent dashboard raises ToolError with RESOURCE_NOT_FOUND."""
         logger.info("Starting delete nonexistent dashboard test")
 
-        result = await mcp_client.call_tool(
-            "ha_config_delete_dashboard", {"dashboard_id": "nonexistent-dashboard-67890"}
-        )
-        data = parse_mcp_result(result)
-        # Home Assistant handles delete as idempotent - deleting nonexistent item succeeds
-        # This is expected behavior and consistent with other HA operations
-        assert data["success"] is True
+        from fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError) as exc_info:
+            await mcp_client.call_tool(
+                "ha_config_delete_dashboard",
+                {"url_path": "nonexistent-dashboard-67890"},
+            )
+
+        data = json.loads(str(exc_info.value))
+        assert data["success"] is False
+        assert data["error"]["code"] == "RESOURCE_NOT_FOUND"
 
         logger.info("Delete nonexistent dashboard test completed successfully")
 
 
-class TestDashboardDocumentationTools:
-    """Test dashboard documentation tools."""
+class TestDashboardIdentifierResolution:
+    """E2E tests for #981 — get/set/delete accept both url_path and internal id."""
 
-    async def test_get_dashboard_guide(self, mcp_client):
-        """Test ha_get_dashboard_guide returns the guide."""
-        logger.info("Testing ha_get_dashboard_guide")
+    async def test_delete_via_url_path(self, mcp_client):
+        """Delete accepts the url_path form (was the new canonical param name)."""
         mcp = MCPAssertions(mcp_client)
 
-        data = await mcp.call_tool_success("ha_get_dashboard_guide", {})
-
-        assert data["success"] is True
-        assert data["action"] == "get_guide"
-        assert "guide" in data
-        assert data["format"] == "markdown"
-
-        # Verify guide contains key sections
-        guide_content = data["guide"]
-        assert "url_path MUST contain hyphen" in guide_content
-        assert "Dashboard Structure" in guide_content
-        assert "Card Categories" in guide_content
-
-        logger.info("ha_get_dashboard_guide test passed")
-
-    async def test_get_card_types(self, mcp_client):
-        """Test ha_get_card_types returns all card types."""
-        logger.info("Testing ha_get_card_types")
-        mcp = MCPAssertions(mcp_client)
-
-        data = await mcp.call_tool_success("ha_get_card_types", {})
-
-        assert data["success"] is True
-        assert data["action"] == "get_card_types"
-        assert "card_types" in data
-        assert "total_count" in data
-        assert data["total_count"] == 41
-
-        # Verify some common card types are present
-        card_types = data["card_types"]
-        assert "light" in card_types
-        assert "entity" in card_types
-
-        logger.info("ha_get_card_types test passed")
-
-    async def test_get_card_documentation_invalid(self, mcp_client):
-        """Test ha_get_card_documentation with invalid card type."""
-        logger.info("Testing ha_get_card_documentation with invalid card type")
-        mcp = MCPAssertions(mcp_client)
-
-        data = await mcp.call_tool_failure(
-            "ha_get_card_documentation",
-            {"card_type": "nonexistent-card-type"},
-            expected_error="Unknown card type",
-        )
-
-        assert data["success"] is False
-        assert data["card_type"] == "nonexistent-card-type"
-
-        logger.info("ha_get_card_documentation (invalid) test passed")
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="jq library not available on Windows")
-class TestJqTransformAndFindCard:
-    """E2E tests for jq_transform and ha_dashboard_find_card."""
-
-    async def test_jq_transform_update_field(self, mcp_client):
-        """Test updating a card field using jq_transform."""
-        logger.info("Starting jq_transform update field test")
-        mcp = MCPAssertions(mcp_client)
-
-        # Setup: Create test dashboard
         await mcp.call_tool_success(
             "ha_config_set_dashboard",
+            {"url_path": "test-981-delete-by-url", "title": "Delete by url_path"},
+        )
+
+        delete_data = await mcp.call_tool_success(
+            "ha_config_delete_dashboard", {"url_path": "test-981-delete-by-url"}
+        )
+        assert delete_data["success"] is True
+        assert delete_data["url_path"] == "test-981-delete-by-url"
+
+        list_after = await mcp.call_tool_success(
+            "ha_config_get_dashboard", {"list_only": True}
+        )
+        assert not any(
+            d.get("url_path") == "test-981-delete-by-url"
+            for d in list_after.get("dashboards", [])
+        )
+
+    async def test_get_via_internal_id_lazy_resolves(self, mcp_client):
+        """Get with the internal dashboard id triggers the lazy resolver."""
+        mcp = MCPAssertions(mcp_client)
+
+        # Create dashboard so the resolver finds something to map.
+        # url_path with hyphen → HA sanitises it to underscore for the internal id.
+        create_data = await mcp.call_tool_success(
+            "ha_config_set_dashboard",
             {
-                "url_path": "test-jq-update",
-                "title": "JQ Update Test",
+                "url_path": "test-981-get-by-id",
+                "title": "Get by id",
                 "config": {
-                    "views": [
-                        {
-                            "title": "Test View",
-                            "cards": [
-                                {"type": "tile", "entity": "sensor.temperature", "icon": "mdi:old"},
-                            ]
-                        }
-                    ]
+                    "views": [{"cards": [{"type": "markdown", "content": "hi"}]}]
                 },
             },
         )
+        internal_id = create_data["dashboard_id"]
+        assert internal_id != "test-981-get-by-id"  # resolver must do real work
 
         try:
-            # Get dashboard and config_hash
-            get_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-jq-update"},
+            # Pass the internal id where url_path is expected — lazy fallback
+            # in get Mode 3 resolves it and retries with the canonical url_path.
+            get_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": internal_id}
             )
-            config_hash = get_result["config_hash"]
-
-            # Update icon using jq_transform
-            update_result = await mcp.call_tool_success(
-                "ha_config_set_dashboard",
-                {
-                    "url_path": "test-jq-update",
-                    "config_hash": config_hash,
-                    "jq_transform": '.views[0].cards[0].icon = "mdi:thermometer"',
-                },
-            )
-            assert update_result["success"] is True
-            assert update_result["action"] == "jq_transform"
-            assert "config_hash" in update_result
-
-            # Verify the change
-            verify_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-jq-update"},
-            )
-            assert verify_result["config"]["views"][0]["cards"][0]["icon"] == "mdi:thermometer"
-
-            logger.info("jq_transform update field test passed")
-
+            assert get_data["success"] is True
+            assert get_data["config"]["views"][0]["cards"][0]["content"] == "hi"
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard",
-                {"dashboard_id": "test-jq-update"},
+                "ha_config_delete_dashboard", {"url_path": "test-981-get-by-id"}
             )
 
-    async def test_jq_transform_add_delete_card(self, mcp_client):
-        """Test adding and deleting cards using jq_transform."""
-        logger.info("Starting jq_transform add/delete test")
+    async def test_set_via_internal_id_pre_resolves(self, mcp_client):
+        """Set with the internal id (no hyphen) gets pre-resolved before validation."""
         mcp = MCPAssertions(mcp_client)
 
-        # Setup: Create test dashboard with one card
-        await mcp.call_tool_success(
+        create_data = await mcp.call_tool_success(
             "ha_config_set_dashboard",
             {
-                "url_path": "test-jq-ops",
-                "title": "JQ Operations Test",
+                "url_path": "test-981-set-by-id",
+                "title": "Set by id",
                 "config": {
-                    "views": [
-                        {
-                            "title": "Test View",
-                            "cards": [
-                                {"type": "tile", "entity": "sensor.temperature"},
-                            ]
-                        }
-                    ]
+                    "views": [{"cards": [{"type": "markdown", "content": "v1"}]}]
                 },
             },
         )
+        internal_id = create_data["dashboard_id"]
+        # Literal compare on the canonical id form — survives an HA-side
+        # change of the slugify separator with a clearer failure message
+        # than ``"-" not in internal_id``. The pre-resolver must run before
+        # the hyphen-check on this id (it has no hyphen by construction).
+        assert internal_id == "test_981_set_by_id"
 
         try:
-            # Add a card
-            get_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-jq-ops"},
-            )
-            config_hash = get_result["config_hash"]
-
-            add_result = await mcp.call_tool_success(
+            # Update via internal id — pre-resolver replaces it with url_path
+            # so the hyphen validation passes.
+            update_data = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
                 {
-                    "url_path": "test-jq-ops",
-                    "config_hash": config_hash,
-                    "jq_transform": '.views[0].cards += [{"type": "button", "entity": "light.bedroom"}]',
-                },
-            )
-            assert add_result["success"] is True
-
-            # Verify 2 cards
-            verify_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-jq-ops"},
-            )
-            assert len(verify_result["config"]["views"][0]["cards"]) == 2
-
-            # Delete the first card
-            config_hash = verify_result["config_hash"]
-            delete_result = await mcp.call_tool_success(
-                "ha_config_set_dashboard",
-                {
-                    "url_path": "test-jq-ops",
-                    "config_hash": config_hash,
-                    "jq_transform": 'del(.views[0].cards[0])',
-                },
-            )
-            assert delete_result["success"] is True
-
-            # Verify 1 card remaining
-            final_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-jq-ops"},
-            )
-            assert len(final_result["config"]["views"][0]["cards"]) == 1
-            assert final_result["config"]["views"][0]["cards"][0]["type"] == "button"
-
-            logger.info("jq_transform add/delete test passed")
-
-        finally:
-            await mcp.call_tool_success(
-                "ha_config_delete_dashboard",
-                {"dashboard_id": "test-jq-ops"},
-            )
-
-    async def test_jq_transform_config_hash_validation(self, mcp_client):
-        """Test config_hash validation prevents conflicts."""
-        logger.info("Starting config_hash validation test")
-        mcp = MCPAssertions(mcp_client)
-
-        # Setup
-        await mcp.call_tool_success(
-            "ha_config_set_dashboard",
-            {
-                "url_path": "test-hash-validation",
-                "title": "Hash Validation Test",
-                "config": {
-                    "views": [
-                        {
-                            "title": "Test View",
-                            "cards": [{"type": "tile", "entity": "sensor.temperature"}]
-                        }
-                    ]
-                },
-            },
-        )
-
-        try:
-            # Get config_hash
-            get_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-hash-validation"},
-            )
-            old_hash = get_result["config_hash"]
-
-            # Modify dashboard (simulate concurrent edit)
-            await mcp.call_tool_success(
-                "ha_config_set_dashboard",
-                {
-                    "url_path": "test-hash-validation",
+                    "url_path": internal_id,
                     "config": {
-                        "views": [
-                            {
-                                "title": "Modified View",
-                                "cards": [{"type": "markdown", "content": "Changed"}]
-                            }
-                        ]
+                        "views": [{"cards": [{"type": "markdown", "content": "v2"}]}]
                     },
                 },
             )
+            assert update_data["success"] is True
+            assert update_data["config_updated"] is True
 
-            # Try to apply jq_transform with stale hash - should fail
-            result = await mcp_client.call_tool(
-                "ha_config_set_dashboard",
-                {
-                    "url_path": "test-hash-validation",
-                    "config_hash": old_hash,
-                    "jq_transform": '.views[0].cards[0].icon = "mdi:new"',
-                },
+            # Verify the canonical url_path now holds v2
+            get_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-981-set-by-id"}
             )
-            parsed = parse_mcp_result(result)
-            assert parsed["success"] is False
-            assert "conflict" in parsed["error"].lower() or "modified" in parsed["error"].lower()
-
-            logger.info("config_hash validation test passed")
-
+            assert get_data["config"]["views"][0]["cards"][0]["content"] == "v2"
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard",
-                {"dashboard_id": "test-hash-validation"},
+                "ha_config_delete_dashboard", {"url_path": "test-981-set-by-id"}
             )
 
-    async def test_jq_transform_requires_hash(self, mcp_client):
-        """Test that jq_transform requires config_hash."""
-        logger.info("Starting jq_transform requires hash test")
+    async def test_mixed_identifier_optimistic_locking(self, mcp_client):
+        """config_hash from get(url_path) matches set(internal_id) — same content."""
         mcp = MCPAssertions(mcp_client)
 
-        # Setup
-        await mcp.call_tool_success(
+        create_data = await mcp.call_tool_success(
             "ha_config_set_dashboard",
             {
-                "url_path": "test-requires-hash",
-                "title": "Requires Hash Test",
-                "config": {"views": [{"cards": []}]},
+                "url_path": "test-981-mixed-hash",
+                "title": "Mixed identifier hash",
+                "config": {
+                    "views": [{"cards": [{"type": "markdown", "content": "x"}]}]
+                },
             },
         )
+        internal_id = create_data["dashboard_id"]
 
         try:
-            # Try jq_transform without config_hash - should fail
-            result = await mcp_client.call_tool(
+            # Read via url_path
+            get_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-981-mixed-hash"}
+            )
+            config_hash = get_data["config_hash"]
+            assert config_hash
+
+            # Apply python_transform via the internal id — the set-tool's
+            # pre-resolver maps the internal id to the canonical url_path
+            # before the python_transform branch runs. The hash from the
+            # url_path read must still validate because the underlying
+            # config is the same.
+            transform_data = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
                 {
-                    "url_path": "test-requires-hash",
-                    "jq_transform": '.views[0].title = "New Title"',
+                    "url_path": internal_id,
+                    "config_hash": config_hash,
+                    "python_transform": (
+                        "config['views'][0]['cards'][0]['content'] = 'transformed'"
+                    ),
                 },
             )
-            parsed = parse_mcp_result(result)
-            assert parsed["success"] is False
-            assert "config_hash is required" in parsed["error"]
+            assert transform_data["success"] is True
+            assert transform_data["action"] == "python_transform"
 
-            logger.info("jq_transform requires hash test passed")
-
+            # Re-read and assert the transform actually wrote new content —
+            # without this, a regression that turns the python_transform
+            # branch into a no-op save (success-but-untouched) would still
+            # pass. Mirrors the v1→v2 verification pattern in
+            # test_set_via_internal_id_pre_resolves above.
+            verify_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-981-mixed-hash"}
+            )
+            assert (
+                verify_data["config"]["views"][0]["cards"][0]["content"]
+                == "transformed"
+            ), (
+                "python_transform reported success but the persisted config "
+                "did not change — likely no-op save regression"
+            )
         finally:
             await mcp.call_tool_success(
-                "ha_config_delete_dashboard",
-                {"dashboard_id": "test-requires-hash"},
+                "ha_config_delete_dashboard", {"url_path": "test-981-mixed-hash"}
             )
+
+
+class TestFindCard:
+    """E2E tests for ha_config_get_dashboard search mode."""
 
     async def test_find_card_by_entity(self, mcp_client):
         """Test finding cards by entity_id."""
@@ -626,11 +593,14 @@ class TestJqTransformAndFindCard:
                                 {
                                     "title": "Section 1",
                                     "cards": [
-                                        {"type": "tile", "entity": "sensor.temperature"},
+                                        {
+                                            "type": "tile",
+                                            "entity": "sensor.temperature",
+                                        },
                                         {"type": "tile", "entity": "sensor.humidity"},
-                                    ]
+                                    ],
                                 }
-                            ]
+                            ],
                         }
                     ]
                 },
@@ -640,7 +610,7 @@ class TestJqTransformAndFindCard:
         try:
             # Find card by entity
             result = await mcp.call_tool_success(
-                "ha_dashboard_find_card",
+                "ha_config_get_dashboard",
                 {
                     "url_path": "test-find-entity",
                     "entity_id": "sensor.temperature",
@@ -662,7 +632,7 @@ class TestJqTransformAndFindCard:
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"dashboard_id": "test-find-entity"},
+                {"url_path": "test-find-entity"},
             )
 
     async def test_find_card_by_type(self, mcp_client):
@@ -693,7 +663,7 @@ class TestJqTransformAndFindCard:
         try:
             # Find all tile cards
             result = await mcp.call_tool_success(
-                "ha_dashboard_find_card",
+                "ha_config_get_dashboard",
                 {
                     "url_path": "test-find-type",
                     "card_type": "tile",
@@ -709,26 +679,42 @@ class TestJqTransformAndFindCard:
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"dashboard_id": "test-find-type"},
+                {"url_path": "test-find-type"},
             )
 
-    async def test_find_card_with_jq_transform(self, mcp_client):
-        """Test workflow: find card -> jq_transform."""
-        logger.info("Starting find_card + jq_transform workflow test")
+    async def test_find_nested_card_python_path_round_trip(self, mcp_client):
+        """find_card → python_transform → re-fetch round trip for a card nested
+        under a button-card custom_fields key that contains an apostrophe.
+
+        Pins issue #1599 round-2 items 2/3/5 at the websocket layer: the
+        returned ``python_path`` must splice into ``ha_config_set_dashboard``
+        and mutate exactly the nested card, even when a key like ``o'brien``
+        would break a raw-interpolated locator.
+        """
+        logger.info("Starting nested-card python_path round-trip test")
         mcp = MCPAssertions(mcp_client)
 
-        # Setup
         await mcp.call_tool_success(
             "ha_config_set_dashboard",
             {
-                "url_path": "test-workflow",
-                "title": "Workflow Test",
+                "url_path": "test-find-roundtrip",
+                "title": "Round Trip Test",
                 "config": {
                     "views": [
                         {
                             "cards": [
-                                {"type": "tile", "entity": "light.living_room", "icon": "mdi:lamp"},
-                                {"type": "tile", "entity": "light.bedroom", "icon": "mdi:bed"},
+                                {
+                                    "type": "custom:button-card",
+                                    "custom_fields": {
+                                        # apostrophe key — the #3 regression case
+                                        "o'brien": {
+                                            "card": {
+                                                "type": "tile",
+                                                "entity": "sensor.temperature",
+                                            }
+                                        }
+                                    },
+                                }
                             ]
                         }
                     ]
@@ -737,42 +723,46 @@ class TestJqTransformAndFindCard:
         )
 
         try:
-            # Find card
-            find_result = await mcp.call_tool_success(
-                "ha_dashboard_find_card",
-                {
-                    "url_path": "test-workflow",
-                    "entity_id": "light.bedroom",
-                },
+            # 1. Locate the nested tile and capture its python_path + hash.
+            found = await mcp.call_tool_success(
+                "ha_config_get_dashboard",
+                {"url_path": "test-find-roundtrip", "card_type": "tile"},
             )
-            assert find_result["match_count"] == 1
+            assert found["match_count"] == 1
+            python_path = found["matches"][0]["python_path"]
+            config_hash = found["config_hash"]
 
-            match = find_result["matches"][0]
-            jq_path = match["jq_path"]
-            config_hash = find_result["config_hash"]
-
-            # Update using jq_path
-            update_result = await mcp.call_tool_success(
+            # 2. Splice python_path into a python_transform write.
+            update = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
                 {
-                    "url_path": "test-workflow",
+                    "url_path": "test-find-roundtrip",
                     "config_hash": config_hash,
-                    "jq_transform": f'{jq_path}.icon = "mdi:lightbulb"',
+                    "python_transform": (
+                        f"config{python_path}['name'] = 'Renamed Tile'"
+                    ),
                 },
             )
-            assert update_result["success"] is True
+            assert update["success"] is True
+            assert update["action"] == "python_transform"
 
-            # Verify
-            verify_result = await mcp.call_tool_success(
-                "ha_config_get_dashboard",
-                {"url_path": "test-workflow"},
+            # 3. Re-fetch and confirm exactly the nested card mutated.
+            verify = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-find-roundtrip"}
             )
-            assert verify_result["config"]["views"][0]["cards"][1]["icon"] == "mdi:lightbulb"
+            view_cards = verify["config"]["views"][0]["cards"]
+            nested = view_cards[0]["custom_fields"]["o'brien"]["card"]
+            assert nested["name"] == "Renamed Tile"
+            # Precision: only the nested card mutated. A python_path that resolved
+            # to the parent button-card instead would also land a `name`, so pin
+            # that the parent is untouched and no card was added/removed.
+            assert "name" not in view_cards[0]
+            assert len(view_cards) == 1
 
-            logger.info("find_card + jq_transform workflow test passed")
+            logger.info("nested-card python_path round-trip test passed")
 
         finally:
             await mcp.call_tool_success(
                 "ha_config_delete_dashboard",
-                {"dashboard_id": "test-workflow"},
+                {"url_path": "test-find-roundtrip"},
             )

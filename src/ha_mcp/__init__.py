@@ -2,10 +2,16 @@
 Home Assistant MCP Server
 
 A Model Context Protocol server that provides complete control over Home Assistant
-through REST API and WebSocket integration with 20+ enhanced tools.
+through REST API and WebSocket integration.
 """
 
-__version__ = "6.5.0"
+# Must be imported before anything that reaches fastmcp (``.auth`` below does),
+# because fastmcp configures rich logging at import time and dies on a rich
+# older than 13.9.4. Importing this module applies the shim. See #2186.
+from . import _rich_compat as _rich_compat
+from ._version import get_version
+
+__version__ = get_version()
 __author__ = "Julien"
 __license__ = "MIT"
 
@@ -19,7 +25,6 @@ from .errors import (
     create_connection_error,
     create_entity_not_found_error,
     create_error_response,
-    create_resource_not_found_error,
     create_service_error,
     create_timeout_error,
     create_validation_error,
@@ -44,7 +49,6 @@ __all__ = [
     "create_validation_error",
     "create_config_error",
     "create_timeout_error",
-    "create_resource_not_found_error",
     "is_error_response",
     "get_error_code",
     "get_error_message",

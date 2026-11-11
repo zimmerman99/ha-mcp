@@ -14,6 +14,7 @@ import pytest
 from ...utilities.assertions import (
     assert_mcp_success,
     parse_mcp_result,
+    safe_call_tool,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,17 +33,14 @@ class TestLabelLifecycle:
         """
         # Search for light entities (common and safe to modify)
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
+            "ha_search",
             {"query": "light", "domain_filter": "light", "limit": 10},
         )
 
         search_data = parse_mcp_result(search_result)
 
         # Handle nested data structure
-        if "data" in search_data:
-            results = search_data.get("data", {}).get("results", [])
-        else:
-            results = search_data.get("results", [])
+        results = search_data.get("entities", [])
 
         if not results:
             pytest.skip("No light entities available for testing")
@@ -362,11 +360,34 @@ class TestLabelLifecycle:
 class TestLabelValidation:
     """Test label validation and error handling."""
 
+    async def test_get_label_nonexistent(self, mcp_client):
+        """Test ha_config_get_label returns RESOURCE_NOT_FOUND for unknown label_id.
+
+        Labels are registry metadata, not HA entities — RESOURCE_NOT_FOUND is
+        the correct category per #1297.
+        """
+        logger.info(
+            "Testing get of nonexistent label (label_id=nonexistent_label_e2e_xyz_404)..."
+        )
+
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_config_get_label",
+            {"label_id": "nonexistent_label_e2e_xyz_404"},
+        )
+
+        assert result["success"] is False
+        assert result["error"]["code"] == "RESOURCE_NOT_FOUND"
+        assert "Label not found" in result["error"]["message"]
+        assert "available_label_ids" in result
+        logger.info("Nonexistent label get correctly rejected")
+
     async def test_update_nonexistent_label(self, mcp_client):
         """Test updating a label that doesn't exist."""
         logger.info("Testing update of nonexistent label...")
 
-        update_result = await mcp_client.call_tool(
+        update_data = await safe_call_tool(
+            mcp_client,
             "ha_config_set_label",
             {
                 "label_id": "nonexistent_label_id_12345",
@@ -374,32 +395,28 @@ class TestLabelValidation:
             },
         )
 
-        update_data = parse_mcp_result(update_result)
-        assert not update_data.get("success"), (
-            "Updating nonexistent label should fail"
-        )
+        assert not update_data.get("success"), "Updating nonexistent label should fail"
         logger.info("Nonexistent label update correctly rejected")
 
     async def test_delete_nonexistent_label(self, mcp_client):
         """Test deleting a label that doesn't exist."""
         logger.info("Testing delete of nonexistent label...")
 
-        delete_result = await mcp_client.call_tool(
+        delete_data = await safe_call_tool(
+            mcp_client,
             "ha_config_remove_label",
             {"label_id": "nonexistent_label_id_12345"},
         )
 
-        delete_data = parse_mcp_result(delete_result)
-        assert not delete_data.get("success"), (
-            "Deleting nonexistent label should fail"
-        )
+        assert not delete_data.get("success"), "Deleting nonexistent label should fail"
         logger.info("Nonexistent label delete correctly rejected")
 
     async def test_assign_to_nonexistent_entity(self, mcp_client):
         """Test assigning label to entity that doesn't exist."""
         logger.info("Testing assign to nonexistent entity...")
 
-        assign_result = await mcp_client.call_tool(
+        assign_data = await safe_call_tool(
+            mcp_client,
             "ha_set_entity",
             {
                 "entity_id": "light.nonexistent_entity_12345",
@@ -407,7 +424,6 @@ class TestLabelValidation:
             },
         )
 
-        assign_data = parse_mcp_result(assign_result)
         assert not assign_data.get("success"), (
             "Assigning to nonexistent entity should fail"
         )

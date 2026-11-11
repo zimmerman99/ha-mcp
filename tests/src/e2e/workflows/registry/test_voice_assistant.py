@@ -15,7 +15,7 @@ import logging
 
 import pytest
 
-from ...utilities.assertions import parse_mcp_result
+from ...utilities.assertions import parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -64,9 +64,9 @@ class TestVoiceAssistantExposure:
 
         # Check filter was applied
         filters = data.get("filters_applied", {})
-        assert (
-            filters.get("assistant") == "conversation"
-        ), "Assistant filter should be applied"
+        assert filters.get("assistant") == "conversation", (
+            "Assistant filter should be applied"
+        )
 
         logger.info(f"Listed entities exposed to conversation: {data.get('count')}")
 
@@ -76,12 +76,12 @@ class TestVoiceAssistantExposure:
         """
         logger.info("Testing ha_get_entity_exposure with invalid assistant")
 
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_get_entity_exposure",
             {"assistant": "invalid_assistant"},
         )
 
-        data = parse_mcp_result(result)
         assert not data.get("success"), "Invalid assistant should fail"
         assert "valid_assistants" in data, "Should suggest valid assistants"
 
@@ -107,7 +107,6 @@ class TestVoiceAssistantExposure:
         entity_id = "input_boolean.test_exposure_check"
         cleanup_tracker.track("input_boolean", entity_id)
 
-
         # Get exposure settings
         result = await mcp_client.call_tool(
             "ha_get_entity_exposure",
@@ -126,8 +125,12 @@ class TestVoiceAssistantExposure:
 
         # Cleanup
         await mcp_client.call_tool(
-            "ha_config_remove_helper",
-            {"helper_type": "input_boolean", "helper_id": "test_exposure_check"},
+            "ha_remove_helpers_integrations",
+            {
+                "helper_type": "input_boolean",
+                "target": "test_exposure_check",
+                "confirm": True,
+            },
         )
 
     async def test_expose_entity_to_conversation(self, mcp_client, cleanup_tracker):
@@ -152,7 +155,6 @@ class TestVoiceAssistantExposure:
 
         entity_id = "input_boolean.test_expose_entity"
         cleanup_tracker.track("input_boolean", entity_id)
-
 
         # Expose to conversation assistant via ha_set_entity
         expose_result = await mcp_client.call_tool(
@@ -183,8 +185,12 @@ class TestVoiceAssistantExposure:
 
         # Cleanup
         await mcp_client.call_tool(
-            "ha_config_remove_helper",
-            {"helper_type": "input_boolean", "helper_id": "test_expose_entity"},
+            "ha_remove_helpers_integrations",
+            {
+                "helper_type": "input_boolean",
+                "target": "test_expose_entity",
+                "confirm": True,
+            },
         )
 
     async def test_hide_entity_from_assistant(self, mcp_client, cleanup_tracker):
@@ -207,7 +213,6 @@ class TestVoiceAssistantExposure:
         entity_id = "input_boolean.test_hide_entity"
         cleanup_tracker.track("input_boolean", entity_id)
 
-
         # Hide from conversation assistant via ha_set_entity
         hide_result = await mcp_client.call_tool(
             "ha_set_entity",
@@ -225,8 +230,12 @@ class TestVoiceAssistantExposure:
 
         # Cleanup
         await mcp_client.call_tool(
-            "ha_config_remove_helper",
-            {"helper_type": "input_boolean", "helper_id": "test_hide_entity"},
+            "ha_remove_helpers_integrations",
+            {
+                "helper_type": "input_boolean",
+                "target": "test_hide_entity",
+                "confirm": True,
+            },
         )
 
     async def test_expose_entity_invalid_assistant(self, mcp_client):
@@ -235,7 +244,8 @@ class TestVoiceAssistantExposure:
         """
         logger.info("Testing ha_set_entity expose_to with invalid assistant")
 
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_set_entity",
             {
                 "entity_id": "input_boolean.test",
@@ -243,7 +253,6 @@ class TestVoiceAssistantExposure:
             },
         )
 
-        data = parse_mcp_result(result)
         assert not data.get("success"), "Invalid assistant should fail"
 
         logger.info("Invalid assistant correctly rejected")

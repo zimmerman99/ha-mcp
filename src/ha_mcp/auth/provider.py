@@ -3,20 +3,30 @@ Home Assistant OAuth 2.1 Provider.
 
 This module implements OAuth 2.1 authentication with Dynamic Client Registration (DCR)
 for Home Assistant MCP Server. Users authenticate via a consent form where they
-provide their Home Assistant URL and Long-Lived Access Token (LLAT).
+provide their Long-Lived Access Token (LLAT).
 """
 
 import binascii
+import contextlib
+import hashlib
+import hmac
 import json
 import logging
+import os
 import secrets
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-import httpx
-from fastmcp.server.auth.auth import AccessToken  # FastMCP version has claims field
+from fastmcp.server.auth.auth import (
+    AccessToken,  # FastMCP version has claims field
+    ClientRegistrationOptions,
+    OAuthProvider,
+    RevocationOptions,
+)
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
@@ -26,17 +36,12 @@ from mcp.server.auth.provider import (
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyHttpUrl
+from pydantic import AnyHttpUrl, ValidationError
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from fastmcp.server.auth.auth import (
-    ClientRegistrationOptions,
-    OAuthProvider,
-    RevocationOptions,
-)
-
+from ..utils.data_paths import get_data_dir
 from .consent_form import create_consent_html, create_error_html
 
 logger = logging.getLogger(__name__)
@@ -48,20 +53,10 @@ REFRESH_TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
 class HomeAssistantCredentials:
-    """Stores Home Assistant credentials for a client."""
+    """Temporary HA credentials held between consent form and token exchange."""
 
-    def __init__(self, ha_url: str, ha_token: str):
-        self.ha_url = ha_url.rstrip("/")
+    def __init__(self, ha_token: str):
         self.ha_token = ha_token
-        self.validated_at = time.time()
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for storage."""
-        return {
-            "ha_url": self.ha_url,
-            "ha_token": self.ha_token,
-            "validated_at": self.validated_at,
-        }
 
 
 class HomeAssistantOAuthProvider(OAuthProvider):
@@ -72,15 +67,26 @@ class HomeAssistantOAuthProvider(OAuthProvider):
     - Dynamic Client Registration (DCR)
     - PKCE support
     - Custom consent form for collecting HA credentials
-    - Stateless access tokens (base64-encoded JSON)
+    - Fully stateless tokens (both access and refresh)
 
-    The consent form collects the user's Home Assistant URL and
-    Long-Lived Access Token, validates them, and encodes them into
-    stateless access tokens for subsequent API calls.
+    The consent form collects the user's Long-Lived Access Token (LLAT),
+    which is encoded into both access and refresh tokens as base64 JSON.
+    Tokens are stateless (HMAC-signed base64 JSON) so no per-token state is
+    stored server-side.
 
-    Access tokens are base64-encoded JSON containing HA credentials.
-    No encryption or signing - security comes from HTTPS transport
-    and the LLAT itself being the authorization boundary.
+    DCR client registrations and the HMAC signing secret are persisted to
+    ``get_data_dir() / "oauth_clients.json"`` and
+    ``get_data_dir() / "oauth_hmac_secret"`` respectively, so registered
+    clients survive container restarts.  If the data directory is not
+    writable (e.g. Docker without a mounted volume) the server falls back
+    to in-memory-only storage and logs a warning; existing clients must
+    re-register after each restart in that case.
+
+    Security comes from HTTPS transport and the LLAT itself being the
+    authorization boundary — revoking the LLAT in Home Assistant
+    immediately invalidates all derived tokens.
+    See SECURITY.md § "OAuth Bearer token design" for the full rationale
+    and the intended revocation path.
     """
 
     def __init__(
@@ -123,46 +129,213 @@ class HomeAssistantOAuthProvider(OAuthProvider):
             required_scopes=required_scopes,
         )
 
-        # In-memory storage
-        self.clients: dict[str, OAuthClientInformationFull] = {}
+        # DCR client registry — persisted to disk so clients survive restarts.
+        self.clients: dict[str, OAuthClientInformationFull] = self._load_clients()
+
+        # Short-lived in-memory state (no persistence needed or wanted)
         self.auth_codes: dict[str, AuthorizationCode] = {}
-        self.access_tokens: dict[str, AccessToken] = {}
-        self.refresh_tokens: dict[str, RefreshToken] = {}
 
         # Home Assistant credentials storage (keyed by client_id)
+        # Temporary: only held between consent form submission and token exchange
         self.ha_credentials: dict[str, HomeAssistantCredentials] = {}
 
         # Pending authorization requests (for consent form flow)
         self.pending_authorizations: dict[str, dict[str, Any]] = {}
 
-        # Token mapping for revocation
-        self._access_to_refresh_map: dict[str, str] = {}
-        self._refresh_to_access_map: dict[str, str] = {}
+        # Server-side secret for HMAC-protecting LLATs in refresh tokens.
+        # Persisted so existing refresh tokens survive server restarts.
+        self._hmac_secret = self._load_hmac_secret()
 
         logger.info(f"HomeAssistantOAuthProvider initialized with base_url={base_url}")
 
-    def _encode_credentials(self, ha_url: str, ha_token: str) -> str:
-        """
-        Encode HA credentials into a stateless access token.
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
 
-        Tokens are base64-encoded JSON containing HA credentials.
-        No encryption or signing - credentials are readable but transmitted over HTTPS.
-        The LLAT itself provides the security boundary.
+    @staticmethod
+    def _clients_file() -> Path:
+        return get_data_dir() / "oauth_clients.json"
+
+    @staticmethod
+    def _hmac_secret_file() -> Path:
+        return get_data_dir() / "oauth_hmac_secret"
+
+    def _load_clients(self) -> dict[str, OAuthClientInformationFull]:
+        """Load persisted DCR client registrations from disk.
+
+        Returns an empty dict if the file is absent, unreadable, or corrupt.
         """
-        payload = {
-            "ha_url": ha_url,
+        path = self._clients_file()
+        try:
+            data: dict[str, Any] = json.loads(path.read_text())
+            clients = {
+                cid: OAuthClientInformationFull.model_validate(c)
+                for cid, c in data.items()
+            }
+            logger.info("Loaded %d OAuth client(s) from %s", len(clients), path)
+            return clients
+        except FileNotFoundError:
+            logger.debug("No persistent OAuth client registry found at %s", path)
+            return {}
+        except (json.JSONDecodeError, OSError, ValidationError) as exc:
+            logger.warning(
+                "Could not load OAuth client registry from %s (%s: %s); "
+                "starting with empty registry.",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+            return {}
+
+    def _save_clients(self) -> None:
+        """Persist DCR client registrations to disk.
+
+        Failures are logged as warnings; the server continues with in-memory
+        state so existing sessions are not disrupted.
+        """
+        if not self.clients:
+            return
+        path = self._clients_file()
+        # Serialize before touching the filesystem. A model that won't
+        # serialize is a programming error and should surface loudly, not be
+        # swallowed as if it were a transient disk fault in the write below.
+        data = {
+            cid: client.model_dump(mode="json") for cid, client in self.clients.items()
+        }
+        payload = json.dumps(data, indent=2).encode()
+        tmp_path = path.parent / f".{path.name}.tmp"
+        try:
+            # Write to a temp file first, then atomically rename. Use os.open
+            # with mode 0o600 (owner read/write only) because a confidential
+            # client's client_secret can be stored in this file.
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
+            os.replace(str(tmp_path), str(path))
+            logger.debug("Persisted %d OAuth client(s) to %s", len(data), path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            logger.warning(
+                "Failed to persist OAuth client registry to %s (%s: %s). "
+                "Clients will need to re-register after the next restart. "
+                "Mount a persistent volume to fix this: "
+                "docker run -v ha-mcp-data:/home/mcpuser/.ha-mcp ...",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+
+    def _load_hmac_secret(self) -> bytes:
+        """Load or generate the HMAC signing secret.
+
+        Persists a newly generated secret so refresh tokens survive restarts.
+        Falls back to a fresh (non-persisted) secret if the file is unreadable.
+        """
+        path = self._hmac_secret_file()
+        try:
+            hex_secret = path.read_text().strip()
+            if not hex_secret:
+                raise ValueError("HMAC secret file is empty")
+            secret = bytes.fromhex(hex_secret)
+            if len(secret) != 32:
+                raise ValueError(
+                    f"Invalid HMAC secret length: {len(secret)} bytes (expected 32)"
+                )
+            logger.debug("Loaded HMAC secret from %s", path)
+            return secret
+        except FileNotFoundError:
+            pass  # first start — generate and persist below
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "Could not load HMAC secret from %s (%s: %s); "
+                "generating a new one — existing refresh tokens will be invalidated.",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+
+        secret = secrets.token_bytes(32)
+        tmp_path = path.parent / f".{path.name}.tmp"
+        try:
+            # Write to a temp file first, then atomically rename — prevents a
+            # partial write from corrupting the secret on an interrupted flush.
+            # os.open with mode 0o600 keeps the file owner read/write only.
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, secret.hex().encode())
+            finally:
+                os.close(fd)
+            os.replace(str(tmp_path), str(path))
+            logger.debug("Persisted new HMAC secret to %s", path)
+        except OSError as exc:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            logger.warning(
+                "Failed to persist HMAC secret to %s (%s: %s). "
+                "Refresh tokens will be invalidated on the next restart.",
+                path,
+                type(exc).__name__,
+                exc,
+            )
+        return secret
+
+    # ------------------------------------------------------------------
+    # OAuthProvider interface
+    # ------------------------------------------------------------------
+
+    def _sign_payload(self, payload_json: bytes) -> str:
+        """Compute HMAC-SHA256 signature of a token payload."""
+        return hmac.new(self._hmac_secret, payload_json, hashlib.sha256).hexdigest()
+
+    def _encode_token(
+        self,
+        ha_token: str,
+        token_type: str = "access",
+        client_id: str | None = None,
+        scopes: list[str] | None = None,
+        expires_at: int | None = None,
+    ) -> str:
+        """Encode a stateless HMAC-signed OAuth token as base64 JSON.
+
+        All tokens are HMAC-signed using a per-instance server secret.
+        This prevents forgery and tampering: an intercepted token cannot
+        be modified (e.g., changing exp, scopes, or client_id) without
+        invalidating the signature.
+
+        The token payload contains the HA LLAT, token type, issued-at
+        timestamp, and (for refresh tokens) client/scope metadata and
+        expiry.
+
+        The signing secret is persisted (see ``_load_hmac_secret``), so signed
+        tokens remain valid across server restarts. Clients re-authenticate via
+        the consent form only when a token expires or the secret is rotated.
+        """
+        payload: dict[str, Any] = {
             "ha_token": ha_token,
+            "type": token_type,
             "iat": int(time.time()),
         }
-        json_str = json.dumps(payload)
-        encoded = urlsafe_b64encode(json_str.encode()).decode().rstrip("=")
-        return encoded
+        if client_id is not None:
+            payload["client_id"] = client_id
+        if scopes is not None:
+            payload["scopes"] = scopes
+        if expires_at is not None:
+            payload["exp"] = expires_at
 
-    def _decode_credentials(self, token: str) -> tuple[str, str] | None:
-        """
-        Decode access token to extract HA credentials.
+        payload_json = json.dumps(payload, sort_keys=True).encode()
+        sig = self._sign_payload(payload_json)
+        envelope = json.dumps({"payload": payload, "sig": sig}).encode()
+        return urlsafe_b64encode(envelope).decode().rstrip("=")
 
-        Returns (ha_url, ha_token) or None if invalid.
+    def _decode_token(self, token: str) -> dict[str, Any] | None:
+        """Decode a stateless token and return its full payload.
+
+        For refresh tokens, verifies the HMAC signature before accepting.
+        Returns the payload dict or ``None`` if the token is malformed
+        or signature verification fails.
         """
         try:
             # Add padding if needed
@@ -171,17 +344,84 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 token += "=" * padding
 
             decoded = urlsafe_b64decode(token.encode()).decode()
-            payload = json.loads(decoded)
+            outer = json.loads(decoded)
 
-            ha_url = payload.get("ha_url")
-            ha_token = payload.get("ha_token")
+            if not isinstance(outer, dict):
+                return None
 
-            if ha_url and ha_token:
-                return ha_url, ha_token
+            # Signed envelope: {"payload": {...}, "sig": "..."}
+            if "sig" in outer and "payload" in outer:
+                payload = outer["payload"]
+                if not isinstance(payload, dict):
+                    return None
+                expected_sig = self._sign_payload(
+                    json.dumps(payload, sort_keys=True).encode()
+                )
+                if not hmac.compare_digest(outer["sig"], expected_sig):
+                    logger.warning("Token signature verification failed")
+                    return None
+                if not payload.get("ha_token"):
+                    return None
+                return payload
+
+            # Reject unsigned tokens — HMAC secret is regenerated on restart,
+            # so no legitimate unsigned tokens can exist on a running server.
             return None
         except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.debug(f"Failed to decode token: {e}")
             return None
+
+    def _issuer(self) -> str:
+        """The issuer identifier this authorization server advertises.
+
+        Single source for the ``issuer`` field of the metadata document served
+        below and for the RFC 9207 ``iss`` authorization-response parameter,
+        which RFC 9207 §2 requires to equal the advertised issuer exactly.
+        """
+        return str(AnyHttpUrl(str(self.base_url).rstrip("/")))
+
+    def _ensure_single_iss(self, url: str) -> str:
+        """Return ``url`` carrying the RFC 9207 ``iss`` parameter exactly once.
+
+        A registered redirect URI may itself carry an ``iss`` query parameter;
+        blindly appending ours would produce an ambiguous double-``iss``
+        response — and common parsers take the FIRST value, which is precisely
+        the issuer mix-up RFC 9207 exists to prevent. Any pre-existing ``iss``
+        is dropped so the one this server stamps is authoritative.
+        """
+        parsed = urlparse(url)
+        params = [
+            (k, v) for k, vs in parse_qs(parsed.query).items() for v in vs if k != "iss"
+        ]
+        params.append(("iss", self._issuer()))
+        return urlunparse(parsed._replace(query=urlencode(params)))
+
+    def _wrap_authorize_with_iss(
+        self, endpoint: "Callable[[Request], Awaitable[Response]]"
+    ) -> "Callable[[Request], Awaitable[Response]]":
+        """Wrap the SDK's ``/authorize`` endpoint to stamp ``iss`` on its
+        error redirects.
+
+        The SDK's ``AuthorizationHandler`` builds OAuth error authorization
+        responses (invalid scope, ``authorize()`` raising after redirect-URI
+        validation) itself, without the RFC 9207 ``iss`` parameter — only our
+        consent-form success path carries it otherwise. Success on this route
+        is a same-origin redirect to the consent form (no ``error``), which is
+        not an authorization response and stays untouched.
+        """
+
+        async def authorize_with_iss(request: Request) -> Response:
+            response: Response = await endpoint(request)
+            location = response.headers.get("location", "")
+            if (
+                response.status_code in (302, 303, 307)
+                and location
+                and "error" in parse_qs(urlparse(location).query)
+            ):
+                response.headers["location"] = self._ensure_single_iss(location)
+            return response
+
+        return authorize_with_iss
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         """
@@ -204,33 +444,44 @@ class HomeAssistantOAuthProvider(OAuthProvider):
             """Enhanced OAuth metadata handler with Claude.ai compatibility."""
             from mcp.server.auth.routes import build_metadata
 
-            # Get base URL
-            base = str(self.base_url).rstrip('/')
-
             # Get base metadata from MCP SDK
             metadata = build_metadata(
-                issuer_url=AnyHttpUrl(base),
-                service_documentation_url=AnyHttpUrl("https://github.com/homeassistant-ai/ha-mcp"),
+                issuer_url=AnyHttpUrl(self._issuer()),
+                service_documentation_url=AnyHttpUrl(
+                    "https://github.com/homeassistant-ai/ha-mcp"
+                ),
                 client_registration_options=self.client_registration_options or {},  # type: ignore[arg-type]
                 revocation_options=self.revocation_options or {},  # type: ignore[arg-type]
             )
 
             # Convert to dict and enhance with missing fields
             # Use mode='json' to serialize AnyHttpUrl objects to strings
-            metadata_dict = metadata.model_dump(mode='json', exclude_none=True)
+            metadata_dict = metadata.model_dump(mode="json", exclude_none=True)
 
             # Add response_modes_supported (required by some OAuth clients)
             metadata_dict["response_modes_supported"] = ["query"]
 
+            # RFC 9207 §3: advertise that authorization responses carry the
+            # ``iss`` parameter — omission means "not supported" to
+            # discovery-driven clients even though redirects now include it.
+            metadata_dict["authorization_response_iss_parameter_supported"] = True
+
             # Add "none" auth method for public clients with PKCE (used by Claude.ai)
             if "token_endpoint_auth_methods_supported" in metadata_dict:
                 if "none" not in metadata_dict["token_endpoint_auth_methods_supported"]:
-                    metadata_dict["token_endpoint_auth_methods_supported"].append("none")
+                    metadata_dict["token_endpoint_auth_methods_supported"].append(
+                        "none"
+                    )
 
             # Also add "none" to revocation endpoint auth methods
             if "revocation_endpoint_auth_methods_supported" in metadata_dict:
-                if "none" not in metadata_dict["revocation_endpoint_auth_methods_supported"]:
-                    metadata_dict["revocation_endpoint_auth_methods_supported"].append("none")
+                if (
+                    "none"
+                    not in metadata_dict["revocation_endpoint_auth_methods_supported"]
+                ):
+                    metadata_dict["revocation_endpoint_auth_methods_supported"].append(
+                        "none"
+                    )
 
             return JSONResponse(content=metadata_dict)
 
@@ -242,6 +493,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 and route.path == "/.well-known/oauth-authorization-server"
             ):
                 from mcp.server.auth.routes import cors_middleware
+
                 enhanced_routes.append(
                     Route(
                         path="/.well-known/oauth-authorization-server",
@@ -249,6 +501,16 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                             enhanced_metadata_handler, ["GET", "OPTIONS"]
                         ),
                         methods=["GET", "OPTIONS"],
+                    )
+                )
+            elif isinstance(route, Route) and route.path == "/authorize":
+                # RFC 9207: the SDK handler's own error redirects must carry
+                # ``iss`` too — see _wrap_authorize_with_iss.
+                enhanced_routes.append(
+                    Route(
+                        path=route.path,
+                        endpoint=self._wrap_authorize_with_iss(route.endpoint),
+                        methods=list(route.methods or []),
                     )
                 )
             else:
@@ -259,12 +521,11 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         # in addition to /.well-known/oauth-authorization-server (OAuth 2.1)
         # Per RFC 8414, many servers support both endpoints with identical metadata
         from mcp.server.auth.routes import cors_middleware
+
         enhanced_routes.append(
             Route(
                 path="/.well-known/openid-configuration",
-                endpoint=cors_middleware(
-                    enhanced_metadata_handler, ["GET", "OPTIONS"]
-                ),
+                endpoint=cors_middleware(enhanced_metadata_handler, ["GET", "OPTIONS"]),
                 methods=["GET", "OPTIONS"],
             )
         )
@@ -275,9 +536,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         enhanced_routes.append(
             Route(
                 path="/token/.well-known/openid-configuration",
-                endpoint=cors_middleware(
-                    enhanced_metadata_handler, ["GET", "OPTIONS"]
-                ),
+                endpoint=cors_middleware(enhanced_metadata_handler, ["GET", "OPTIONS"]),
                 methods=["GET", "OPTIONS"],
             )
         )
@@ -306,7 +565,9 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         ):
             # Grant all valid scopes by default
             client_info.scope = " ".join(self.client_registration_options.valid_scopes)
-            logger.info(f"Client registered without scopes, granting all valid scopes: {client_info.scope}")
+            logger.info(
+                f"Client registered without scopes, granting all valid scopes: {client_info.scope}"
+            )
 
         # Validate scopes if configured
         if (
@@ -327,6 +588,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
 
         self.clients[client_info.client_id] = client_info
         logger.info(f"Registered OAuth client: {client_info.client_id}")
+        self._save_clients()
 
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
@@ -339,7 +601,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         """
         if client.client_id is None:
             raise AuthorizeError(
-                error="invalid_client",
+                error="invalid_request",
                 error_description="Client ID is required",
             )
 
@@ -365,7 +627,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         }
 
         # Build consent form URL
-        base = str(self.base_url).rstrip('/')
+        base = str(self.base_url).rstrip("/")
         consent_url = f"{base}/consent?txn_id={txn_id}"
 
         logger.debug(f"Redirecting to consent form: {consent_url}")
@@ -406,32 +668,34 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=400,
             )
 
-        html = create_consent_html(
+        redirect_uri = pending.get("redirect_uri", "")
+        if not redirect_uri:
+            return HTMLResponse(
+                create_error_html(
+                    "invalid_request",
+                    "No redirect URI provided. The client must specify a redirect URI.",
+                ),
+                status_code=400,
+            )
+
+        consent_html = create_consent_html(
             client_id=pending["client_id"],
-            client_name=pending.get("client_name"),
-            redirect_uri=pending["redirect_uri"],
+            redirect_uri=redirect_uri,
             state=pending.get("state", ""),
-            scopes=pending.get("scopes", []),
+            txn_id=txn_id,
             error_message=error_message,
         )
 
-        # Add txn_id as hidden field
-        html = html.replace(
-            '<input type="hidden" name="client_id"',
-            f'<input type="hidden" name="txn_id" value="{txn_id}">\n            <input type="hidden" name="client_id"',
-        )
-
-        return HTMLResponse(html)
+        return HTMLResponse(consent_html)
 
     async def _consent_post(self, request: Request) -> Response:
         """Handle POST request from consent form."""
-        logger.info("📝 === CONSENT FORM POST RECEIVED ===")
+        logger.info("=== CONSENT FORM POST RECEIVED ===")
         form = await request.form()
 
         txn_id = form.get("txn_id")
-        ha_url = form.get("ha_url")
         ha_token = form.get("ha_token")
-        logger.info(f"📝 Form data: txn_id={txn_id}, ha_url={ha_url}, has_token={ha_token is not None}")
+        logger.info(f"Form data: txn_id={txn_id}, has_token={ha_token is not None}")
 
         if not txn_id:
             return HTMLResponse(
@@ -452,13 +716,13 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=400,
             )
 
-        if not ha_url or not ha_token:
+        if not ha_token:
             # Redirect back to form with error
-            base = str(self.base_url).rstrip('/')
+            base = str(self.base_url).rstrip("/")
             error_params = urlencode(
                 {
                     "txn_id": txn_id,
-                    "error": "Please provide both Home Assistant URL and access token.",
+                    "error": "Please provide your Long-Lived Access Token.",
                 }
             )
             return RedirectResponse(
@@ -466,30 +730,13 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=303,
             )
 
-        # Validate HA credentials
-        validation_error = await self._validate_ha_credentials(
-            str(ha_url), str(ha_token)
-        )
-        if validation_error:
-            base = str(self.base_url).rstrip('/')
-            error_params = urlencode(
-                {
-                    "txn_id": txn_id,
-                    "error": validation_error,
-                }
-            )
-            return RedirectResponse(
-                f"{base}/consent?{error_params}",
-                status_code=303,
-            )
-
-        # Store validated credentials
+        # Store credentials (no server-side validation - the token will be
+        # validated on first actual API call to the configured HA instance)
         client_id = pending["client_id"]
         self.ha_credentials[client_id] = HomeAssistantCredentials(
-            ha_url=str(ha_url),
             ha_token=str(ha_token),
         )
-        logger.info(f"✅ Stored HA credentials for client {client_id}: {str(ha_url)}")
+        logger.info(f"Stored HA credentials for client {client_id}")
 
         # Generate authorization code
         auth_code_value = f"ha_auth_code_{secrets.token_hex(16)}"
@@ -508,75 +755,30 @@ class HomeAssistantOAuthProvider(OAuthProvider):
             ),
             scopes=scopes_list,
             expires_at=expires_at,
-            code_challenge=pending.get("code_challenge"),
+            code_challenge=pending.get("code_challenge"),  # type: ignore[arg-type]  # None is valid per PKCE spec (RFC 7636 §4.3); empty string would break validation
         )
         self.auth_codes[auth_code_value] = auth_code
 
         # Clean up pending authorization
         del self.pending_authorizations[str(txn_id)]
 
-        # Redirect back to client with auth code
-        redirect_uri = construct_redirect_uri(
-            pending["redirect_uri"],
-            code=auth_code_value,
-            state=pending.get("state"),
+        # Redirect back to client with auth code. RFC 9207: the authorization
+        # response carries the issuer that produced it, so a client registered
+        # with several authorization servers cannot be fed a code minted by a
+        # different one. _ensure_single_iss (rather than an ``iss=`` kwarg
+        # here) collapses any ``iss`` baked into the registered redirect URI —
+        # construct_redirect_uri appends blindly, and a double ``iss`` is
+        # ambiguous to strict clients.
+        redirect_uri = self._ensure_single_iss(
+            construct_redirect_uri(
+                pending["redirect_uri"],
+                code=auth_code_value,
+                state=pending.get("state"),
+            )
         )
 
         logger.info(f"Authorization successful for client {client_id}")
         return RedirectResponse(redirect_uri, status_code=303)
-
-    async def _validate_ha_credentials(self, ha_url: str, ha_token: str) -> str | None:
-        """
-        Validate Home Assistant credentials by making a test API call.
-
-        Args:
-            ha_url: Home Assistant URL
-            ha_token: Long-Lived Access Token
-
-        Returns:
-            Error message if validation failed, None if successful
-        """
-        try:
-            ha_url = ha_url.rstrip("/")
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                response = await client.get(
-                    f"{ha_url}/api/config",
-                    headers={
-                        "Authorization": f"Bearer {ha_token}",
-                        "Content-Type": "application/json",
-                    },
-                )
-
-                if response.status_code == 401:
-                    return "Invalid access token. Please check your Long-Lived Access Token."
-
-                if response.status_code == 403:
-                    return "Access forbidden. The token may not have sufficient permissions."
-
-                if response.status_code >= 400:
-                    return f"Failed to connect to Home Assistant: HTTP {response.status_code}"
-
-                # Verify we got a valid config response
-                try:
-                    config = response.json()
-                    if "location_name" not in config and "version" not in config:
-                        return "Invalid response from Home Assistant. Please check the URL."
-                except Exception:
-                    return "Invalid response format from Home Assistant."
-
-                logger.info(
-                    f"Validated HA credentials for {config.get('location_name', 'Unknown')}"
-                )
-                return None
-
-        except httpx.ConnectError:
-            return "Could not connect to Home Assistant. Please check the URL and ensure Home Assistant is accessible."
-        except httpx.TimeoutException:
-            return "Connection to Home Assistant timed out. Please check the URL."
-        except Exception as e:
-            logger.error(f"Error validating HA credentials: {e}")
-            return f"Failed to validate credentials: {str(e)}"
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
@@ -595,7 +797,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        """Exchange authorization code for access and refresh tokens."""
+        """Exchange authorization code for stateless access and refresh tokens."""
         if authorization_code.code not in self.auth_codes:
             raise TokenError(
                 "invalid_grant", "Authorization code not found or already used."
@@ -607,70 +809,75 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         if client.client_id is None:
             raise TokenError("invalid_client", "Client ID is required")
 
-        # Generate tokens
-        access_token_value = f"ha_access_{secrets.token_hex(32)}"
-        refresh_token_value = f"ha_refresh_{secrets.token_hex(32)}"
-
-        access_token_expires_at = int(time.time() + ACCESS_TOKEN_EXPIRY_SECONDS)
-        refresh_token_expires_at = int(time.time() + REFRESH_TOKEN_EXPIRY_SECONDS)
-
         # Get HA credentials for this client to encode in token
         ha_credentials = self.ha_credentials.get(client.client_id)
         if not ha_credentials:
             raise TokenError(
-                "server_error",
+                "invalid_client",
                 f"No Home Assistant credentials found for client {client.client_id}",
             )
 
-        # STATELESS TOKEN: Encode HA credentials directly into the access token
-        # No server-side storage needed - token contains everything as base64-encoded JSON
-        access_token_value = self._encode_credentials(
-            ha_credentials.ha_url, ha_credentials.ha_token
-        )
+        scopes = authorization_code.scopes
+        access_token_expires_at = int(time.time() + ACCESS_TOKEN_EXPIRY_SECONDS)
+        refresh_token_expires_at = int(time.time() + REFRESH_TOKEN_EXPIRY_SECONDS)
 
-        # Still use random string for refresh token (less sensitive, can be in memory)
-        # Refresh tokens are less frequently used and don't need to carry credentials
-        self.refresh_tokens[refresh_token_value] = RefreshToken(
-            token=refresh_token_value,
+        # Both tokens are stateless — no server-side storage needed.
+        access_token_value = self._encode_token(
+            ha_credentials.ha_token,
+            token_type="access",
+            expires_at=access_token_expires_at,
+        )
+        refresh_token_value = self._encode_token(
+            ha_credentials.ha_token,
+            token_type="refresh",
             client_id=client.client_id,
-            scopes=authorization_code.scopes,
+            scopes=scopes,
             expires_at=refresh_token_expires_at,
         )
 
-        # Map for revocation (refresh token only, access token is stateless)
-        self._refresh_to_access_map[refresh_token_value] = client.client_id or ""
+        # Clean up temporary credentials (no longer needed after token issued)
+        self.ha_credentials.pop(client.client_id, None)
 
-        # Clean up temporary credentials storage (no longer needed after token issued)
-        if client.client_id in self.ha_credentials:
-            del self.ha_credentials[client.client_id]
-
-        logger.info(f"Issued stateless access token for client {client.client_id}")
+        logger.info(f"Issued stateless tokens for client {client.client_id}")
 
         return OAuthToken(
             access_token=access_token_value,
             token_type="Bearer",
             expires_in=ACCESS_TOKEN_EXPIRY_SECONDS,
             refresh_token=refresh_token_value,
-            scope=(
-                " ".join(authorization_code.scopes)
-                if authorization_code.scopes
-                else None
-            ),
+            scope=" ".join(scopes) if scopes else None,
         )
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
     ) -> RefreshToken | None:
-        """Load refresh token from storage."""
-        token_obj = self.refresh_tokens.get(refresh_token)
-        if token_obj:
-            if token_obj.client_id != client.client_id:
-                return None
-            if token_obj.expires_at is not None and token_obj.expires_at < time.time():
-                self._revoke_internal(refresh_token_str=token_obj.token)
-                return None
-            return token_obj
-        return None
+        """Decode and validate a stateless refresh token."""
+        payload = self._decode_token(refresh_token)
+        if not payload:
+            return None
+
+        if payload.get("type") != "refresh":
+            logger.debug("Token is not a refresh token")
+            return None
+
+        if payload.get("client_id") != client.client_id:
+            logger.warning(
+                f"Refresh token client_id mismatch: expected {client.client_id}, "
+                f"got {payload.get('client_id')}"
+            )
+            return None
+
+        expires_at = payload.get("exp")
+        if expires_at is not None and expires_at < time.time():
+            logger.debug("Refresh token expired")
+            return None
+
+        return RefreshToken(
+            token=refresh_token,
+            client_id=payload["client_id"],
+            scopes=payload.get("scopes", []),
+            expires_at=expires_at,
+        )
 
     async def exchange_refresh_token(
         self,
@@ -678,7 +885,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        """Exchange refresh token for new access token."""
+        """Exchange a stateless refresh token for new stateless tokens."""
         # Validate scopes
         original_scopes = set(refresh_token.scopes)
         requested_scopes = set(scopes)
@@ -691,41 +898,29 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         if client.client_id is None:
             raise TokenError("invalid_client", "Client ID is required")
 
-        # Preserve claims from old access token before revoking
-        old_access_token_str = self._refresh_to_access_map.get(refresh_token.token)
-        old_claims = {}
-        if old_access_token_str and old_access_token_str in self.access_tokens:
-            old_access_token = self.access_tokens[old_access_token_str]
-            old_claims = old_access_token.claims or {}
+        # Recover HA token directly from the stateless refresh token
+        payload = self._decode_token(refresh_token.token)
+        if not payload:
+            raise TokenError(
+                "invalid_grant",
+                "Cannot decode refresh token.",
+            )
 
-        # Revoke old tokens
-        self._revoke_internal(refresh_token_str=refresh_token.token)
-
-        # Issue new tokens
-        new_access_token_value = f"ha_access_{secrets.token_hex(32)}"
-        new_refresh_token_value = f"ha_refresh_{secrets.token_hex(32)}"
-
+        ha_token = payload["ha_token"]
         access_token_expires_at = int(time.time() + ACCESS_TOKEN_EXPIRY_SECONDS)
         refresh_token_expires_at = int(time.time() + REFRESH_TOKEN_EXPIRY_SECONDS)
 
-        # Preserve HA credentials in new access token claims
-        self.access_tokens[new_access_token_value] = AccessToken(
-            token=new_access_token_value,
-            client_id=client.client_id,
-            scopes=scopes,
-            expires_at=access_token_expires_at,
-            claims=old_claims,  # Preserve HA credentials across token refresh
+        # Issue new stateless token pair
+        new_access_token_value = self._encode_token(
+            ha_token, token_type="access", expires_at=access_token_expires_at
         )
-
-        self.refresh_tokens[new_refresh_token_value] = RefreshToken(
-            token=new_refresh_token_value,
+        new_refresh_token_value = self._encode_token(
+            ha_token,
+            token_type="refresh",
             client_id=client.client_id,
             scopes=scopes,
             expires_at=refresh_token_expires_at,
         )
-
-        self._access_to_refresh_map[new_access_token_value] = new_refresh_token_value
-        self._refresh_to_access_map[new_refresh_token_value] = new_access_token_value
 
         return OAuthToken(
             access_token=new_access_token_value,
@@ -736,96 +931,61 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """
-        Load and validate access token.
+        """Decode and validate a stateless access token.
 
-        STATELESS: Decodes token to extract HA credentials.
-        No server-side storage needed - token is self-contained base64-encoded JSON.
+        Accepts tokens with ``type=access`` or no type field (backwards
+        compatibility with tokens issued before v7.x / April 2026).
+        Rejects tokens explicitly typed as ``refresh``.
+        Enforces ``exp`` if present in the payload.
         """
-
-        # Decode token to get HA credentials
-        credentials = self._decode_credentials(token)
-        if not credentials:
+        payload = self._decode_token(token)
+        if not payload:
             return None
 
-        ha_url, ha_token = credentials
+        # Reject refresh tokens presented as access tokens
+        token_type = payload.get("type")
+        if token_type == "refresh":
+            logger.warning("Refresh token presented as access token (rejected)")
+            return None
 
-        # Create AccessToken object with decoded credentials in claims
-        # No expiry check - tokens don't expire (LLAT revocation handles security)
+        # Enforce expiry if present
+        expires_at = payload.get("exp")
+        if expires_at is not None and expires_at < time.time():
+            logger.debug("Access token expired")
+            return None
+
         return AccessToken(
             token=token,
-            client_id="stateless",  # We don't store client_id in token
-            scopes=["homeassistant", "mcp"],
-            expires_at=None,  # Stateless tokens don't expire
-            claims={
-                "ha_url": ha_url,
-                "ha_token": ha_token,
-            },
+            client_id=payload.get("client_id", "stateless"),
+            scopes=payload.get("scopes", ["homeassistant", "mcp"]),
+            expires_at=expires_at,
+            claims={"ha_token": payload["ha_token"]},
         )
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Verify bearer token and return access info if valid."""
         return await self.load_access_token(token)
 
-    def _revoke_internal(
-        self, access_token_str: str | None = None, refresh_token_str: str | None = None
-    ) -> None:
-        """Internal helper to remove tokens and their associations."""
-        if access_token_str:
-            if access_token_str in self.access_tokens:
-                del self.access_tokens[access_token_str]
-
-            associated_refresh = self._access_to_refresh_map.pop(access_token_str, None)
-            if associated_refresh:
-                if associated_refresh in self.refresh_tokens:
-                    del self.refresh_tokens[associated_refresh]
-                self._refresh_to_access_map.pop(associated_refresh, None)
-
-        if refresh_token_str:
-            if refresh_token_str in self.refresh_tokens:
-                del self.refresh_tokens[refresh_token_str]
-
-            associated_access = self._refresh_to_access_map.pop(refresh_token_str, None)
-            if associated_access:
-                if associated_access in self.access_tokens:
-                    del self.access_tokens[associated_access]
-                self._access_to_refresh_map.pop(associated_access, None)
-
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
-        """Revoke an access or refresh token."""
-        if isinstance(token, AccessToken):
-            self._revoke_internal(access_token_str=token.token)
-        elif isinstance(token, RefreshToken):
-            self._revoke_internal(refresh_token_str=token.token)
+        """Revoke a token (no-op for stateless tokens).
+
+        With fully stateless tokens there is no server-side state to
+        remove.  The LLAT itself is the security boundary — revoking
+        it in Home Assistant immediately invalidates all derived tokens.
+
+        Per RFC 7009, the /revoke endpoint returns success regardless.
+        The token remains valid until the underlying LLAT is revoked
+        in Home Assistant.
+        """
+        logger.debug(
+            "Token revocation requested (no-op for stateless tokens; "
+            "revoke the LLAT in Home Assistant to invalidate)"
+        )
 
     def get_ha_credentials(self, client_id: str) -> HomeAssistantCredentials | None:
-        """
-        Get Home Assistant credentials for a client.
+        """Get temporarily stored HA credentials for a client.
 
-        This is used by the MCP server to get the HA URL and token
-        for making API calls on behalf of the authenticated user.
-
-        Args:
-            client_id: The OAuth client ID
-
-        Returns:
-            HomeAssistantCredentials if found, None otherwise
+        Only valid between consent form submission and token exchange.
+        After token issuance, credentials are deleted from this store.
         """
         return self.ha_credentials.get(client_id)
-
-    def get_ha_credentials_for_token(
-        self, access_token: str
-    ) -> HomeAssistantCredentials | None:
-        """
-        Get Home Assistant credentials for an access token.
-
-        Args:
-            access_token: The access token string
-
-        Returns:
-            HomeAssistantCredentials if found, None otherwise
-        """
-        token_obj = self.access_tokens.get(access_token)
-        if token_obj and token_obj.client_id:
-            return self.ha_credentials.get(token_obj.client_id)
-        return None

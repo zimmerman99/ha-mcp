@@ -148,6 +148,78 @@ class TestGroupLifecycle:
                 )
             logger.info("Group deletion verified")
 
+    async def test_group_list_pagination(self, mcp_client, cleanup_tracker):
+        """
+        Test: limit/offset paginate the group listing (issue #1869)
+
+        Drives the pagination contract through the MCP layer, which the unit
+        suite cannot reach: it calls the tool function directly and so never
+        exercises the parameter schema. Every assertion holds against the
+        response it came from rather than a baseline captured earlier, because
+        other modules create groups too and the collection can grow between
+        calls.
+        """
+        logger.info("Testing group list pagination...")
+
+        async with MCPAssertions(mcp_client) as mcp:
+            # Three groups guarantee at least two pages at limit=2.
+            for i in range(3):
+                object_id = f"test_e2e_page_{i}"
+                await mcp.call_tool_success(
+                    "ha_config_set_group",
+                    {
+                        "object_id": object_id,
+                        "name": f"Test E2E Page {i}",
+                        "entities": ["light.bed_light"],
+                    },
+                )
+                cleanup_tracker.track("group", object_id)
+
+            # Each response is asserted against itself rather than a baseline
+            # captured earlier: other modules create groups too, so the
+            # collection can grow between calls.
+            first = await mcp.call_tool_success(
+                "ha_config_list_groups", {"limit": 2, "offset": 0}
+            )
+            assert len(first["groups"]) == 2, f"limit=2 should cut the page: {first}"
+            assert first["count"] == 2, (
+                f"count is the page size, not the total: {first}"
+            )
+            assert first["total_count"] >= 3, f"the three created groups: {first}"
+            assert first["offset"] == 0
+            assert first["limit"] == 2
+            assert first["has_more"] is True
+            assert first["next_offset"] == 2
+
+            # Second page: offset advanced the window, so no record repeats.
+            second = await mcp.call_tool_success(
+                "ha_config_list_groups", {"limit": 2, "offset": 2}
+            )
+            assert second["offset"] == 2
+            first_ids = {g["entity_id"] for g in first["groups"]}
+            second_ids = {g["entity_id"] for g in second["groups"]}
+            assert not (first_ids & second_ids), (
+                f"pages must not overlap: {first_ids & second_ids}"
+            )
+
+            # A limit above the collection returns it whole, in one page.
+            full = await mcp.call_tool_success("ha_config_list_groups", {"limit": 500})
+            assert len(full["groups"]) == full["total_count"]
+            assert full["count"] == full["total_count"]
+            assert full["has_more"] is False
+            assert full["next_offset"] is None
+
+            # Offset past the end: an empty final page, not an error.
+            past = await mcp.call_tool_success(
+                "ha_config_list_groups", {"offset": full["total_count"] + 10}
+            )
+            assert past["groups"] == []
+            assert past["count"] == 0
+            assert past["has_more"] is False
+            assert past["next_offset"] is None
+
+            logger.info(f"Pagination verified across {full['total_count']} groups")
+
     async def test_group_add_remove_entities(self, mcp_client, cleanup_tracker):
         """
         Test: Add and remove entities from a group
@@ -464,7 +536,9 @@ class TestGroupLifecycle:
 
             # Verify all groups exist
             list_data = await mcp.call_tool_success("ha_config_list_groups", {})
-            object_ids_in_list = [g.get("object_id") for g in list_data.get("groups", [])]
+            object_ids_in_list = [
+                g.get("object_id") for g in list_data.get("groups", [])
+            ]
 
             for object_id in created_object_ids:
                 assert object_id in object_ids_in_list, (
@@ -493,7 +567,9 @@ class TestGroupLifecycle:
 
             # Verify all deleted
             list_data = await mcp.call_tool_success("ha_config_list_groups", {})
-            object_ids_in_list = [g.get("object_id") for g in list_data.get("groups", [])]
+            object_ids_in_list = [
+                g.get("object_id") for g in list_data.get("groups", [])
+            ]
 
             for object_id in created_object_ids:
                 assert object_id not in object_ids_in_list, (
@@ -514,16 +590,12 @@ async def test_group_search_discovery(mcp_client):
         # Search for group entities
         try:
             search_data = await mcp.call_tool_success(
-                "ha_search_entities",
+                "ha_search",
                 {"query": "group", "domain_filter": "group", "limit": 10},
             )
 
-            data = (
-                search_data.get("data", {}) if search_data.get("data") else search_data
-            )
-
-            if data.get("success") and data.get("results"):
-                results = data.get("results", [])
+            if search_data.get("success") and search_data.get("entities"):
+                results = search_data.get("entities", [])
                 logger.info(f"Found {len(results)} group entities via search")
 
                 for result in results:

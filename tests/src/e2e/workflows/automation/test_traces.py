@@ -6,14 +6,19 @@ Verifies that ha_get_automation_traces returns non-empty traces after automation
 """
 
 import logging
+import time
+from typing import Any
 
 import pytest
 
 from ...utilities.assertions import (
+    MCPAssertions,
     assert_mcp_success,
     parse_mcp_result,
+    safe_call_tool,
 )
-from ...utilities.wait_helpers import wait_for_condition
+from ...utilities.entity_finders import find_test_light_entity
+from ...utilities.wait_helpers import wait_for_condition, wait_for_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -24,29 +29,69 @@ class TestAutomationTraces:
     """Test automation trace retrieval functionality."""
 
     async def _find_test_light_entity(self, mcp_client) -> str:
-        """Find a suitable light entity for testing."""
-        search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "light", "domain_filter": "light", "limit": 20},
+        """Delegates to the suite-wide helper in utilities.entity_finders."""
+        return await find_test_light_entity(mcp_client)
+
+    async def test_template_trace_with_null_trigger_states(
+        self,
+        mcp_client: Any,
+        test_data_factory: Any,
+    ) -> None:
+        """Return time-driven template traces whose HA states are null."""
+        trigger_after = int(time.time()) + 45
+        create_config = test_data_factory.automation_config(
+            "Template Null State Trace",
+            trigger=[
+                {
+                    "platform": "template",
+                    "value_template": (
+                        f"{{{{ as_timestamp(now()) >= {trigger_after} }}}}"
+                    ),
+                }
+            ],
+            action=[{"delay": {"seconds": 0}}],
+            initial_state=True,
         )
 
-        search_data = parse_mcp_result(search_result)
+        automation_id: str | None = None
+        try:
+            async with MCPAssertions(mcp_client) as mcp:
+                create_data = await mcp.call_tool_success(
+                    "ha_config_set_automation", {"config": create_config}
+                )
+                automation_id = create_data.get("entity_id") or create_data.get(
+                    "automation_id"
+                )
+                assert automation_id is not None
 
-        if "data" in search_data:
-            results = search_data.get("data", {}).get("results", [])
-        else:
-            results = search_data.get("results", [])
+                traces_data = await wait_for_tool_result(
+                    mcp_client,
+                    tool_name="ha_get_automation_traces",
+                    arguments={"automation_id": automation_id},
+                    predicate=lambda data: data.get("trace_count", 0) > 0,
+                    timeout=120,
+                    poll_interval=1,
+                    description="time-driven template automation trace",
+                )
+                run_id = traces_data["traces"][0]["run_id"]
+                detailed_data = await mcp.call_tool_success(
+                    "ha_get_automation_traces",
+                    {"automation_id": automation_id, "run_id": run_id},
+                )
 
-        if not results:
-            pytest.skip("No light entities available for testing")
-
-        # Prefer demo entities
-        for entity in results:
-            entity_id = entity.get("entity_id", "")
-            if "demo" in entity_id.lower() or "test" in entity_id.lower():
-                return entity_id
-
-        return results[0].get("entity_id", "")
+            assert detailed_data["trigger"]["platform"] == "template"
+            assert detailed_data["trigger"]["from_state"] is None
+            assert detailed_data["trigger"]["to_state"] is None
+        finally:
+            if automation_id is not None:
+                cleanup_data = await safe_call_tool(
+                    mcp_client,
+                    "ha_config_remove_automation",
+                    {"identifier": automation_id},
+                )
+                assert cleanup_data.get("success") is True, (
+                    f"Failed to remove test automation: {cleanup_data}"
+                )
 
     async def test_automation_trace_after_trigger(
         self, mcp_client, cleanup_tracker, test_data_factory
@@ -81,9 +126,7 @@ class TestAutomationTraces:
         create_data = parse_mcp_result(create_result)
 
         # Track for cleanup
-        automation_id = create_data.get("entity_id") or create_data.get(
-            "automation_id"
-        )
+        automation_id = create_data.get("entity_id") or create_data.get("automation_id")
         if automation_id:
             cleanup_tracker.track("automation", automation_id)
         logger.info(f"Created automation: {automation_id}")
@@ -116,7 +159,7 @@ class TestAutomationTraces:
             check_automation_traces,
             timeout=15,
             poll_interval=0.5,
-            condition_name="automation trace to be recorded"
+            condition_name="automation trace to be recorded",
         )
 
         # Skip test if traces don't appear (timing issue, not a failure)
@@ -170,19 +213,29 @@ class TestAutomationTraces:
 
             assert detailed_data.get("success") is True
             assert detailed_data.get("run_id") == run_id
-            
+
             # Verify detailed content structure (Deep verification)
             # This ensures we correctly parsed the flat structure (trigger/0, action/0)
-            assert "trigger" in detailed_data, "Detailed trace should contain trigger info"
-            assert "action_trace" in detailed_data, "Detailed trace should contain action_trace"
-            assert isinstance(detailed_data["action_trace"], list), "action_trace should be a list"
-            assert len(detailed_data["action_trace"]) > 0, "action_trace should not be empty"
-            
+            assert "trigger" in detailed_data, (
+                "Detailed trace should contain trigger info"
+            )
+            assert "action_trace" in detailed_data, (
+                "Detailed trace should contain action_trace"
+            )
+            assert isinstance(detailed_data["action_trace"], list), (
+                "action_trace should be a list"
+            )
+            assert len(detailed_data["action_trace"]) > 0, (
+                "action_trace should not be empty"
+            )
+
             # Check for path property to ensure flat structure parsing worked
             first_action = detailed_data["action_trace"][0]
             assert "path" in first_action, "Action trace element should contain 'path'"
-            
-            logger.info(f"Detailed trace verified: Found {len(detailed_data['action_trace'])} actions")
+
+            logger.info(
+                f"Detailed trace verified: Found {len(detailed_data['action_trace'])} actions"
+            )
 
     async def test_empty_traces_with_diagnostics(
         self, mcp_client, cleanup_tracker, test_data_factory
@@ -214,9 +267,7 @@ class TestAutomationTraces:
         assert_mcp_success(create_result)
         create_data = parse_mcp_result(create_result)
 
-        automation_id = create_data.get("entity_id") or create_data.get(
-            "automation_id"
-        )
+        automation_id = create_data.get("entity_id") or create_data.get("automation_id")
         if automation_id:
             cleanup_tracker.track("automation", automation_id)
 
@@ -311,7 +362,7 @@ class TestAutomationTraces:
             check_traces,
             timeout=15,  # Increased timeout for ARM compatibility
             poll_interval=0.5,
-            condition_name="script trace to be recorded"
+            condition_name="script trace to be recorded",
         )
 
         # Skip test if traces don't appear (timing issue, not a failure)
@@ -337,3 +388,18 @@ class TestAutomationTraces:
         assert trace_count > 0, (
             f"Expected at least 1 trace after running script, got {trace_count}"
         )
+
+
+@pytest.mark.automation
+class TestGetAutomationTracesNegativeInputs:
+    """Negative-input tests for ha_get_automation_traces."""
+
+    async def test_wrong_domain_prefix_rejected(self, mcp_client: Any) -> None:
+        """Rejects an entity ID that does not belong to a supported domain."""
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_get_automation_traces",
+            {"automation_id": "sensor.some_entity"},
+        )
+        assert result["success"] is False
+        assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"

@@ -26,11 +26,11 @@ logger = logging.getLogger(__name__)
 async def test_entity_id(mcp_client) -> str:
     """Find a single suitable entity for testing."""
     search_result = await mcp_client.call_tool(
-        "ha_search_entities",
+        "ha_search",
         {"query": "light", "domain_filter": "light", "limit": 1},
     )
     search_data = parse_mcp_result(search_result)
-    results = search_data.get("data", search_data).get("results", [])
+    results = search_data.get("entities", [])
     if not results:
         pytest.skip("No light entities available for testing")
     return results[0]["entity_id"]
@@ -63,7 +63,9 @@ class TestLabelSetOperation:
         data = assert_mcp_success(result, "set labels")
         assert label_id in data.get("entity_entry", {}).get("labels", [])
 
-        logger.info(f"Set labels on {entity_id}: {data.get('entity_entry', {}).get('labels')}")
+        logger.info(
+            f"Set labels on {entity_id}: {data.get('entity_entry', {}).get('labels')}"
+        )
 
         # Clean up: clear labels
         await mcp_client.call_tool(
@@ -71,7 +73,9 @@ class TestLabelSetOperation:
             {"entity_id": entity_id, "labels": []},
         )
 
-    async def test_set_multiple_labels(self, mcp_client, cleanup_tracker, test_entity_id):
+    async def test_set_multiple_labels(
+        self, mcp_client, cleanup_tracker, test_entity_id
+    ):
         """Test: Set multiple labels on an entity at once."""
         entity_id = test_entity_id
 
@@ -196,7 +200,7 @@ class TestLabelEntityRegistryIntegrity:
             "ha_get_state",
             {"entity_id": entity_id},
         )
-        initial_data = parse_mcp_result(initial_result)
+        parse_mcp_result(initial_result)
 
         # Create and set a label
         create_result = await mcp_client.call_tool(

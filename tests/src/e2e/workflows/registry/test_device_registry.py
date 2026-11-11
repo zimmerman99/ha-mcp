@@ -4,13 +4,13 @@ Device Registry E2E Tests
 Tests for the device registry management tools:
 - ha_get_device: List all devices with optional filtering
 - ha_get_device: Get device details including entities
-- ha_update_device: Update device properties (name, area, disabled, labels)
+- ha_set_device: Set device properties (name, area, disabled, labels)
 - ha_remove_device: Remove orphaned devices
 
 Key test scenarios:
 - List devices and verify structure
 - Get device details with entities
-- Update device name (note: does NOT cascade to entities)
+- Set device name (note: does NOT cascade to entities)
 - Filter devices by area and manufacturer
 - Handle non-existent devices
 """
@@ -19,7 +19,7 @@ import logging
 
 import pytest
 
-from ...utilities.assertions import parse_mcp_result
+from ...utilities.assertions import parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +30,10 @@ class TestDeviceList:
 
     async def test_list_all_devices(self, mcp_client):
         """
-        Test: List all devices in the registry
+        Test: List all devices in the registry (paginated, summary mode).
 
-        Verifies the basic list functionality returns expected structure.
+        Verifies the basic list functionality returns expected structure
+        with pagination metadata.
         """
         logger.info("Testing device list - all devices")
 
@@ -44,11 +45,18 @@ class TestDeviceList:
         assert "count" in list_data, "Response should contain count"
         assert "total_devices" in list_data, "Response should contain total_devices"
 
+        # Pagination metadata
+        assert "has_more" in list_data, "Response should contain has_more"
+        assert "offset" in list_data, "Response should contain offset"
+        assert "limit" in list_data, "Response should contain limit"
+        assert "total_count" in list_data, "Response should contain total_count"
+
         devices = list_data["devices"]
         count = list_data["count"]
 
         assert isinstance(devices, list), "devices should be a list"
         assert count == len(devices), f"Count mismatch: {count} vs {len(devices)}"
+        assert count <= 50, f"Default page should have at most 50 devices, got {count}"
 
         logger.info(f"Listed {count} devices successfully")
 
@@ -58,52 +66,62 @@ class TestDeviceList:
             expected_fields = ["device_id", "name", "manufacturer", "model"]
             for field in expected_fields:
                 assert field in device, f"Device missing field: {field}"
-            logger.info(f"Sample device: {device.get('name')} ({device.get('device_id')[:8]}...)")
+            # Summary mode should not include entities
+            assert "entities" not in device, "Summary mode should omit entities"
+            logger.info(
+                f"Sample device: {device.get('name')} ({device.get('device_id')[:8]}...)"
+            )
 
     async def test_list_devices_filter_by_area(self, mcp_client):
-        """
-        Test: Filter devices by area_id
+        """Filter devices by area_id (positive, multi-match, and negative cases).
 
-        Note: This test may not find devices if no devices are assigned to areas
-        in the test environment.
+        Seed (tests/initial_test_state/.storage/core.device_registry) assigns
+        ``living_room`` to 2+ demo devices so this test reliably exercises the
+        area-filter code path without relying on environmental luck.
         """
         logger.info("Testing device list - filter by area")
 
-        # First, get all devices to find an area
         all_result = await mcp_client.call_tool("ha_get_device", {})
         all_data = parse_mcp_result(all_result)
         assert all_data.get("success"), f"Failed to list all devices: {all_data}"
 
-        # Find a device with an area
-        devices_with_area = [
-            d for d in all_data.get("devices", [])
-            if d.get("area_id")
-        ]
-
-        if not devices_with_area:
-            logger.info("No devices with areas found, skipping area filter test")
-            pytest.skip("No devices with areas in test environment")
-
-        area_id = devices_with_area[0]["area_id"]
-        logger.info(f"Testing filter with area_id: {area_id}")
-
-        # Filter by area
         filter_result = await mcp_client.call_tool(
             "ha_get_device",
-            {"area_id": area_id},
+            {"area_id": "living_room"},
         )
         filter_data = parse_mcp_result(filter_result)
 
         assert filter_data.get("success"), f"Failed to filter devices: {filter_data}"
         assert filter_data.get("filters"), "Response should indicate filters applied"
-
-        # Verify all returned devices have the specified area
-        for device in filter_data.get("devices", []):
-            assert device.get("area_id") == area_id, (
-                f"Device {device.get('name')} has area {device.get('area_id')}, expected {area_id}"
+        assert filter_data["count"] >= 2, (
+            f"Seed assigns living_room to 2+ devices but filter returned {filter_data['count']} — "
+            "check tests/initial_test_state/.storage/core.device_registry"
+        )
+        assert filter_data["count"] < all_data["count"], (
+            f"Filter returned {filter_data['count']} of {all_data['count']} devices — "
+            "area filter appears to be ignored"
+        )
+        for device in filter_data["devices"]:
+            assert device.get("area_id") == "living_room", (
+                f"Device {device.get('name')} has area {device.get('area_id')}, expected living_room"
             )
 
-        logger.info(f"Area filter returned {filter_data['count']} devices")
+        empty_result = await mcp_client.call_tool(
+            "ha_get_device",
+            {"area_id": "no_such_area_xyz123"},
+        )
+        empty_data = parse_mcp_result(empty_result)
+        assert empty_data.get("success"), (
+            f"Filter by nonexistent area should succeed, not raise: {empty_data}"
+        )
+        assert empty_data["count"] == 0, (
+            f"Filter by nonexistent area returned {empty_data['count']} devices, expected 0"
+        )
+
+        logger.info(
+            f"Area filter: {filter_data['count']} living_room devices, "
+            f"negative case returned 0"
+        )
 
     async def test_list_devices_filter_by_manufacturer(self, mcp_client):
         """
@@ -118,12 +136,13 @@ class TestDeviceList:
 
         # Find a device with a manufacturer
         devices_with_mfr = [
-            d for d in all_data.get("devices", [])
-            if d.get("manufacturer")
+            d for d in all_data.get("devices", []) if d.get("manufacturer")
         ]
 
         if not devices_with_mfr:
-            logger.info("No devices with manufacturers found, skipping manufacturer filter test")
+            logger.info(
+                "No devices with manufacturers found, skipping manufacturer filter test"
+            )
             pytest.skip("No devices with manufacturers in test environment")
 
         manufacturer = devices_with_mfr[0]["manufacturer"]
@@ -147,6 +166,59 @@ class TestDeviceList:
             )
 
         logger.info(f"Manufacturer filter returned {filter_data['count']} devices")
+
+    async def test_list_devices_pagination(self, mcp_client):
+        """Test that limit/offset pagination works for device listing."""
+        logger.info("Testing device list pagination")
+
+        # Get first page with small limit
+        page1 = await mcp_client.call_tool(
+            "ha_get_device",
+            {"limit": 2, "offset": 0},
+        )
+        data1 = parse_mcp_result(page1)
+        assert data1.get("success"), f"Page 1 failed: {data1}"
+
+        if data1["total_count"] < 3:
+            pytest.skip("Not enough devices to test pagination")
+
+        assert data1["count"] == 2
+        assert data1["offset"] == 0
+        assert data1["has_more"] is True
+
+        # Get second page
+        page2 = await mcp_client.call_tool(
+            "ha_get_device",
+            {"limit": 2, "offset": 2},
+        )
+        data2 = parse_mcp_result(page2)
+        assert data2.get("success"), f"Page 2 failed: {data2}"
+        assert data2["offset"] == 2
+
+        # Pages should not overlap
+        ids1 = {d["device_id"] for d in data1["devices"]}
+        ids2 = {d["device_id"] for d in data2["devices"]}
+        assert ids1.isdisjoint(ids2), "Pages should not overlap"
+
+        logger.info("Device pagination test passed")
+
+    async def test_list_devices_full_detail(self, mcp_client):
+        """Test that detail_level='full' includes entities in list mode."""
+        logger.info("Testing device list with full detail")
+
+        result = await mcp_client.call_tool(
+            "ha_get_device",
+            {"detail_level": "full", "limit": 5},
+        )
+        data = parse_mcp_result(result)
+        assert data.get("success"), f"Full detail failed: {data}"
+        assert data.get("detail_level") == "full"
+
+        # Full mode should include entities per device
+        for device in data.get("devices", []):
+            assert "entities" in device, "Full mode should include entities"
+
+        logger.info("Device full detail test passed")
 
 
 @pytest.mark.registry
@@ -188,8 +260,13 @@ class TestDeviceGet:
 
         # Verify device structure
         expected_fields = [
-            "device_id", "name", "manufacturer", "model",
-            "area_id", "disabled_by", "labels",
+            "device_id",
+            "name",
+            "manufacturer",
+            "model",
+            "area_id",
+            "disabled_by",
+            "labels",
         ]
         for field in expected_fields:
             assert field in device, f"Device missing field: {field}"
@@ -209,22 +286,26 @@ class TestDeviceGet:
         """
         logger.info("Testing get non-existent device")
 
-        get_result = await mcp_client.call_tool(
+        get_data = await safe_call_tool(
+            mcp_client,
             "ha_get_device",
             {"device_id": "definitely_not_a_real_device_id_12345"},
         )
-        get_data = parse_mcp_result(get_result)
 
         assert not get_data.get("success"), "Getting non-existent device should fail"
-        assert "not found" in get_data.get("error", "").lower(), (
+        error = get_data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "not found" in error_msg.lower(), (
             f"Error should indicate device not found: {get_data}"
         )
         logger.info("Non-existent device correctly rejected")
 
 
 @pytest.mark.registry
-class TestDeviceUpdate:
-    """Test ha_update_device functionality."""
+class TestDeviceSet:
+    """Test ha_set_device functionality."""
 
     async def test_update_device_name(self, mcp_client):
         """
@@ -251,7 +332,7 @@ class TestDeviceUpdate:
 
         # Update device name
         update_result = await mcp_client.call_tool(
-            "ha_update_device",
+            "ha_set_device",
             {
                 "device_id": device_id,
                 "name": test_name,
@@ -275,7 +356,7 @@ class TestDeviceUpdate:
         # Restore original name (or clear custom name)
         logger.info("Restoring original device name")
         restore_result = await mcp_client.call_tool(
-            "ha_update_device",
+            "ha_set_device",
             {
                 "device_id": device_id,
                 "name": "",  # Clear custom name
@@ -289,9 +370,10 @@ class TestDeviceUpdate:
         """
         Test: Update device labels
 
-        Note: Labels must exist in Home Assistant's label registry before they
-        can be assigned to devices. This test verifies the update mechanism
-        works, even if labels don't exist (they'll be empty in that case).
+        Labels must exist in Home Assistant's label registry before they can
+        be assigned — unknown label IDs are rejected instead of being stored
+        as dangling references (issue #2159) — so the test creates its labels
+        first and removes them afterwards.
         """
         logger.info("Testing device labels update")
 
@@ -305,50 +387,70 @@ class TestDeviceUpdate:
             pytest.skip("No devices in test environment")
 
         device_id = list_data["devices"][0]["device_id"]
-        test_labels = ["test_label", "e2e_test"]
-        logger.info(f"Updating device {device_id} labels: {test_labels}")
 
-        # Update device labels
-        # Note: If labels don't exist in label registry, they won't be applied
-        update_result = await mcp_client.call_tool(
-            "ha_update_device",
-            {
-                "device_id": device_id,
-                "labels": test_labels,
-            },
+        # Capture the original labels so cleanup restores the device exactly.
+        detail_result = await mcp_client.call_tool(
+            "ha_get_device", {"device_id": device_id}
         )
-        update_data = parse_mcp_result(update_result)
+        detail_data = parse_mcp_result(detail_result)
+        assert detail_data.get("success"), f"Failed to get device: {detail_data}"
+        original_labels = detail_data.get("device", {}).get("labels", [])
 
-        assert update_data.get("success"), f"Failed to update labels: {update_data}"
-        logger.info("Labels update command succeeded")
+        # Create the labels this test assigns. Creation happens inside the
+        # cleanup guard so a failed second create still removes the first.
+        test_labels = []
+        try:
+            for label_name in ("Device E2E Label A", "Device E2E Label B"):
+                create_result = await mcp_client.call_tool(
+                    "ha_config_set_label", {"name": label_name}
+                )
+                create_data = parse_mcp_result(create_result)
+                assert create_data.get("success"), (
+                    f"Failed to create label: {create_data}"
+                )
+                test_labels.append(create_data["label_id"])
+            logger.info(f"Updating device {device_id} labels: {test_labels}")
 
-        # Verify the response structure contains labels field
-        updated_entry = update_data.get("device_entry", {})
-        assert "labels" in updated_entry, "Response should contain labels field"
-        updated_labels = updated_entry.get("labels", [])
-        logger.info(f"Labels in response: {updated_labels}")
-
-        # Note: Labels may be empty if the labels don't exist in label_registry
-        # The important thing is that the API accepted the request
-        if updated_labels:
-            logger.info(f"Labels applied: {updated_labels}")
-        else:
-            logger.info(
-                "Labels were not applied (likely labels don't exist in label registry)"
+            # Update device labels
+            update_result = await mcp_client.call_tool(
+                "ha_set_device",
+                {
+                    "device_id": device_id,
+                    "labels": test_labels,
+                },
             )
+            update_data = parse_mcp_result(update_result)
 
-        # Clear labels (set to empty)
-        logger.info("Clearing device labels")
-        clear_result = await mcp_client.call_tool(
-            "ha_update_device",
-            {
-                "device_id": device_id,
-                "labels": [],
-            },
-        )
-        clear_data = parse_mcp_result(clear_result)
-        assert clear_data.get("success"), f"Failed to clear labels: {clear_data}"
-        logger.info("Labels cleared")
+            assert update_data.get("success"), f"Failed to update labels: {update_data}"
+            updated_labels = update_data.get("device_entry", {}).get("labels", [])
+            assert sorted(updated_labels) == sorted(test_labels), (
+                f"Labels not applied: {update_data}"
+            )
+            logger.info(f"Labels applied: {updated_labels}")
+
+            # Clear labels (set to empty)
+            logger.info("Clearing device labels")
+            clear_result = await mcp_client.call_tool(
+                "ha_set_device",
+                {
+                    "device_id": device_id,
+                    "labels": [],
+                },
+            )
+            clear_data = parse_mcp_result(clear_result)
+            assert clear_data.get("success"), f"Failed to clear labels: {clear_data}"
+            logger.info("Labels cleared")
+        finally:
+            # Restore the device's original labels even when an assertion
+            # above fails, then drop the labels this test created.
+            await mcp_client.call_tool(
+                "ha_set_device",
+                {"device_id": device_id, "labels": original_labels},
+            )
+            for label_id in test_labels:
+                await mcp_client.call_tool(
+                    "ha_config_remove_label", {"label_id": label_id}
+                )
 
     async def test_update_device_no_changes(self, mcp_client):
         """
@@ -367,14 +469,18 @@ class TestDeviceUpdate:
         device_id = list_data["devices"][0]["device_id"]
 
         # Update with no parameters
-        update_result = await mcp_client.call_tool(
-            "ha_update_device",
+        update_data = await safe_call_tool(
+            mcp_client,
+            "ha_set_device",
             {"device_id": device_id},
         )
-        update_data = parse_mcp_result(update_result)
 
         assert not update_data.get("success"), "Update with no changes should fail"
-        assert "no updates" in update_data.get("error", "").lower(), (
+        error = update_data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "no updates" in error_msg.lower(), (
             f"Error should mention no updates: {update_data}"
         )
         logger.info("No-changes update correctly rejected")
@@ -385,17 +491,21 @@ class TestDeviceUpdate:
         """
         logger.info("Testing update non-existent device")
 
-        update_result = await mcp_client.call_tool(
-            "ha_update_device",
+        update_data = await safe_call_tool(
+            mcp_client,
+            "ha_set_device",
             {
                 "device_id": "definitely_not_a_real_device_id_12345",
                 "name": "Test Name",
             },
         )
-        update_data = parse_mcp_result(update_result)
 
-        assert not update_data.get("success"), "Updating non-existent device should fail"
-        logger.info(f"Non-existent device update correctly rejected: {update_data.get('error')}")
+        assert not update_data.get("success"), (
+            "Updating non-existent device should fail"
+        )
+        logger.info(
+            f"Non-existent device update correctly rejected: {update_data.get('error')}"
+        )
 
 
 @pytest.mark.registry
@@ -408,14 +518,20 @@ class TestDeviceRemove:
         """
         logger.info("Testing remove non-existent device")
 
-        remove_result = await mcp_client.call_tool(
+        remove_data = await safe_call_tool(
+            mcp_client,
             "ha_remove_device",
             {"device_id": "definitely_not_a_real_device_id_12345"},
         )
-        remove_data = parse_mcp_result(remove_result)
 
-        assert not remove_data.get("success"), "Removing non-existent device should fail"
-        assert "not found" in remove_data.get("error", "").lower(), (
+        assert not remove_data.get("success"), (
+            "Removing non-existent device should fail"
+        )
+        error = remove_data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "not found" in error_msg.lower(), (
             f"Error should indicate device not found: {remove_data}"
         )
         logger.info("Non-existent device removal correctly rejected")
@@ -503,7 +619,7 @@ async def test_device_entity_independence(mcp_client):
     # Rename the device
     test_name = "Independence Test Device"
     update_result = await mcp_client.call_tool(
-        "ha_update_device",
+        "ha_set_device",
         {
             "device_id": device_id,
             "name": test_name,
@@ -511,7 +627,6 @@ async def test_device_entity_independence(mcp_client):
     )
     update_data = parse_mcp_result(update_result)
     assert update_data.get("success"), f"Failed to rename device: {update_data}"
-
 
     # Verify entities still have original entity_ids
     get_result = await mcp_client.call_tool(
@@ -530,7 +645,7 @@ async def test_device_entity_independence(mcp_client):
 
     # Restore device name
     restore_result = await mcp_client.call_tool(
-        "ha_update_device",
+        "ha_set_device",
         {
             "device_id": device_id,
             "name": "",  # Clear custom name
@@ -540,3 +655,51 @@ async def test_device_entity_independence(mcp_client):
     assert restore_data.get("success"), f"Failed to restore device name: {restore_data}"
 
     logger.info("Device/entity naming independence test completed")
+
+
+@pytest.mark.registry
+class TestDeviceGetNegativeInputs:
+    """
+    A2 negative-input tests for ha_get_device's single-device lookup mode.
+
+    Covers the nonexistent-device_id failure path. Existing tests in this
+    file exercise the list mode, area/manufacturer filters, and the
+    update/remove flows, but never call ha_get_device with a device_id
+    that is absent from the device registry.
+
+    Methodology: source-verified against tools_registry.py. When the
+    requested device_id is not present in the device registry list,
+    raise_tool_error is invoked with ErrorCode.RESOURCE_NOT_FOUND and the
+    message "Device not found: ..." (devices live in the device registry,
+    addressed by device_id UUID — not entities, so RESOURCE_NOT_FOUND is
+    the correct category per #1297).
+    """
+
+    async def test_get_device_nonexistent_device_id(self, mcp_client):
+        """
+        Test: ha_get_device(device_id="<nonexistent>") returns a structured
+        error with code RESOURCE_NOT_FOUND, not success=True.
+
+        Source path: tools_registry.py — single-device lookup branch returns
+        RESOURCE_NOT_FOUND when the device_id is absent from
+        config/device_registry/list.
+        """
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_get_device",
+            {"device_id": "nonexistent_device_a2_e2e_xyz_404"},
+        )
+
+        assert not data.get("success"), (
+            f"Expected failure for nonexistent device_id, got success=True: {data}"
+        )
+        assert data["error"]["code"] == "RESOURCE_NOT_FOUND", (
+            f"Expected error code RESOURCE_NOT_FOUND, got: {data['error']}"
+        )
+        assert "suggestion" in data["error"], (
+            "Error response should include a suggestion"
+        )
+        error_msg = data["error"]["message"].lower()
+        assert "not found" in error_msg, (
+            f"Expected 'not found' in error message, got: {data['error']}"
+        )

@@ -4,7 +4,6 @@ These tests verify that error codes, error responses, and helper functions
 work correctly to provide informative, structured error messages.
 """
 
-
 from ha_mcp.errors import (
     DEFAULT_SUGGESTIONS,
     ErrorCode,
@@ -13,7 +12,6 @@ from ha_mcp.errors import (
     create_connection_error,
     create_entity_not_found_error,
     create_error_response,
-    create_resource_not_found_error,
     create_service_error,
     create_timeout_error,
     create_validation_error,
@@ -99,14 +97,18 @@ class TestCreateErrorResponse:
 
         assert "suggestion" in response["error"]
         # Should use default suggestions from DEFAULT_SUGGESTIONS
-        assert "ha_search_entities()" in response["error"]["suggestion"]
+        assert "ha_search()" in response["error"]["suggestion"]
 
     def test_error_response_with_context(self):
         """Error response should include context at top level."""
         response = create_error_response(
             ErrorCode.SERVICE_CALL_FAILED,
             "Service call failed",
-            context={"domain": "light", "service": "turn_on", "entity_id": "light.test"},
+            context={
+                "domain": "light",
+                "service": "turn_on",
+                "entity_id": "light.test",
+            },
         )
 
         assert response["domain"] == "light"
@@ -147,6 +149,40 @@ class TestCreateAuthError:
         response = create_auth_error("Token expired", expired=True)
 
         assert response["error"]["code"] == "AUTH_EXPIRED"
+
+    def test_invalid_token_suggestions_non_addon(self, monkeypatch):
+        """Off the add-on, an invalid token keeps the token-centric defaults
+        (the long-lived-token advice)."""
+        monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
+        response = create_auth_error("Invalid token")
+
+        joined = " ".join(response["error"].get("suggestions", []))
+        assert "long-lived access token" in joined
+        assert "Supervisor" not in joined
+
+    def test_invalid_token_suggestions_addon(self, monkeypatch):
+        """On the add-on (Supervisor token), invalid-token guidance switches to
+        Supervisor-aware steps (Core restart, home-assistant.log) and drops the
+        long-lived-token advice that doesn't apply under Supervisor auth (issue
+        #1694). It must NOT assert a root cause."""
+        monkeypatch.setenv("SUPERVISOR_TOKEN", "fake-supervisor-token")
+        response = create_auth_error("Invalid token")
+
+        assert response["error"]["code"] == "AUTH_INVALID_TOKEN"
+        joined = " ".join(response["error"].get("suggestions", []))
+        assert "Supervisor" in joined
+        assert "home-assistant.log" in joined
+        assert "long-lived access token" not in joined
+
+    def test_expired_token_unaffected_by_addon(self, monkeypatch):
+        """Expired errors keep their own defaults even on the add-on — the
+        swap targets invalid-token only."""
+        monkeypatch.setenv("SUPERVISOR_TOKEN", "fake-supervisor-token")
+        response = create_auth_error("Token expired", expired=True)
+
+        assert response["error"]["code"] == "AUTH_EXPIRED"
+        joined = " ".join(response["error"].get("suggestions", []))
+        assert "Supervisor" not in joined
 
 
 class TestCreateEntityNotFoundError:
@@ -247,21 +283,6 @@ class TestCreateTimeoutError:
         assert "30" in response["error"]["message"]
         assert response["operation"] == "service_call"
         assert response["timeout_seconds"] == 30.0
-
-
-class TestCreateResourceNotFoundError:
-    """Tests for create_resource_not_found_error function."""
-
-    def test_resource_not_found_structure(self):
-        """Resource not found error should include resource_type and identifier."""
-        response = create_resource_not_found_error("Automation", "automation.test")
-
-        assert response["success"] is False
-        assert response["error"]["code"] == "RESOURCE_NOT_FOUND"
-        assert "Automation" in response["error"]["message"]
-        assert "automation.test" in response["error"]["message"]
-        assert response["resource_type"] == "Automation"
-        assert response["identifier"] == "automation.test"
 
 
 class TestIsErrorResponse:

@@ -15,6 +15,7 @@ Tests are designed for Docker Home Assistant test environment with testcontainer
 """
 
 import ast
+import asyncio
 import json
 import logging
 import time
@@ -34,6 +35,10 @@ logger = logging.getLogger(__name__)
 
 def enhanced_parse_mcp_result(result) -> dict[str, Any]:
     """Enhanced MCP result parser with better error handling."""
+    # Same passthrough contract as the shared utilities.assertions helper:
+    # an already-parsed dict comes back unchanged.
+    if isinstance(result, dict):
+        return result
     try:
         if hasattr(result, "content") and result.content:
             response_text = str(result.content[0].text)
@@ -73,14 +78,11 @@ async def wait_for_item_in_list(
     This function handles timing issues where items are added but not
     immediately visible through the API.
     """
-    start_time = time.time()
+    start_time = time.monotonic()
 
-    while time.time() - start_time < timeout:
+    while time.monotonic() - start_time < timeout:
         try:
-            result = await mcp_client.call_tool(
-                "ha_get_todo",
-                {"entity_id": entity_id}
-            )
+            result = await mcp_client.call_tool("ha_get_todo", {"entity_id": entity_id})
             data = enhanced_parse_mcp_result(result)
 
             if data.get("success"):
@@ -106,10 +108,7 @@ async def get_item_by_summary(
 ) -> dict[str, Any] | None:
     """Get a todo item by its summary text."""
     try:
-        result = await mcp_client.call_tool(
-            "ha_get_todo",
-            {"entity_id": entity_id}
-        )
+        result = await mcp_client.call_tool("ha_get_todo", {"entity_id": entity_id})
         data = enhanced_parse_mcp_result(result)
 
         if data.get("success"):
@@ -190,11 +189,11 @@ class TestTodoItemOperations:
             # 1. ADD: Add a new item
             logger.info(f"Adding item: {test_item}")
             add_result = await mcp.call_tool_success(
-                "ha_add_todo_item",
+                "ha_set_todo_item",
                 {
                     "entity_id": todo_entity,
                     "summary": test_item,
-                }
+                },
             )
             assert add_result.get("item") == test_item, "Added item should match"
             logger.info("Item added successfully")
@@ -208,8 +207,7 @@ class TestTodoItemOperations:
             # 2. GET: Verify item exists in list
             logger.info("Verifying item exists...")
             get_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
 
             items = get_result.get("items", [])
@@ -233,12 +231,12 @@ class TestTodoItemOperations:
             # 3. UPDATE: Mark item as completed
             logger.info("Marking item as completed...")
             await mcp.call_tool_success(
-                "ha_update_todo_item",
+                "ha_set_todo_item",
                 {
                     "entity_id": todo_entity,
                     "item": test_item,
                     "status": "completed",
-                }
+                },
             )
             logger.info("Item marked as completed")
 
@@ -246,8 +244,7 @@ class TestTodoItemOperations:
 
             # Verify the status changed
             verify_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
 
             completed_item = None
@@ -260,7 +257,9 @@ class TestTodoItemOperations:
             if completed_item:
                 logger.info(f"Item status after update: {completed_item.get('status')}")
             else:
-                logger.info("Item may have been auto-removed after completion (normal for some integrations)")
+                logger.info(
+                    "Item may have been auto-removed after completion (normal for some integrations)"
+                )
 
             # 4. REMOVE: Remove the item
             logger.info("Removing item...")
@@ -269,15 +268,14 @@ class TestTodoItemOperations:
                 {
                     "entity_id": todo_entity,
                     "item": test_item,
-                }
+                },
             )
             logger.info("Item removed successfully")
 
             # Wait and verify item is gone
 
             final_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
 
             final_items = final_result.get("items", [])
@@ -309,8 +307,7 @@ class TestTodoItemOperations:
             # Test filtering by needs_action status
             logger.info("Testing filter: needs_action")
             needs_action_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity, "status": "needs_action"}
+                "ha_get_todo", {"entity_id": todo_entity, "status": "needs_action"}
             )
             assert "items" in needs_action_result, "Should have items in response"
             logger.info(f"Found {needs_action_result['count']} items needing action")
@@ -318,8 +315,7 @@ class TestTodoItemOperations:
             # Test filtering by completed status
             logger.info("Testing filter: completed")
             completed_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity, "status": "completed"}
+                "ha_get_todo", {"entity_id": todo_entity, "status": "completed"}
             )
             assert "items" in completed_result, "Should have items in response"
             logger.info(f"Found {completed_result['count']} completed items")
@@ -327,8 +323,7 @@ class TestTodoItemOperations:
             # Test no filter (all items)
             logger.info("Testing filter: none (all items)")
             all_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
             assert "items" in all_result, "Should have items in response"
             logger.info(f"Found {all_result['count']} total items")
@@ -370,7 +365,7 @@ class TestTodoErrorHandling:
         """
         Test: Update requires at least one update field
 
-        Validates that ha_update_todo_item requires at least one update field.
+        Validates that ha_set_todo_item requires at least one update field.
         """
         logger.info("Testing update validation...")
 
@@ -385,7 +380,7 @@ class TestTodoErrorHandling:
 
             # Try to update without any update fields
             await mcp.call_tool_failure(
-                "ha_update_todo_item",
+                "ha_set_todo_item",
                 {
                     "entity_id": todo_entity,
                     "item": "some_item",
@@ -423,19 +418,18 @@ class TestTodoAdvancedFeatures:
             # Try to add with description
             try:
                 await mcp.call_tool_success(
-                    "ha_add_todo_item",
+                    "ha_set_todo_item",
                     {
                         "entity_id": todo_entity,
                         "summary": test_item,
                         "description": test_desc,
-                    }
+                    },
                 )
                 logger.info("Item with description added successfully")
 
                 # Clean up
                 await mcp_client.call_tool(
-                    "ha_remove_todo_item",
-                    {"entity_id": todo_entity, "item": test_item}
+                    "ha_remove_todo_item", {"entity_id": todo_entity, "item": test_item}
                 )
                 logger.info("Cleanup completed")
 
@@ -466,8 +460,7 @@ class TestTodoAdvancedFeatures:
 
             # Add item
             await mcp.call_tool_success(
-                "ha_add_todo_item",
-                {"entity_id": todo_entity, "summary": original_name}
+                "ha_set_todo_item", {"entity_id": todo_entity, "summary": original_name}
             )
 
             # Wait for item
@@ -475,20 +468,19 @@ class TestTodoAdvancedFeatures:
 
             # Rename item
             await mcp.call_tool_success(
-                "ha_update_todo_item",
+                "ha_set_todo_item",
                 {
                     "entity_id": todo_entity,
                     "item": original_name,
                     "rename": new_name,
-                }
+                },
             )
             logger.info("Item renamed successfully")
 
             # Wait and verify
 
             get_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
 
             items = get_result.get("items", [])
@@ -505,8 +497,7 @@ class TestTodoAdvancedFeatures:
 
             # Clean up
             await mcp_client.call_tool(
-                "ha_remove_todo_item",
-                {"entity_id": todo_entity, "item": new_name}
+                "ha_remove_todo_item", {"entity_id": todo_entity, "item": new_name}
             )
 
             logger.info("Rename todo item test passed")
@@ -540,8 +531,7 @@ class TestTodoBulkOperations:
             added_items = []
             for item_name in items_to_add:
                 await mcp.call_tool_success(
-                    "ha_add_todo_item",
-                    {"entity_id": todo_entity, "summary": item_name}
+                    "ha_set_todo_item", {"entity_id": todo_entity, "summary": item_name}
                 )
                 added_items.append(item_name)
 
@@ -551,8 +541,7 @@ class TestTodoBulkOperations:
 
             # Verify all items exist
             get_result = await mcp.call_tool_success(
-                "ha_get_todo",
-                {"entity_id": todo_entity}
+                "ha_get_todo", {"entity_id": todo_entity}
             )
 
             items = get_result.get("items", [])
@@ -566,7 +555,7 @@ class TestTodoBulkOperations:
                 try:
                     await mcp_client.call_tool(
                         "ha_remove_todo_item",
-                        {"entity_id": todo_entity, "item": item_name}
+                        {"entity_id": todo_entity, "item": item_name},
                     )
                 except Exception:
                     pass  # Item may already be gone
@@ -585,13 +574,12 @@ async def test_todo_search_discovery(mcp_client):
     async with MCPAssertions(mcp_client) as mcp:
         # Search for todo entities
         search_result = await mcp.call_tool_success(
-            "ha_search_entities",
-            {"query": "todo", "domain_filter": "todo", "limit": 10}
+            "ha_search",
+            {"query": "todo", "domain_filter": "todo", "limit": 10},
         )
 
         # Check if any todo entities found
-        data = search_result.get("data", search_result)
-        results = data.get("results", [])
+        results = search_result.get("entities", [])
 
         logger.info(f"Found {len(results)} todo entities via search")
 

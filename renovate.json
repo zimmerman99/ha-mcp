@@ -7,61 +7,108 @@
   "schedule": [
     "after 3pm on tuesday"
   ],
+  "minimumReleaseAge": "7 days",
+  "minimumReleaseAgeBehaviour": "timestamp-optional",
+  "logLevelRemap": [
+    {
+      "matchMessage": "External host error causing abort - skipping",
+      "newLogLevel": "error"
+    },
+    {
+      "matchMessage": "Git error - aborting",
+      "newLogLevel": "error"
+    },
+    {
+      "matchMessage": "/^Some release\\(s\\) did not have a releaseTimestamp, but as we're running with minimumReleaseAgeBehaviour=timestamp-optional, proceeding\\. See debug logs for more information$/",
+      "newLogLevel": "info"
+    }
+  ],
+  "vulnerabilityAlerts": {
+    "minimumReleaseAge": null
+  },
   "enabledManagers": [
     "custom.regex",
-    "dockerfile"
+    "dockerfile",
+    "git-submodules"
   ],
+  "git-submodules": {
+    "description": "The git-submodules manager ships enabled=false by default; enabledManagers only filters the manager list and does not flip that default, so both are required (#1729)",
+    "enabled": true
+  },
   "ignorePaths": [],
   "customManagers": [
     {
       "customType": "regex",
       "managerFilePatterns": [
-        "/tests/.*\\.py$/"
+        "/tests/.*\\.py$/",
+        "/.github/workflows/.*\\.yml$/"
       ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+.*?\\S+:(?<currentValue>[\\d.]+)"
       ],
       "depNameTemplate": "{{{depName}}}",
       "datasourceTemplate": "{{{datasource}}}"
+    },
+    {
+      "description": "Vendored library pins. src/ha_mcp/_vendor/ holds third-party code copied verbatim from the pinned sdist, so no package manager sees it: enabledManagers excludes pip_requirements and dependabot's uv ecosystem reads only pyproject.toml/uv.lock. Without this manager a CVE fix would never open a PR. A bump alone does not regenerate the tree — tests/src/unit/test_vendored_websockets.py fails the renovate PR until scripts/vendor_websockets.py is re-run and the result committed, which is the intended handoff.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^src/ha_mcp/_vendor/requirements\\.txt$/"
+      ],
+      "matchStrings": [
+        "(?<depName>[A-Za-z0-9._-]+)==(?<currentValue>[^\\s#]+)"
+      ],
+      "datasourceTemplate": "pypi"
+    },
+    {
+      "description": "Python-assignment version pins (e.g. HAOS_VERSION = \"17.3\" in build_image.py)",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/tests/.*\\.py$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\s+\\w+\\s*=\\s*[\"'](?<currentValue>[\\d.]+)[\"']"
+      ],
+      "depNameTemplate": "{{{depName}}}",
+      "datasourceTemplate": "{{{datasource}}}"
+    },
+    {
+      "description": "Exact Renovate engine version used by renovatebot/github-action",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/renovate\\.yml$/"
+      ],
+      "matchStrings": [
+        "renovate-version:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"
+      ],
+      "depNameTemplate": "renovatebot/renovate",
+      "datasourceTemplate": "github-releases"
     }
   ],
   "packageRules": [
     {
-      "description": "Python version upgrades - wait 6 months after release",
+      "description": "Keep Python interpreter changes coordinated while allowing same-tag digest refreshes",
       "matchManagers": [
-        "asdf"
+        "dockerfile"
       ],
       "matchPackageNames": [
         "python"
       ],
-      "minimumReleaseAge": "180 days",
-      "postUpgradeTasks": {
-        "commands": [
-          "PYTHON_VERSION=$(cat .python-version)",
-          "PYTHON_MAJOR=$(echo $PYTHON_VERSION | cut -d. -f1)",
-          "PYTHON_MINOR=$(echo $PYTHON_VERSION | cut -d. -f2)",
-          "PYTHON_NEXT=\"${PYTHON_MAJOR}.$((PYTHON_MINOR + 1))\"",
-          "sed -i \"s/requires-python = \\\">=3\\.[0-9]\\+,<3\\.[0-9]\\+\\\"/requires-python = \\\">=${PYTHON_VERSION},<${PYTHON_NEXT}\\\"/\" pyproject.toml",
-          "sed -i '/Programming Language :: Python :: 3\\.[0-9]\\+/d' pyproject.toml",
-          "sed -i \"/Programming Language :: Python :: 3\\\",/a\\\\    \\\"Programming Language :: Python :: ${PYTHON_VERSION}\\\",\" pyproject.toml",
-          "sed -i \"s/python3\\.[0-9]\\+-bookworm-slim/python${PYTHON_VERSION}-bookworm-slim/\" Dockerfile",
-          "sed -i \"s/python3\\.[0-9]\\+-bookworm/python${PYTHON_VERSION}-bookworm/\" homeassistant-addon/Dockerfile",
-          "sed -i \"s/Python 3\\.[0-9]\\+ - Security/Python ${PYTHON_VERSION} - Security/\" Dockerfile homeassistant-addon/Dockerfile",
-          "sed -i \"s/PYTHON_VERSION: \\\"3\\.[0-9]\\+\\\"/PYTHON_VERSION: \\\"${PYTHON_VERSION}\\\"/\" .github/workflows/pr.yml .github/workflows/test.yml .github/workflows/e2e-tests.yml .github/workflows/semver-release.yml",
-          "git add .python-version pyproject.toml Dockerfile homeassistant-addon/Dockerfile .github/workflows/pr.yml .github/workflows/test.yml .github/workflows/e2e-tests.yml .github/workflows/semver-release.yml"
-        ],
-        "fileFilters": [
-          ".python-version",
-          "pyproject.toml",
-          "Dockerfile",
-          "homeassistant-addon/Dockerfile",
-          ".github/workflows/pr.yml",
-          ".github/workflows/test.yml",
-          ".github/workflows/e2e-tests.yml",
-          ".github/workflows/semver-release.yml"
-        ],
-        "executionMode": "branch"
-      }
+      "allowedVersions": "/^3\\.13-slim$/"
+    },
+    {
+      "description": "Webhook proxy images change only through the dev-first promotion workflow",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "python"
+      ],
+      "matchFileNames": [
+        "homeassistant-addon-webhook-proxy/Dockerfile",
+        "homeassistant-addon-webhook-proxy-dev/Dockerfile"
+      ],
+      "enabled": false
     }
   ],
   "labels": [

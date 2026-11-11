@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ha-mcp"
-version = "6.5.0"
+version = "8.2.0"
 description = "Home Assistant MCP Server - Complete control of Home Assistant through MCP"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+# Upper bound widened to <3.15 so the package installs on Home Assistant's
+# interpreter when run in-process by the ha_mcp_tools component (HA
+# core-2026.7 ships Python 3.14). src/ stays 3.13-compatible.
+requires-python = ">=3.13,<3.15"
 license = {text = "MIT"}
 authors = [
     {name = "Julien", email = "github@qc-h.net"}
@@ -19,19 +22,39 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Home Automation",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 dependencies = [
-    "fastmcp>=2.11.0",
-    "httpx[socks]>=0.27.0,<1.0",
-    'jq>=1.8.0; sys_platform != "win32"',
-    "pydantic>=2.5.0",
-    "python-dotenv>=1.0.0",
-    "truststore>=0.10.0",
-    "websockets>=12.0",
-    "cryptography>=45.0.7",
+    "fastmcp==3.4.6",
+    "httpx[socks]==0.28.1",
+    "pydantic==2.13.4",
+    "python-dotenv==1.2.2",
+    "truststore==0.10.4",
+    # websockets is deliberately ABSENT from this list: ha-mcp ships its own
+    # private copy (src/ha_mcp/_vendor/websockets, pinned in the vendor
+    # requirements.txt and synced by scripts/vendor_websockets.py) and never
+    # imports the shared site-packages copy. Inside Home Assistant that
+    # shared copy is unowned — ~20 integration libraries drag it in with
+    # conflicting version demands and any of their installs can replace or
+    # tear it in place (#2135/#2146); a declared dependency here would make
+    # ha-mcp PIN that contested copy, which is what forced the in-place
+    # replacements. A shared copy can still arrive transitively (fastmcp
+    # declares one), so what keeps us off it is the vendored import path,
+    # not the absence of this line — and the embedded no-stomp e2e guard is
+    # what proves no install of ours ever replaces the shared copy.
+    # Range (not a hard pin) so the resolver can satisfy Home Assistant's own
+    # cryptography constraint when ha-mcp is installed into the HA venv for
+    # in-process embedding (HA 2026.6 pins cryptography==48.0.0, 2026.7 pins
+    # 48.0.1 — the floor must admit every supported core's pin; live-found on
+    # the embedded e2e lane against the HA 2026.6.4 image).
+    # cryptography is a transitive dependency only — never imported in src/.
+    "cryptography>=48.0.0,<51",
+    "pydantic-monty==0.0.18",
+    "tzdata>=2024.1",
+    "packaging>=24.0",
 ]
 
 [project.urls]
@@ -44,42 +67,27 @@ ha-mcp = "ha_mcp.__main__:main"
 ha-mcp-smoke-test = "ha_mcp.smoke_test:main"
 hamcp-test-env = "tests.test_env_manager:main"
 ha-mcp-web = "ha_mcp.__main__:main_web"
-ha-mcp-sse = "ha_mcp.__main__:main_sse"
 ha-mcp-oauth = "ha_mcp.__main__:main_oauth"
+ha-mcp-oidc = "ha_mcp.__main__:main_oidc"
 
 [tool.setuptools]
 package-dir = {"" = "src", "tests" = "tests"}
 packages = { find = { where = ["src", "."], include = ["ha_mcp*", "tests"] } }
 
 [tool.setuptools.package-data]
-ha_mcp = ["py.typed", "_pypi_marker", "resources/*.md", "resources/*.json"]
-
-[tool.black]
-line-length = 88
-target-version = ['py311']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
-
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 88
-known_first_party = ["ha_mcp"]
+ha_mcp = ["py.typed", "_pypi_marker", "settings_ui/settings.html", "settings_ui/settings.js", "settings_ui/settings.css", "settings_ui/locales/*.json", "settings_ui/locales/README.md", "resources/skills-vendor/**/*"]
+# The vendored websockets tree's non-Python files: the upstream LICENSE
+# (BSD-3 requires shipping it), the VENDORED provenance marker, and the
+# renovate-managed pin file the drift test reads.
+"ha_mcp._vendor" = ["requirements.txt"]
+"ha_mcp._vendor.websockets" = ["LICENSE", "VENDORED", "MANIFEST.sha256", "py.typed"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
+mypy_path = "src"
+# /tmp keeps the cache on Linux tmpfs — avoids the slow Windows FS in WSL2.
+# Windows-native contributors can remove this line or override with MYPY_CACHE_DIR.
+cache_dir = "/tmp/.mypy_cache"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
@@ -95,49 +103,139 @@ explicit_package_bases = true
 [[tool.mypy.overrides]]
 module = [
     "fastmcp.*",
+    "jq",
+    "pydantic_monty",
+    "pydantic_monty.*",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Vendored websockets: upstream's typing, not ours to check. follow_imports
+# skip keeps our client code checked against Any instead of dragging the
+# vendored tree into the run.
+module = ["ha_mcp._vendor.*"]
+follow_imports = "skip"
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "homeassistant.*",
+    "aiohasupervisor",
+    "aiohasupervisor.*",
+    "aiohttp",
+    "awesomeversion",
+    "yarl",
+    "voluptuous",
+    # Ships with HA core at runtime (helpers.llm schema conversion, #1745);
+    # not installed in this dev environment.
+    "voluptuous_openapi",
+    "jsonschema",
+    "requests",
+    "requests.*",
 ]
 ignore_missing_imports = true
 
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 88
+extend-exclude = [
+    "tests/initial_test_state",
+    # Vendored websockets — upstream's code style, not ours. Kept in sync
+    # with PATHS_IGNORE in scripts/codeql_quality_gate.py.
+    "src/ha_mcp/_vendor/websockets",
+    # HA integration manifests must be strict JSON (no trailing commas);
+    # ruff 0.15+ formats .json files as JSONC and inserts trailing commas
+    # which makes Python's json.load() reject the file at HA startup.
+    "custom_components/**/*.json",
+]
 
 [tool.ruff.lint]
 select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort
-    "B",  # flake8-bugbear
-    "C4", # flake8-comprehensions
-    "UP", # pyupgrade
-    "RUF100", # unused noqa
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "C90",   # mccabe complexity
+    "UP",    # pyupgrade
+    "RUF",   # ruff-specific rules
+    "PIE",   # misc lints
+    "PERF",  # performance anti-patterns
+    "ASYNC", # async best practices
+    "A",     # builtin shadowing
+    "LOG",   # logging best practices
+    "SIM",   # simplify
+    "PLE",   # pylint errors (real bugs: bad logging args, await outside async)
+    # Targeted pylint conventions/refactors/warnings. The PL family is NOT
+    # selected wholesale: PLC0415 (import-outside-top-level) fights the
+    # deliberate lazy-init architecture, and PLR2004 (magic values),
+    # PLR0913/PLR0917 (wide FastMCP tool signatures) and PLR0911 (too many
+    # returns -- a separate signal from C901's cyclomatic complexity, and
+    # noisy on this codebase's early-return validation style) are noise
+    # here. Add codes individually so a new upstream PLR rule does not land
+    # enabled by default.
+    "PLC0206", # dict-index-missing-items
+    "PLC0207", # missing-maxsplit-arg
+    "PLR0402", # manual-from-import
+    "PLR1711", # useless-return
+    "PLR1714", # repeated-equality-comparison
+    "PLR1730", # if-stmt-min-max
+    "PLR5501", # collapsible-else-if
+    "PLW0108", # unnecessary-lambda
+    "PLW0602", # global-variable-not-assigned
+    "PLW1510", # subprocess-run-without-check
+    "PLW2901", # redefined-loop-name
 ]
 ignore = [
-    "E501",  # line too long, handled by black
-    "B008",  # do not perform function calls in argument defaults
-    "C901",  # too complex
-    "B904",  # raise exceptions with from None/err - non-critical
-    "F841",  # local variable assigned but never used
-    "B007",  # loop control variable not used within loop body
-    "W293",  # blank line contains whitespace
-    "W291",  # trailing whitespace
-    "F821",  # undefined name (often false positives in complex imports)
-    "E722",  # bare except (temporary for cleanup)
-    "UP038", # isinstance union syntax (non-critical)
-    "I001",  # import sorting handled by isort
+    "E501",    # line too long — formatter handles this
+    "B008",    # function calls in defaults — FastMCP pattern
+    "SIM102",  # collapsible-if — sometimes less readable
+    "SIM108",  # ternary — sometimes less readable
+    "SIM105",  # contextlib.suppress — style preference
+    "ASYNC109",# timeout params are standard in HA API patterns
+    "RUF001",  # ambiguous unicode — HA entity names use degree symbols etc
+    "RUF003",  # ambiguous unicode in comments
+    "RUF010",  # explicit f-string type conversion — str(x) is clearer than !s
+    "RUF059",  # unused unpacked variable
+    "SIM118",  # in-dict-keys — style preference
+    "PIE810",  # multiple-starts-ends-with — style preference
+    "RUF005",  # collection-literal-concatenation
+    "RUF022",  # unsorted-dunder-all
+    "RUF013",  # implicit-optional
 ]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
 "tests/**/*" = ["E501", "B011"]
+# Temporary: the equivalent PLC0207/PLR5501 fixes landed in
+# homeassistant-addon-webhook-proxy-dev/ only, per the dev-first/promote-only
+# flow (allow-stable-edit is for exceptional stable-only repairs, not routine sweeps —
+# see homeassistant-addon-webhook-proxy/AGENTS.md "Dev-first, promote-only").
+# The -dev entries name where a reset-dev-from-stable run puts those same two
+# stable files (start.py stays put, mcp_proxy/ is renamed to mcp_proxy_dev/),
+# so the auto-opened reset PR lints clean. Scoped per file and per rule so
+# both rules stay live everywhere else in both trees — the -dev tree is where
+# all new webhook-proxy code is authored. Remove all four once the next
+# promote carries the fixes into stable.
+"homeassistant-addon-webhook-proxy/start.py" = ["PLR5501"]
+"homeassistant-addon-webhook-proxy/mcp_proxy/__init__.py" = ["PLC0207"]
+"homeassistant-addon-webhook-proxy-dev/start.py" = ["PLR5501"]
+"homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/__init__.py" = ["PLC0207"]
+# C901 is enforced repo-wide with no per-file exemptions (the grandfathered
+# list was fully cleared by issue #925). Do NOT add "path" = ["C901"] entries
+# here — extract helpers to bring the function below the threshold instead:
+# "some/path.py" = ["C901"]  <- never this
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# See tests/pytest.ini: an empty parametrize list is a guard that stopped
+# running, and the default mark hides it as a skip the summary ignores.
+empty_parameter_set_mark = "fail_at_collect"
 addopts = [
     "--strict-markers",
     "--strict-config",
@@ -157,36 +255,63 @@ markers = [
     "error_handling: error handling and edge case tests",
     "cleanup: tests that create entities needing cleanup",
     "performance: performance measurement and regression tests",
+    "external_only: skips on HAOS inaddon tier (server runs in a separate addon container, so in-process env monkeypatching doesn't reach it)",
+    "inaddon_only: only runs on HAOS inaddon tier",
 ]
 asyncio_mode = "auto"
 
 [dependency-groups]
 dev = [
-    "black>=23.0.0",
+    # Real aiohttp so tests can pin the ClientTimeout defaults the custom
+    # component's relay and the webhook-proxy addon rely on (both are stubbed
+    # in unit tests; nothing else would catch stub drift). NOT a runtime
+    # dependency — src/ never imports aiohttp; HA core provides it in-process.
+    # Floor = the aiohttp HA core 2026.6 pins (2026.7 pins 3.14.1, 2026.8.dev
+    # pins 3.14.3), so the version tested here is one a supported HA runs.
+    "aiohttp>=3.13.5",
     "build>=1.2.2",
+    # Test infrastructure imports the SHARED websockets directly (the HAOS
+    # runtime harness, the image bake, wait_helpers) to talk to Home
+    # Assistant's own WebSocket API — that is test tooling driving HA, not
+    # ha-mcp code, so it does not go through the vendored copy. Declared
+    # here so the test suite never depends on it arriving transitively;
+    # it is NOT a runtime dependency (see the note in [project.dependencies]).
+    "websockets>=15.0.1",
     "docker>=7.1.0",
-    "isort>=5.12.0",
+    "httpx2>=2.4.0",
     "mypy>=1.17.0",
+    "openai>=1.0.0",
+    "jsonschema>=4.25.1",
+    "pyinstaller>=6.0.0",
+    "pynacl>=1.6.0",
     "psutil>=7.0.0",
     "pytest>=8.4.2",
     "pytest-asyncio>=1.1.0",
     "pytest-cov>=5.0.0",
+    "pytest-timeout>=2.3.0",
+    "pytest-rerunfailures>=15.0",
+    # Real voluptuous for the config-flow tests (the component's
+    # config_flow imports it; HA provides it at runtime, tests need it here).
+    "voluptuous>=0.15.2",
+    # Real voluptuous-openapi for the embedded e2e LLM-API test: it converts
+    # the REAL tool-schema catalog exactly like llm_api.py does at runtime
+    # (HA core provides it at runtime; unit tests stub it).
+    "voluptuous-openapi>=0.4.1",
     "pytest-xdist>=3.8.0",
     "requests>=2.25.0",
+    "lefthook>=1.10.0",
+    "ruamel.yaml>=0.18.0",
     "ruff>=0.12.12",
     "testcontainers>=4.13.0",
+    "ast-grep-cli>=0.42.0",
 ]
 
 # Semantic versioning configuration
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
-version_variables = [
-    "src/ha_mcp/__init__.py:__version__",
-]
 build_command = """
-VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = \"\\(.*\\)\"/\\1/')
-sed -i "s/^version: \\\".*\\\"/version: \\\"$VERSION\\\"/" homeassistant-addon/config.yaml
-git add homeassistant-addon/config.yaml
+pip install uv && uv lock
+git add uv.lock
 """
 dist_path = "dist/"
 upload_to_PyPI = true

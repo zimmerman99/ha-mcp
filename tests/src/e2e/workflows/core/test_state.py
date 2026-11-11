@@ -9,7 +9,7 @@ import logging
 
 import pytest
 
-from ...utilities.assertions import assert_mcp_success, parse_mcp_result
+from ...utilities.assertions import assert_mcp_success, parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,9 @@ async def test_get_state_known_entity(mcp_client):
     assert "metadata" in data, f"Missing metadata: {data}"
 
     logger.info(f"Sun state: {state_data['state']}")
-    logger.info(f"Sun attributes: elevation={attrs.get('elevation')}, azimuth={attrs.get('azimuth')}")
+    logger.info(
+        f"Sun attributes: elevation={attrs.get('elevation')}, azimuth={attrs.get('azimuth')}"
+    )
 
 
 @pytest.mark.asyncio
@@ -81,8 +83,8 @@ async def test_get_state_light_entity(mcp_client, test_light_entity):
     if state_data["state"] == "on":
         if "brightness" in attrs:
             logger.info(f"Light brightness: {attrs['brightness']}")
-        if "color_temp" in attrs:
-            logger.info(f"Light color_temp: {attrs['color_temp']}")
+        if "color_temp_kelvin" in attrs:
+            logger.info(f"Light color_temp_kelvin: {attrs['color_temp_kelvin']}")
 
 
 @pytest.mark.asyncio
@@ -91,12 +93,12 @@ async def test_get_state_nonexistent_entity(mcp_client):
     """Test retrieving state of a non-existent entity returns error."""
     logger.info("Testing ha_get_state with non-existent entity")
 
-    result = await mcp_client.call_tool(
+    # Use safe_call_tool since we expect this to fail (entity doesn't exist)
+    data = await safe_call_tool(
+        mcp_client,
         "ha_get_state",
         {"entity_id": "sensor.nonexistent_test_entity_xyz_12345"},
     )
-
-    data = parse_mcp_result(result)
 
     # State data may be nested in 'data' key
     inner_data = data.get("data", data)
@@ -120,17 +122,14 @@ async def test_get_state_sensor_with_numeric_value(mcp_client):
 
     # Search for a sensor to test
     search_result = await mcp_client.call_tool(
-        "ha_search_entities",
-        {"query": "", "domain_filter": "sensor", "limit": 5},
+        "ha_search",
+        {"domain_filter": "sensor", "limit": 5},
     )
 
     search_data = parse_mcp_result(search_result)
 
     # Get results from nested structure
-    if "data" in search_data:
-        results = search_data.get("data", {}).get("results", [])
-    else:
-        results = search_data.get("results", [])
+    results = search_data.get("entities", [])
 
     if not results:
         pytest.skip("No sensor entities available for testing")
@@ -161,27 +160,36 @@ async def test_get_state_sensor_with_numeric_value(mcp_client):
 @pytest.mark.asyncio
 @pytest.mark.core
 async def test_get_state_automation_entity(mcp_client):
-    """Test retrieving state of an automation entity."""
+    """Test retrieving state of an automation entity.
+
+    Anchors on ``automation.e2e_seed_automation`` -- the entity_id HA
+    derives from the slugified ``alias`` of the disabled seed automation
+    defined in ``tests/initial_test_state/automations.yaml`` -- so a
+    regression that removes the seed automation fails this test loudly
+    instead of silently passing on whatever generic automation happened
+    to be present.
+    """
     logger.info("Testing ha_get_state with automation entity")
 
-    # Search for an automation
+    seed_entity = "automation.e2e_seed_automation"
     search_result = await mcp_client.call_tool(
-        "ha_search_entities",
-        {"query": "", "domain_filter": "automation", "limit": 5},
+        "ha_search",
+        {"domain_filter": "automation", "limit": 25},
     )
 
     search_data = parse_mcp_result(search_result)
 
     # Get results from nested structure
-    if "data" in search_data:
-        results = search_data.get("data", {}).get("results", [])
-    else:
-        results = search_data.get("results", [])
+    results = search_data.get("entities", [])
 
-    if not results:
-        pytest.skip("No automation entities available for testing")
-
-    automation_entity = results[0].get("entity_id")
+    assert results, "No automation entities returned by ha_search"
+    automation_entity_ids = [r.get("entity_id") for r in results]
+    assert seed_entity in automation_entity_ids, (
+        f"Expected seeded {seed_entity} in search results, got "
+        f"{automation_entity_ids!r} - see "
+        f"tests/initial_test_state/automations.yaml."
+    )
+    automation_entity = seed_entity
     logger.info(f"Testing with automation: {automation_entity}")
 
     result = await mcp_client.call_tool(
@@ -217,17 +225,14 @@ async def test_get_state_binary_sensor(mcp_client):
 
     # Search for a binary sensor
     search_result = await mcp_client.call_tool(
-        "ha_search_entities",
-        {"query": "", "domain_filter": "binary_sensor", "limit": 5},
+        "ha_search",
+        {"domain_filter": "binary_sensor", "limit": 5},
     )
 
     search_data = parse_mcp_result(search_result)
 
     # Get results from nested structure
-    if "data" in search_data:
-        results = search_data.get("data", {}).get("results", [])
-    else:
-        results = search_data.get("results", [])
+    results = search_data.get("entities", [])
 
     if not results:
         pytest.skip("No binary_sensor entities available for testing")

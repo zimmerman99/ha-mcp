@@ -6,57 +6,184 @@ allowing AI to explore available Home Assistant services/actions.
 """
 
 import logging
-from typing import Any
+from typing import Annotated, Any, Literal
 
-from .helpers import log_tool_usage
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
+from pydantic import Field
+
+from ..client.rest_client import (
+    HomeAssistantAPIError,
+    HomeAssistantAuthError,
+    HomeAssistantCommandError,
+    HomeAssistantCommandTimeout,
+    HomeAssistantConnectionError,
+)
+from ..client.websocket_client import get_websocket_client
+from ..errors import ErrorCode, create_error_response, create_validation_error
+from .component_api import (
+    component_supports,
+    get_component_caps,
+    invalidate_caps,
+    is_unknown_command,
+)
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+)
+from .util_helpers import (
+    JSON_STRING_COERCION,
+    build_pagination_metadata,
+    parse_string_list_param,
+    project_fields,
+    result_fields_warning,
+)
 
 logger = logging.getLogger(__name__)
 
+# WS command name for the component's coarse-filtered service catalog read
+# (see ``component_api`` module docstring for the capability-negotiation pattern
+# this consumer follows).
+WS_SERVICES_LIST = "ha_mcp_tools/services_list"
 
-def register_services_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register service discovery tools with the MCP server."""
 
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["service"], "title": "List Available Services"})
+class ServiceDiscoveryTools:
+    """Service discovery tools for Home Assistant."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @tool(
+        name="ha_list_services",
+        tags={"Service & Device Control"},
+        annotations={
+            "openWorldHint": False,
+            "idempotentHint": True,
+            "readOnlyHint": True,
+            "title": "List Available Services",
+        },
+    )
     @log_tool_usage
     async def ha_list_services(
+        self,
         domain: str | None = None,
         query: str | None = None,
+        limit: Annotated[
+            int,
+            Field(
+                default=50,
+                ge=1,
+                le=200,
+                description="Max services to return per page (default: 50)",
+            ),
+        ] = 50,
+        offset: Annotated[
+            int,
+            Field(
+                default=0,
+                ge=0,
+                description="Number of services to skip for pagination (default: 0)",
+            ),
+        ] = 0,
+        detail_level: Annotated[
+            Literal["summary", "full"],
+            Field(
+                default="summary",
+                description=(
+                    "'summary': service name + description only (default). "
+                    "'full': include parameter field schemas."
+                ),
+            ),
+        ] = "summary",
+        service_fields: Annotated[
+            str | list[str] | None,
+            JSON_STRING_COERCION,
+            Field(
+                default=None,
+                description=(
+                    "Project each service record to only the specified keys. "
+                    'E.g. ["name", "description"] returns slim service records. '
+                    "None = full records (default). Unknown keys yield empty records. "
+                    "Available keys: name, description, domain, service, fields (full mode only), "
+                    "target (full mode only)."
+                ),
+            ),
+        ] = None,
+        fields: Annotated[
+            str | list[str] | None,
+            JSON_STRING_COERCION,
+            Field(
+                default=None,
+                description=(
+                    "Return only the specified top-level response keys to reduce "
+                    'response size (e.g. ["services"]). '
+                    "None = full response (default). "
+                    "Available keys: success, domains, services, total_count, count, "
+                    "offset, limit, has_more, next_offset, detail_level, filters_applied."
+                ),
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        """
-        List available Home Assistant services with their parameters.
+        """List available Home Assistant services with optional pagination and detail control.
 
         Discovers services/actions that can be called via ha_call_service.
-        Returns service definitions including field names, types, and descriptions.
+        Use domain or query filters to narrow results. Defaults to summary mode
+        (name + description only) to keep responses compact.
 
         Args:
             domain: Filter by domain (e.g., 'light', 'switch', 'climate').
-                   If not provided, returns services from all domains.
             query: Search in service names and descriptions.
-                   Matches against service IDs and their descriptions.
-
-        Returns:
-            Dictionary with:
-            - success: Whether the operation succeeded
-            - domains: List of available domains (when no domain filter)
-            - services: Dictionary of service definitions keyed by domain.service
-            - total_count: Total number of services returned
+            limit: Max services per page (default: 50).
+            offset: Pagination offset (default: 0).
+            detail_level: 'summary' (default) returns name/description only;
+                         'full' includes parameter field schemas.
 
         Examples:
-            # List all light services
-            ha_list_services(domain="light")
+            # Browse first page of all services (compact)
+            ha_list_services()
 
-            # Search for services related to temperature
+            # List all light services with full parameter details
+            ha_list_services(domain="light", detail_level="full")
+
+            # Search for temperature-related services
             ha_list_services(query="temperature")
 
-            # Get all available services (may be large)
-            ha_list_services()
+            # Paginate through all services
+            ha_list_services(offset=50)
         """
+        parsed_fields: list[str] | None = None
+        if fields is not None:
+            try:
+                parsed_fields = parse_string_list_param(
+                    fields, "fields", allow_csv=True
+                )
+            except ValueError as exc:
+                raise_tool_error(create_validation_error(str(exc), parameter="fields"))
+        parsed_service_fields: list[str] | None = None
+        if service_fields is not None:
+            try:
+                parsed_service_fields = parse_string_list_param(
+                    service_fields, "service_fields", allow_csv=True
+                )
+                if (
+                    parsed_service_fields is not None
+                    and len(parsed_service_fields) == 0
+                ):
+                    raise ValueError("service_fields must contain at least one key")
+            except ValueError as exc:
+                raise_tool_error(
+                    create_validation_error(str(exc), parameter="service_fields")
+                )
         try:
-            # Get services from REST API (includes parameter definitions)
-            rest_services = await client.get_services()
+            limit_int = limit
+            offset_int = offset
 
-            # Get translations for service descriptions via WebSocket
-            translations = await _get_service_translations(client)
+            catalog_warnings: list[str] = []
+            rest_services, translations = await _fetch_catalog_and_translations(
+                self._client, domain, catalog_warnings
+            )
 
             # Process and filter services
             result = _process_services(
@@ -64,24 +191,159 @@ def register_services_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 translations=translations,
                 domain_filter=domain,
                 query_filter=query,
+                limit=limit_int,
+                offset=offset_int,
+                detail_level=detail_level,
             )
 
-            return result
+            if parsed_service_fields is not None and "services" in result:
+                _orig_svc_vals = list(result["services"].values())
+                result["services"] = {
+                    k: {fk: fv for fk, fv in v.items() if fk in parsed_service_fields}
+                    for k, v in result["services"].items()
+                }
+                _warn = result_fields_warning(
+                    _orig_svc_vals,
+                    list(result["services"].values()),
+                    parsed_service_fields,
+                    param_name="service_fields",
+                )
+                if _warn:
+                    result.setdefault("warnings", []).append(_warn)
 
+            _attach_warnings(result, catalog_warnings)
+
+            return project_fields(result, parsed_fields)
+
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Failed to list services: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "suggestions": [
+            exception_to_structured_error(
+                e,
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify WebSocket API is available",
                     "Try with a specific domain filter",
                 ],
-            }
+            )
+            return (
+                None  # exception_to_structured_error always raises; explicit for CodeQL
+            )
 
 
-async def _get_service_translations(client: Any) -> dict[str, Any]:
+def register_services_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register service discovery tools with the MCP server."""
+    register_tool_methods(mcp, ServiceDiscoveryTools(client))
+
+
+def _attach_warnings(result: dict[str, Any], warnings: list[str]) -> None:
+    """Merge degradation warnings into a response's top-level ``warnings``.
+
+    The catalog is REST-backed and still answers when the WebSocket is down,
+    so without this the service descriptions just go missing and the response
+    looks complete (#1947). Empty in, key omitted.
+    """
+    if warnings:
+        result.setdefault("warnings", []).extend(warnings)
+
+
+async def _fetch_catalog_and_translations(
+    client: Any, domain: str | None, warnings: list[str] | None = None
+) -> tuple[Any, dict[str, Any]]:
+    """The ``(rest_services, translations)`` pair ``_process_services`` consumes.
+
+    Tries the component (``domain``-scoped, one frame) first; falls back to the
+    legacy REST ``get_services()`` + WS ``frontend/get_translations`` pair on any
+    capability miss or fallback-eligible error.
+    """
+    component_payload = await _fetch_services_list_via_component(client, domain=domain)
+    if component_payload is not None:
+        return component_payload["services"], component_payload["translations"]
+    rest_services = await client.get_services()
+    translations = await _get_service_translations(client, warnings)
+    return rest_services, translations
+
+
+async def _fetch_services_list_via_component(
+    client: Any, *, domain: str | None
+) -> dict[str, Any] | None:
+    """One ``ha_mcp_tools/services_list`` read; ``None`` ⇒ run the legacy path.
+
+    Returns ``{"services": [...], "translations": {...}}`` — ``services`` is the
+    REST ``/api/services`` list shape and ``translations`` the same flat
+    ``frontend/get_translations`` resources map ``_get_service_translations``
+    returns — so ``_process_services`` consumes either source unchanged. Only
+    ``domain`` is threaded to the component (an exact match, identical semantics
+    on both sides); ``query`` is deliberately NOT forwarded, even though the
+    component also accepts a coarse ``query`` filter, because that coarse pass
+    can drop a domain from the payload ENTIRELY when nothing under it matches
+    anywhere (name/description/translation) — but ``_process_services``'s
+    ``domains`` field is populated purely from ``domain_filter`` (every domain
+    that passes it, independent of ``query_filter``), so a query-trimmed payload
+    would silently omit domains legacy still lists. Skipping ``query`` on the
+    wire keeps ``_process_services`` doing 100% of the query filtering over an
+    identical (domain-filtered only) catalog either way, so the output — the
+    ``domains`` field included — is byte-identical to legacy in every case, not
+    just when a query happens not to trigger the drop. ``None`` on capability
+    miss, downgrade (``unknown_command`` → invalidate the cached caps), or
+    command error/timeout (logged) — the caller falls back to the legacy REST +
+    WS translations fetch.
+
+    Per the uniform transport-fallback taxonomy, a connection-establishment
+    failure IS caught here and mapped to ``None`` (legacy fallback), like every
+    component fetch helper. This tool's legacy path is the REST ``get_services()`` +
+    a per-request WS bridge for translations, NOT the shared pooled WS — so a WS
+    outage must not kill the tool when REST can still serve the catalog. The
+    catch stays broad so no unexpected fault escapes and kills the tool; routing
+    any
+    non-command component failure back to the REST catalog fetch is safe here
+    (mirrors ``get_component_caps``' own broad-catch precedent).
+    """
+    caps = await get_component_caps(client)
+    if not component_supports(caps, "services_list"):
+        return None
+    kwargs: dict[str, Any] = {"language": "en"}
+    if domain is not None:
+        kwargs["domain"] = domain
+    try:
+        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        raw = await ws.send_command(WS_SERVICES_LIST, **kwargs)
+    except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
+        if is_unknown_command(exc):
+            invalidate_caps(client)
+        else:
+            logger.warning("%s failed; fell back to legacy: %r", WS_SERVICES_LIST, exc)
+        return None
+    except Exception as exc:
+        # DEVIATION (see docstring): the legacy path is REST + a per-request WS
+        # bridge, NOT the shared pooled WS. A pooled-WS drop or a failed
+        # (re)connect, both HomeAssistantConnectionError since #1947, must fall
+        # back to REST rather than kill the tool.
+        logger.warning(
+            "%s connection error; falling back to REST legacy: %r",
+            WS_SERVICES_LIST,
+            exc,
+        )
+        return None
+    result = raw.get("result")
+    if (
+        not isinstance(result, dict)
+        or not isinstance(result.get("services"), list)
+        or not isinstance(result.get("translations"), dict)
+    ):
+        logger.debug(
+            "%s returned a malformed result (services/translations wrong shape); "
+            "falling back to legacy",
+            WS_SERVICES_LIST,
+        )
+        return None
+    return result
+
+
+async def _get_service_translations(
+    client: Any, warnings: list[str] | None = None
+) -> dict[str, Any]:
     """
     Get service translations from Home Assistant via WebSocket.
 
@@ -97,15 +359,30 @@ async def _get_service_translations(client: Any) -> dict[str, Any]:
             }
         )
 
-        if response.get("success") and response.get("result"):
+        if (
+            isinstance(response, dict)
+            and response.get("success")
+            and response.get("result")
+        ):
             result = response["result"]
             if isinstance(result, dict):
                 resources: dict[str, Any] = result.get("resources", {})
                 return resources
         return {}
 
-    except Exception as e:
+    except (
+        HomeAssistantConnectionError,
+        HomeAssistantAPIError,
+        HomeAssistantAuthError,
+        TimeoutError,
+        OSError,
+    ) as e:
         logger.warning(f"Failed to get service translations: {e}")
+        # An empty map is also what an instance with no translations returns,
+        # so a caller that wants to tell the two apart passes ``warnings``
+        # and reports that the catalog came back without descriptions (#1947).
+        if warnings is not None:
+            warnings.append(f"service descriptions unavailable: {e}")
         return {}
 
 
@@ -114,6 +391,9 @@ def _process_services(
     translations: dict[str, Any],
     domain_filter: str | None = None,
     query_filter: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    detail_level: Literal["summary", "full"] = "summary",
 ) -> dict[str, Any]:
     """
     Process raw service data into structured output.
@@ -123,9 +403,12 @@ def _process_services(
         translations: Service translations from WebSocket
         domain_filter: Optional domain to filter by
         query_filter: Optional search query
+        limit: Maximum number of services per page
+        offset: Number of services to skip
+        detail_level: 'summary' or 'full'
 
     Returns:
-        Processed service dictionary
+        Processed service dictionary with pagination metadata
     """
     services: dict[str, dict[str, Any]] = {}
     domains_seen: set[str] = set()
@@ -141,13 +424,16 @@ def _process_services(
             for domain, data in rest_services.items()
         ]
     else:
-        return {
-            "success": False,
-            "error": "Unexpected service data format",
-            "services": {},
-            "domains": [],
-            "total_count": 0,
-        }
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.INTERNAL_UNEXPECTED,
+                "Unexpected service data format",
+                suggestions=[
+                    "Retry the request — this may be a transient issue",
+                    "Check Home Assistant is running and responding correctly",
+                ],
+            )
+        )
 
     query_lower = query_filter.lower() if query_filter else None
 
@@ -165,57 +451,85 @@ def _process_services(
 
         for service_name, service_def in domain_services.items():
             service_key = f"{domain}.{service_name}"
-
-            # Get translations for this service
-            translation_key = f"component.{domain}.services.{service_name}"
-            service_trans = translations.get(translation_key, {})
-
-            # Build service description
-            name = service_trans.get("name", service_name.replace("_", " ").title())
-            description = service_trans.get(
-                "description",
-                service_def.get("description", ""),
+            entry = _build_service_entry(
+                domain,
+                service_name,
+                service_def,
+                translations,
+                query_lower,
+                detail_level,
             )
-
-            # Apply query filter
-            if query_lower:
-                searchable = f"{service_key} {name} {description}".lower()
-                if query_lower not in searchable:
-                    continue
-
-            # Process fields/parameters
-            fields = _process_service_fields(
-                service_def.get("fields", {}),
-                service_trans.get("fields", {}),
-            )
-
-            # Build service entry
-            services[service_key] = {
-                "name": name,
-                "description": description,
-                "domain": domain,
-                "service": service_name,
-                "fields": fields,
-            }
-
-            # Add target only if present
-            target = service_def.get("target")
-            if target is not None:
-                services[service_key]["target"] = target
+            if entry is not None:
+                services[service_key] = entry
 
     # Sort domains alphabetically
     sorted_domains = sorted(domains_seen)
 
+    # Apply pagination to the collected services
+    all_keys = list(services.keys())
+    total_count = len(all_keys)
+    paginated_keys = all_keys[offset : offset + limit]
+    paginated_services = {k: services[k] for k in paginated_keys}
+
     return {
         "success": True,
         "domains": sorted_domains,
-        "services": services,
-        "total_count": len(services),
+        "services": paginated_services,
+        **build_pagination_metadata(
+            total_count, offset, limit, len(paginated_services)
+        ),
+        "detail_level": detail_level,
         "filters_applied": {
             "domain": domain_filter,
             "query": query_filter,
         },
     }
+
+
+def _build_service_entry(
+    domain: str,
+    service_name: str,
+    service_def: dict[str, Any],
+    translations: dict[str, Any],
+    query_lower: str | None,
+    detail_level: Literal["summary", "full"],
+) -> dict[str, Any] | None:
+    """Build a single service entry, returning None if it doesn't match the query."""
+    translation_key = f"component.{domain}.services.{service_name}"
+    service_trans = translations.get(translation_key, {})
+
+    name = service_trans.get("name", service_name.replace("_", " ").title())
+    description = service_trans.get(
+        "description",
+        service_def.get("description", ""),
+    )
+
+    # Apply query filter
+    if query_lower:
+        searchable = f"{domain}.{service_name} {name} {description}".lower()
+        if query_lower not in searchable:
+            return None
+
+    entry: dict[str, Any] = {
+        "name": name,
+        "description": description,
+        "domain": domain,
+        "service": service_name,
+    }
+
+    # Include full field schemas only in 'full' detail mode
+    if detail_level == "full":
+        entry["fields"] = _process_service_fields(
+            service_def.get("fields", {}),
+            service_trans.get("fields", {}),
+        )
+
+    # Add target only if present
+    target = service_def.get("target")
+    if target is not None:
+        entry["target"] = target
+
+    return entry
 
 
 def _process_service_fields(
@@ -263,6 +577,24 @@ def _process_service_fields(
     return processed
 
 
+_SIMPLE_SELECTOR_TYPES: dict[str, str] = {
+    "boolean": "boolean",
+    "text": "text",
+    "target": "target (entity/area/device)",
+    "time": "time",
+    "date": "date",
+    "datetime": "datetime",
+    "color_temp": "color_temp_kelvin",
+    "color_temp_kelvin": "color_temp_kelvin",
+    "color_rgb": "color_rgb",
+    "object": "object",
+    "template": "template",
+    "area": "area",
+    "device": "device",
+    "duration": "duration",
+}
+
+
 def _get_field_type(selector: dict[str, Any]) -> str:
     """
     Determine field type from selector definition.
@@ -276,73 +608,17 @@ def _get_field_type(selector: dict[str, Any]) -> str:
     if not selector:
         return "any"
 
-    # Check for common selector types
+    for key, type_name in _SIMPLE_SELECTOR_TYPES.items():
+        if key in selector:
+            return type_name
     if "number" in selector:
-        num_sel = selector["number"]
-        if isinstance(num_sel, dict) and "min" in num_sel and "max" in num_sel:
-            return f"number ({num_sel['min']}-{num_sel['max']})"
-        return "number"
-
-    if "boolean" in selector:
-        return "boolean"
-
-    if "text" in selector:
-        return "text"
+        return _get_number_type(selector["number"])
 
     if "select" in selector:
-        select_sel = selector["select"]
-        if isinstance(select_sel, dict):
-            options = select_sel.get("options", [])
-            if options and len(options) <= 5:
-                # Show options inline for small lists
-                option_values = [
-                    opt.get("value", opt) if isinstance(opt, dict) else opt
-                    for opt in options
-                ]
-                return f"select ({', '.join(str(v) for v in option_values)})"
-        return "select"
+        return _get_select_type(selector["select"])
 
     if "entity" in selector:
-        entity_sel = selector["entity"]
-        if isinstance(entity_sel, dict) and "domain" in entity_sel:
-            domains = entity_sel["domain"]
-            if isinstance(domains, list):
-                return f"entity ({', '.join(domains)})"
-            return f"entity ({domains})"
-        return "entity"
-
-    if "target" in selector:
-        return "target (entity/area/device)"
-
-    if "time" in selector:
-        return "time"
-
-    if "date" in selector:
-        return "date"
-
-    if "datetime" in selector:
-        return "datetime"
-
-    if "color_temp" in selector:
-        return "color_temp"
-
-    if "color_rgb" in selector:
-        return "color_rgb"
-
-    if "object" in selector:
-        return "object"
-
-    if "template" in selector:
-        return "template"
-
-    if "area" in selector:
-        return "area"
-
-    if "device" in selector:
-        return "device"
-
-    if "duration" in selector:
-        return "duration"
+        return _get_entity_type(selector["entity"])
 
     # Return the first key as type name
     selector_types = list(selector.keys())
@@ -350,3 +626,33 @@ def _get_field_type(selector: dict[str, Any]) -> str:
         return selector_types[0]
 
     return "any"
+
+
+def _get_number_type(num_sel: Any) -> str:
+    """Format number selector type with optional range."""
+    if isinstance(num_sel, dict) and "min" in num_sel and "max" in num_sel:
+        return f"number ({num_sel['min']}-{num_sel['max']})"
+    return "number"
+
+
+def _get_select_type(select_sel: Any) -> str:
+    """Format select selector type with inline options for small lists."""
+    if isinstance(select_sel, dict):
+        options = select_sel.get("options", [])
+        if options and len(options) <= 5:
+            option_values = [
+                opt.get("value", opt) if isinstance(opt, dict) else opt
+                for opt in options
+            ]
+            return f"select ({', '.join(str(v) for v in option_values)})"
+    return "select"
+
+
+def _get_entity_type(entity_sel: Any) -> str:
+    """Format entity selector type with domain constraint."""
+    if isinstance(entity_sel, dict) and "domain" in entity_sel:
+        domains = entity_sel["domain"]
+        if isinstance(domains, list):
+            return f"entity ({', '.join(domains)})"
+        return f"entity ({domains})"
+    return "entity"

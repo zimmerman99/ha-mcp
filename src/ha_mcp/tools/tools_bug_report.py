@@ -5,65 +5,193 @@ This module provides a tool to collect diagnostic information and guide users
 on how to create effective bug reports.
 """
 
+import asyncio
+import importlib
+import importlib.metadata
+import importlib.util
 import logging
 import os
 import platform
+import re
 import sys
+import time
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote_plus
 
+import httpx
+from fastmcp import Context
+from fastmcp.tools import tool
 from pydantic import Field
 
 from ha_mcp import __version__
 
-from ..utils.usage_logger import AVG_LOG_ENTRIES_PER_TOOL, get_recent_logs, get_startup_logs
-from .helpers import log_tool_usage
+from .._version import get_version, is_embedded, is_running_in_addon
+from ..client.supervisor_client import make_supervisor_httpx_client
+from ..config import Settings, get_global_settings
+from ..utils.usage_logger import (
+    AVG_LOG_ENTRIES_PER_TOOL,
+    get_recent_logs,
+    get_startup_logs,
+)
+from .component_api import get_component_caps
+from .helpers import log_tool_usage, register_tool_methods
+from .util_helpers import ANSI_ESCAPE_RE, JSON_STRING_COERCION, project_fields
 
 logger = logging.getLogger(__name__)
 
 # GitHub issue template URLs
-RUNTIME_BUG_URL = "https://github.com/homeassistant-ai/ha-mcp/issues/new?template=runtime_bug.yml"
-AGENT_BEHAVIOR_URL = "https://github.com/homeassistant-ai/ha-mcp/issues/new?template=agent_behavior.yml"
+RUNTIME_BUG_URL = (
+    "https://github.com/homeassistant-ai/ha-mcp/issues/new?template=runtime_bug.yml"
+)
+AGENT_BEHAVIOR_URL = (
+    "https://github.com/homeassistant-ai/ha-mcp/issues/new?template=agent_behavior.yml"
+)
+
+# Guidance surfaced when the reported problem is a tool that never shows up in
+# the client's tool list. In issue #1804 this produced a false bug report: the
+# tool was enabled and loaded server-side (startup logs even said so), but the
+# MCP client had never refreshed its cached tool list, so the agent concluded
+# it was a server bug. A stale client-side tool list is the single most likely
+# cause of a missing tool and must be ruled out before filing.
+MISSING_TOOL_HINT = (
+    "MISSING/UNAVAILABLE TOOL? If the problem is that a tool you expected is not "
+    "in your tool list (can't find it, can't call it), this is very likely NOT a "
+    "bug. MCP clients cache the tool list when they connect and do NOT pick up "
+    "newly enabled tools until the connection is refreshed. Server-side logs "
+    "saying a tool is 'enabled' do NOT mean the client has loaded it. Ask the "
+    "user to refresh their MCP connection first: in Claude Desktop / claude.ai "
+    "use the connector's refresh option, or simply disconnect and reconnect it; "
+    "in Claude Code run /mcp and reconnect the server. Only file a bug if the "
+    "tool is still missing after a refresh."
+)
+
+# Max characters to include from addon container logs.
+# 3000 chars ≈ 750 LLM tokens — keeps the tool response well below context budgets
+# while still capturing enough recent output to diagnose most issues.
+_ADDON_LOG_MAX_CHARS = 3000
+
+# Max characters to include from the Home Assistant error log (home-assistant.log).
+# Slightly larger than the addon cap: this log carries the highest-value
+# diagnostic lines (auth failures, integration tracebacks) and the recent tail
+# is where they land. ~5000 chars ≈ 1250 LLM tokens.
+_CORE_LOG_MAX_CHARS = 5000
+
+# IPv4 sanitization: only redact addresses with strong network context so that
+# four-segment version strings (e.g. "ha-mcp version 1.2.3.4") are preserved.
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_IPV4 = rf"(?:{_IPV4_OCTET}\.){{3}}{_IPV4_OCTET}"
+# IP followed by :port or /CIDR — always a network address, never a version.
+_IPV4_WITH_PORT_OR_CIDR_RE = re.compile(rf"\b{_IPV4}(?::\d+|/\d{{1,2}})\b(?!\.\d)")
+# IP preceded by a network keyword (from, to, host=, addr=, etc.).
+_IPV4_AFTER_KEYWORD_RE = re.compile(
+    rf"\b((?:from|to|host|hostname|addr|address|ip|src|dst|server|client|peer|via)\b\s*[=:]?\s*){_IPV4}\b(?!\.\d)",
+    re.IGNORECASE,
+)
+# IP appearing inside a URL (`scheme://1.2.3.4...`).
+_IPV4_IN_URL_RE = re.compile(rf"(://){_IPV4}\b(?!\.\d)")
 
 
 def _detect_installation_method() -> str:
     """
     Detect how ha-mcp was installed.
 
-    Returns one of: pyinstaller, addon, docker, git, pypi, unknown
+    Returns one of: pyinstaller, embedded, addon, docker, git, pypi, unknown
     """
     # 1. PyInstaller binary
     if getattr(sys, "frozen", False):
         return "pyinstaller"
 
-    # 2. Home Assistant Add-on (has supervisor token)
-    if os.environ.get("SUPERVISOR_TOKEN"):
+    # 2. In-process server inside HA core (the ha_mcp_tools custom
+    #    component's "server" entry). Checked BEFORE the docker probe: the
+    #    HA core container carries /.dockerenv, so without this branch
+    #    embedded installs misreport as plain docker.
+    if is_embedded():
+        return "embedded"
+
+    # 3. Home Assistant Add-on (has supervisor token)
+    if is_running_in_addon():
         return "addon"
 
-    # 3. Docker container (non-addon)
+    # 4. Docker container (non-addon)
     if Path("/.dockerenv").exists():
         return "docker"
 
-    # 4. Git clone - check for .git directory relative to package
+    # 5. Git clone - check for .git directory relative to package
     try:
         # Go up from tools_bug_report.py -> tools -> ha_mcp -> src -> project_root
         project_root = Path(__file__).parent.parent.parent.parent
         if (project_root / ".git").exists():
             return "git"
     except Exception:
+        # Best-effort probe: path resolution may fail in unusual layouts;
+        # fall through to the next detection heuristic.
         pass
 
-    # 5. PyPI install - marker file exists in package
+    # 6. PyPI install - marker file exists in package
     try:
         marker_path = Path(__file__).parent.parent / "_pypi_marker"
         if marker_path.exists():
             return "pypi"
     except Exception:
+        # Best-effort probe: marker lookup may fail in unusual layouts;
+        # fall through to the default "unknown" result.
         pass
 
-    # 6. Default - unknown
+    # 7. Default - unknown
     return "unknown"
+
+
+def _detect_installed_version() -> str | None:
+    """Return the ha-mcp version installed ON DISK right now.
+
+    ``__version__`` is frozen when the process first imports ha_mcp, so after
+    an in-place update the running process keeps reporting the old version
+    while the disk already carries the new one. Reporting both (plus
+    ``version_mismatch``) turns a "which server am I talking to" hunt into a
+    single tool call.
+    """
+    try:
+        importlib.invalidate_caches()
+        return get_version()
+    except Exception as e:
+        logger.info("Installed-version probe failed: %s", e)
+        return None
+
+
+def _instance_identity() -> dict[str, Any]:
+    """Return process identity (id, start time, uptime).
+
+    Mirrors the ``/api/settings/info`` fields so a report and the web UI can
+    be matched to the same (or different) server process.
+    """
+    from ..settings_ui import _PROCESS_INSTANCE_ID, _PROCESS_STARTED_AT
+
+    return {
+        "instance_id": _PROCESS_INSTANCE_ID,
+        "started_at": _PROCESS_STARTED_AT,
+        "uptime_seconds": round(time.time() - _PROCESS_STARTED_AT, 1),
+    }
+
+
+def _format_version_value(diagnostic_info: dict[str, Any]) -> str:
+    """Render the version for report surfaces, flagging a stale worker.
+
+    A failed installed-version probe must stay distinguishable from
+    "checked, versions match" — otherwise the exact stale-worker
+    condition this field exists to expose disappears whenever the probe
+    itself hiccups.
+    """
+    running = diagnostic_info.get("ha_mcp_version", "Unknown")
+    installed = diagnostic_info.get("installed_version")
+    if diagnostic_info.get("version_mismatch"):
+        return (
+            f"{running} (running) — {installed} is installed; "
+            "restart to finish applying the update"
+        )
+    if installed is None:
+        return f"{running} (installed-on-disk version could not be verified)"
+    return str(running)
 
 
 def _detect_platform() -> dict[str, str]:
@@ -77,19 +205,650 @@ def _detect_platform() -> dict[str, str]:
     }
 
 
-def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register bug report tools with the MCP server."""
+def _format_websockets_dependency_value(diagnostic_info: dict[str, Any]) -> str:
+    """Render the websockets probe for the human-pasteable report.
 
-    @mcp.tool(
+    Mirrors the sibling ``_format_*_value`` helpers: a degraded probe stays
+    visibly degraded instead of disappearing — for the #2135/#2146 failure
+    class this line IS the diagnosis, so it must survive into the report a
+    user pastes.
+    """
+    state = diagnostic_info.get("websockets_dependency") or {}
+    if not state:
+        return "not probed"
+    if state.get("vendored_import_ok"):
+        value = f"vendored {state.get('vendored_version') or 'unknown'}"
+        if state.get("vendored_c_speedups") is False:
+            value += " (pure-Python)"
+    else:
+        value = (
+            f"vendored BROKEN: {state.get('vendored_import_error', 'import failed')}"
+        )
+    if (error := state.get("shared_metadata_error")) is not None:
+        shared = f"metadata unreadable: {error}"
+    elif (version := state.get("shared_metadata_version")) is not None:
+        shared = f"{version} per dist metadata"
+    else:
+        shared = "absent"
+    return f"{value} | shared env copy: {shared}"
+
+
+def _websockets_dependency_state() -> dict[str, Any]:
+    """Report the vendored websockets copy plus the shared copy's state.
+
+    ha-mcp runs on its private ``ha_mcp._vendor.websockets``, immune to the
+    shared site-packages copy that ~20 HA integration libraries contend
+    over (#2135/#2146). The vendored version proves what the server
+    actually runs; the shared copy's metadata version is ecosystem context
+    for triage (a torn shared copy no longer affects ha-mcp, but still
+    breaks the integrations that use it). Any probe failure is captured as
+    data — the bug-report path itself must never break on a broken
+    dependency.
+    """
+    state: dict[str, Any] = {}
+    try:
+        vendored = importlib.import_module("ha_mcp._vendor.websockets")
+        importlib.import_module("ha_mcp._vendor.websockets.asyncio.client")
+        state["vendored_version"] = getattr(vendored, "__version__", "Unknown")
+        state["vendored_import_ok"] = True
+    except Exception as e:
+        state["vendored_version"] = None
+        state["vendored_import_ok"] = False
+        state["vendored_import_error"] = f"{type(e).__name__}: {e}"
+    # Whether the vendored copy has its optional C accelerator. The vendor
+    # sync ships pure Python only (scripts/vendor_websockets.py strips the
+    # compiled extension), so this answers "did vendoring cost throughput?"
+    # without the reporter having to guess.
+    state["vendored_c_speedups"] = (
+        importlib.util.find_spec("ha_mcp._vendor.websockets.speedups") is not None
+    )
+    # Shared-copy context for triage, read from DIST METADATA only: ha-mcp
+    # never imports the shared copy, and probing it by import would mean
+    # touching the contested package this whole design avoids. Absent and
+    # unreadable are reported distinctly — collapsing a corrupt install into
+    # "absent" would read as a clean environment during exactly the failure
+    # class this field exists for.
+    try:
+        state["shared_metadata_version"] = importlib.metadata.version("websockets")
+    except importlib.metadata.PackageNotFoundError:
+        state["shared_metadata_version"] = None
+    except Exception as e:
+        state["shared_metadata_version"] = None
+        state["shared_metadata_error"] = f"{type(e).__name__}: {e}"
+    return state
+
+
+# Tool-surface-shaping toggles surfaced in bug reports. The set is small on
+# purpose: only flags that materially change which tools the agent sees, since
+# the same bug report behaves very differently depending on these. New
+# tool-shaping toggles should be added here so triage doesn't have to ask.
+#
+# ``enable_beta_features`` leads the list because it is the master gate: when
+# off it force-disables every beta sub-flag (filesystem tools, code mode, YAML
+# editing, ...) regardless of the sub-flag's own value, so a "missing tool"
+# report is meaningless without it. ``enable_filesystem_tools`` is a beta-gated
+# tool family from issue #1804 — surfacing it lets triage see at a glance whether
+# the tool the user couldn't find was even enabled server-side.
+_CONFIG_TOGGLE_FIELDS: tuple[str, ...] = (
+    "enable_beta_features",
+    "enable_websocket",
+    "enable_dashboard_partial_tools",
+    "enable_tool_search",
+    "tool_search_max_results",
+    "enable_yaml_config_editing",
+    "enable_filesystem_tools",
+    "enable_code_mode",
+    "enabled_tool_modules",
+)
+
+
+def _get_config_toggles(settings: Settings | None = None) -> dict[str, Any]:
+    """Read tool-surface-shaping config toggles from Settings.
+
+    Defaults to the global settings singleton; tests can pass a fake Settings
+    instance instead. Returns an empty dict on any failure (Settings
+    construction, attribute coercion, list-field split) so a misconfigured
+    environment can't break the bug report path itself.
+    """
+    try:
+        s = settings if settings is not None else get_global_settings()
+
+        toggles: dict[str, Any] = {}
+        for field in _CONFIG_TOGGLE_FIELDS:
+            value = getattr(s, field, None)
+            if value is None:
+                continue
+            toggles[field] = value
+
+        # Summarize list-shaped seeds as counts rather than dumping the full
+        # strings — they can be very long, and listing the exact tools the
+        # user disabled isn't useful for triage.
+        for list_field in ("disabled_tools", "pinned_tools"):
+            raw = getattr(s, list_field, "") or ""
+            count = len([item for item in raw.split(",") if item.strip()])
+            toggles[f"{list_field}_count"] = count
+
+        return toggles
+    except Exception as e:
+        logger.warning(
+            "Failed to read settings for bug report toggles: %s (%s)",
+            e,
+            type(e).__name__,
+        )
+        return {}
+
+
+def _extract_client_info(ctx: Context | None) -> dict[str, str]:
+    """Pull the connecting MCP client's self-identification off the request context.
+
+    The MCP ``initialize`` handshake carries a ``clientInfo`` Implementation
+    object (``name``/``version``/optional ``title``). FastMCP exposes the
+    underlying server session as ``ctx.session``; the MCP SDK's
+    ``ServerSession`` keeps the parsed initialize params on ``client_params``.
+    The attribute name on the parsed Pydantic model is ``clientInfo`` in
+    ``mcp`` 1.24.x (the version this project pins) — we also fall back to
+    ``client_info`` to stay forward-compatible with SDK versions that switch
+    to snake_case.
+
+    Returns ``{"name": ..., "version": ..., "title": ...}``. ``name`` and
+    ``version`` fall back to ``"unknown"`` when the client didn't send them;
+    ``title`` falls back to the empty string so callers can distinguish "not
+    sent" from a real title without false-positive aside rendering.
+
+    Returns an empty dict if no context is available (tool invoked outside an
+    MCP request, e.g. unit tests) so the bug-report path stays robust. The
+    log level is intentionally INFO, not DEBUG: this catch is the only signal
+    we'd get if FastMCP/MCP SDK shape drifts in a future release, and silent
+    drift would hide a regression for months.
+    """
+    if ctx is None:
+        return {}
+    try:
+        session = getattr(ctx, "session", None)
+        params = (
+            getattr(session, "client_params", None) if session is not None else None
+        )
+        if params is None:
+            return {}
+        # Try the camelCase attribute (mcp 1.24.x) first, then snake_case so
+        # we keep working if the SDK switches the alias direction.
+        client = getattr(params, "clientInfo", None) or getattr(
+            params, "client_info", None
+        )
+        if client is None:
+            return {}
+        return {
+            "name": getattr(client, "name", None) or "unknown",
+            "version": getattr(client, "version", None) or "unknown",
+            "title": getattr(client, "title", None) or "",
+        }
+    except Exception as e:
+        logger.info(
+            "Failed to read MCP client info from context: %s (%s)",
+            e,
+            type(e).__name__,
+        )
+        return {}
+
+
+def _format_client_info_for_template(info: dict[str, str]) -> str:
+    """Render the MCP client identification as a single human-readable line.
+
+    Falls back to ``unknown (client did not advertise itself)`` when no
+    client info was available — this happens for direct MCP clients that
+    skip the optional ``clientInfo`` field, or when the bug report tool
+    runs outside a live request. Phrasing is deliberately observable
+    rather than naming the underlying API field (which may be renamed).
+    """
+    if not info:
+        return "unknown (client did not advertise itself)"
+    name = info.get("name") or "unknown"
+    version = info.get("version") or "unknown"
+    title = info.get("title") or ""
+    base = f"{name} {version}"
+    if title and title != name:
+        return f"{base} _(advertised title: {title})_"
+    return base
+
+
+def _detect_mcp_transport() -> str:
+    """Best-effort MCP transport detection.
+
+    Returns ``stdio`` / ``http`` / ``sse`` / ``unknown``. We can't observe the
+    transport perfectly from a tool call, so we look at the entrypoint name
+    and well-known env hints. The result is informational — the bug template
+    surfaces it as an auto-detect that the agent or user can override.
+
+    ha-mcp ships no SSE entry point, so ``sse`` only appears when an operator
+    drives fastmcp's own deprecated SSE transport via ``FASTMCP_TRANSPORT`` —
+    worth surfacing in a report, since that run shape is unsupported.
+    """
+    # Entry-point script name (e.g. ``ha-mcp-web`` for HTTP;
+    # pyproject.toml's [project.scripts] is the source of truth).
+    argv0 = (sys.argv[0] if sys.argv else "").lower()
+    basename = os.path.basename(argv0)
+    if basename.endswith("-web"):
+        return "http"
+
+    # Env hints set by HTTP wrappers / supervisors. ``streamable-http`` is the
+    # documented FastMCP variant; collapse it to ``http`` since the
+    # distinction doesn't change triage decisions.
+    transport_env = os.environ.get("FASTMCP_TRANSPORT", "").strip().lower()
+    if transport_env in {"http", "stdio", "sse"}:
+        return transport_env
+    if transport_env == "streamable-http":
+        return "http"
+    if os.environ.get("MCP_HTTP_PORT") or os.environ.get("FASTMCP_PORT"):
+        return "http"
+
+    # Home Assistant add-on always runs HTTP via homeassistant-addon/start.py.
+    # Placed after the explicit hints (argv0 / env) so an operator override
+    # still wins, but before the stdin-isatty fallback because Supervisor-
+    # launched containers have no TTY on stdin and would otherwise be
+    # mislabeled stdio.
+    if is_running_in_addon():
+        return "http"
+
+    # If stdin is piped (not a TTY), ha-mcp was launched by an MCP host on
+    # stdio. If it IS a TTY, this is a manual / interactive run with no
+    # other transport hints — fall through to ``unknown``.
+    try:
+        if not sys.stdin.isatty():
+            return "stdio"
+    except (AttributeError, OSError, ValueError):
+        # ``sys.stdin`` can be None or detached (pythonw, daemonized
+        # contexts, certain test harnesses). Treat as no signal.
+        pass
+
+    return "unknown"
+
+
+def _sanitize_log_text(text: str) -> str:
+    """Best-effort secret scrubber for log text.
+
+    Defense-in-depth, not exhaustive — bug reports still pass through human
+    review (see ``_generate_anonymization_guide``). Rules cover the most common
+    leak shapes seen in HA add-on logs:
+    JWTs, bearer tokens, long hex tokens, ``key=value`` style credentials,
+    URL userinfo, IPv4 addresses with network context, and the MCP connect-URL
+    secret path (the add-on's LAN auth).
+    """
+    # JWT tokens (header.payload.signature)
+    text = re.sub(
+        r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+        "[REDACTED_JWT]",
+        text,
+    )
+    # Bearer tokens — match any casing (BEARER, Bearer, bearer, BeArEr, …)
+    # via re.IGNORECASE, but preserve the original casing in the output by
+    # echoing m.group(1) back through the lambda.
+    text = re.sub(
+        r"\b(bearer)\s+\S+",
+        lambda m: f"{m.group(1)} [REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Generic key=value credentials (api_key, token, secret, password, etc.).
+    # Negative lookbehind for a letter so OPENAI_API_KEY=... still matches
+    # (underscore is a word-char, so \b doesn't fire there).
+    # "authorization" is intentionally omitted — the Bearer rule above already
+    # handles "Authorization: Bearer ..." and overlapping rules double-tap.
+    text = re.sub(
+        r"(?<![A-Za-z])(api[_-]?key|access[_-]?key|secret[_-]?key|token|secret|password|passwd)\b(\s*[:=]\s*)\S+",
+        r"\1\2[REDACTED]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # URL userinfo: scheme://user:password@host -> scheme://user:[REDACTED]@host
+    text = re.sub(
+        r"([a-zA-Z][a-zA-Z0-9+.-]*://)([^:/?#\s@]+):([^@/\s]+)@",
+        r"\1\2:[REDACTED]@",
+        text,
+    )
+    # Long hex strings (API keys, tokens) - 32+ contiguous hex chars
+    text = re.sub(
+        r"(?<![a-fA-F0-9])[a-fA-F0-9]{32,}(?![a-fA-F0-9])",
+        "[REDACTED_HEX]",
+        text,
+    )
+    # IPv4 addresses — only when there's strong network context, so that
+    # four-segment version strings (e.g. "version 1.2.3.4") survive intact.
+    text = _IPV4_WITH_PORT_OR_CIDR_RE.sub("[IP]", text)
+    text = _IPV4_IN_URL_RE.sub(r"\1[IP]", text)
+    text = _IPV4_AFTER_KEYWORD_RE.sub(r"\1[IP]", text)
+    # MCP connect-URL secret path — the add-on's LAN auth. Redact by the
+    # configured value (catches custom paths) and the generated
+    # ``/private_<token>`` convention. Only bug-report output is scrubbed here;
+    # the raw logs this text is copied from are left intact.
+    # The dedicated settings-UI secret path (OAuth/OIDC) is a second secret whose
+    # leak grants the same unauthenticated settings access, so redact a custom
+    # value the same way. The auto-generated /private_<token> form is caught by
+    # the generic pattern below.
+    for env_name in ("MCP_SECRET_PATH", "MCP_SETTINGS_SECRET_PATH"):
+        # Strip before rstrip: the resolver strips MCP_SETTINGS_SECRET_PATH before
+        # mounting, so a whitespace-bearing value mounts at the stripped path — the
+        # redaction pattern must match that, not the raw value (GHSA-mx64-982r-65vg).
+        configured = os.getenv(env_name, "").strip().rstrip("/")
+        if configured and configured != "/mcp":
+            # Anchor on a path-segment boundary so a short/substring-prone
+            # configured value (e.g. "/ha") cannot corrupt unrelated text
+            # (e.g. "/happy").
+            text = re.sub(
+                re.escape(configured) + r"(?![A-Za-z0-9_-])",
+                "[REDACTED_SECRET_PATH]",
+                text,
+            )
+    text = re.sub(r"/private_[A-Za-z0-9_-]+", "[REDACTED_SECRET_PATH]", text)
+    return text
+
+
+async def _fetch_addon_logs() -> str:
+    """Fetch ha-mcp addon container logs via the Supervisor REST API.
+
+    Only works when running as a Home Assistant add-on (SUPERVISOR_TOKEN set).
+    Uses /addons/self/logs which resolves to the calling addon's own logs via
+    the Supervisor's per-addon token binding — no slug interpolation needed.
+
+    Direct httpx against ``http://supervisor`` is the documented add-on access
+    pattern: it uses the Supervisor token directly (no extra HA hop) and
+    preserves the ``self`` shortcut, which the WebSocket ``supervisor/api``
+    proxy used by other tools may not.
+
+    Returns sanitized log text (last _ADDON_LOG_MAX_CHARS chars, with a
+    truncation marker prepended when truncation occurs), or empty string on
+    failure.
+    """
+    # Redundant with the caller's `install_method == "addon"` gate, but kept
+    # as a defensive guard for any direct callers added later.
+    if not is_running_in_addon():
+        return ""
+
+    try:
+        async with make_supervisor_httpx_client(
+            timeout=10.0, verify=get_global_settings().verify_ssl
+        ) as http_client:
+            resp = await http_client.get("/addons/self/logs")
+            if resp.status_code != 200:
+                logger.info("Addon log fetch returned HTTP %s", resp.status_code)
+                return ""
+
+            # Strip ANSI escape codes first, then sanitize, then truncate.
+            # Sanitizing before truncating prevents secrets that straddle the
+            # truncation boundary from leaking through.
+            cleaned = ANSI_ESCAPE_RE.sub("", resp.text)
+            sanitized = _sanitize_log_text(cleaned)
+            if len(sanitized) > _ADDON_LOG_MAX_CHARS:
+                marker = (
+                    f"[...truncated, showing last {_ADDON_LOG_MAX_CHARS} of "
+                    f"{len(sanitized)} chars...]\n"
+                )
+                return marker + sanitized[-_ADDON_LOG_MAX_CHARS:]
+            return sanitized
+    except httpx.RequestError as e:
+        logger.warning(f"Failed to fetch addon logs: {e}")
+
+    return ""
+
+
+async def _fetch_core_error_log(client: Any) -> str:
+    """Fetch the Home Assistant error log (home-assistant.log) via the client.
+
+    Works on every install type — ``HomeAssistantClient.get_error_log`` routes
+    add-on installs to the Supervisor, supervised/HAOS to the hassio proxy, and
+    container/pip to ``/api/error_log``. Captured over REST, which stays up even
+    when the WebSocket path is failing; that is exactly the failure mode in
+    issue #1694, where the high-value auth lines
+    (``InsecureKeyLengthWarning``, "invalid authentication") only appeared in
+    home-assistant.log, not in the add-on log this tool already captured.
+
+    Best-effort: returns sanitized text (last ``_CORE_LOG_MAX_CHARS`` chars,
+    with a truncation marker prepended) or an empty string on any failure, so a
+    log-fetch problem never breaks the bug-report path.
+    """
+    try:
+        raw = await client.get_error_log()
+    except Exception as e:
+        # Broad by design — the bug-report path must stay robust whatever the
+        # client raises (auth, role, connection, transport). Logged at INFO so
+        # a missing error log is visible without alarming on a routine 403.
+        logger.info(
+            "Could not fetch HA error log for bug report: %s (%s)",
+            e,
+            type(e).__name__,
+        )
+        return ""
+
+    if not raw:
+        return ""
+
+    # Strip ANSI, then sanitize, then truncate — sanitizing before truncating
+    # keeps a secret straddling the cut boundary from leaking through.
+    sanitized = _sanitize_log_text(ANSI_ESCAPE_RE.sub("", raw))
+    if len(sanitized) > _CORE_LOG_MAX_CHARS:
+        marker = (
+            f"[...truncated, showing last {_CORE_LOG_MAX_CHARS} of "
+            f"{len(sanitized)} chars...]\n"
+        )
+        return marker + sanitized[-_CORE_LOG_MAX_CHARS:]
+    return sanitized
+
+
+def _format_tools_entry_value(diagnostic_info: dict[str, Any]) -> str:
+    """Render the File & YAML Tools entry status for the report templates."""
+    return diagnostic_info.get("tools_entry_status") or "unknown (probe failed)"
+
+
+def _format_server_entry_value(diagnostic_info: dict[str, Any]) -> str:
+    """Render the in-process server entry status for the report templates."""
+    return diagnostic_info.get("server_entry_status") or "unknown (probe failed)"
+
+
+# Entry titles assigned by the component's config flow (config_flow.py /
+# const.py in custom_components/ha_mcp_tools) — the server code cannot import
+# the separately-shipped component package, so the defaults are mirrored here.
+# "HA MCP Tools" is the pre-#1853 tools-entry title an unloaded legacy entry
+# may still carry. A user-renamed entry lands in the "unrecognized" bucket
+# rather than being misclassified.
+_SERVER_ENTRY_TITLE = "HA-MCP Server"
+_TOOLS_ENTRY_TITLES = frozenset({"HA-MCP File & YAML Tools", "HA MCP Tools"})
+
+
+def _classify_component_entries(
+    entries: list[Any],
+) -> tuple[list[str], list[str]]:
+    """Split ha_mcp_tools config entries into server-entry and unrecognized.
+
+    Tools-entry titles are dropped: their functional state comes from the
+    services probe (``_detect_tools_entry_status``), which sees whether the
+    entry actually serves, not just whether it exists.
+    """
+    server: list[str] = []
+    unrecognized: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        title = str(entry.get("title") or "untitled")
+        state = str(entry.get("state") or "unknown state")
+        if title == _SERVER_ENTRY_TITLE:
+            server.append(f"added ({state})")
+        elif title not in _TOOLS_ENTRY_TITLES:
+            unrecognized.append(f'"{title}" ({state})')
+    return server, unrecognized
+
+
+def _build_formatted_report(
+    diagnostic_info: dict[str, Any],
+    mcp_transport: str,
+    client_info: dict[str, str],
+    platform_info: dict[str, str],
+    config_toggles: dict[str, Any],
+    startup_logs: list[dict[str, Any]],
+    startup_log_summary: str,
+    recent_logs: list[dict[str, Any]],
+    log_summary: str,
+    addon_logs: str,
+    core_error_log: str,
+) -> str:
+    report_lines = [
+        "=== ha-mcp Bug Report Info ===",
+        "",
+        f"ha-mcp Version: {_format_version_value(diagnostic_info)}",
+        f"Custom Component: {diagnostic_info.get('component_version') or 'not detected (not installed, or probe failed)'}",
+        f"File & YAML Tools entry: {_format_tools_entry_value(diagnostic_info)}",
+        f"In-process Server entry: {_format_server_entry_value(diagnostic_info)}",
+        f"Installation Method: {diagnostic_info['installation_method']}",
+        f"MCP Transport: {mcp_transport}",
+        f"MCP Client: {_format_client_info_for_template(client_info)}",
+        f"Operating System: {platform_info['os']} {platform_info['os_release']} ({platform_info['architecture']})",
+        f"Python Version: {platform_info['python_version']}",
+        f"Home Assistant Version: {diagnostic_info['home_assistant_version']}",
+        f"Connection Status: {diagnostic_info['connection_status']}",
+        f"Entity Count: {diagnostic_info['entity_count']}",
+        f"websockets Dependency: {_format_websockets_dependency_value(diagnostic_info)}",
+    ]
+    if "location_name" in diagnostic_info:
+        report_lines.append(f"Location Name: {diagnostic_info['location_name']}")
+    if "time_zone" in diagnostic_info:
+        report_lines.append(f"Time Zone: {diagnostic_info['time_zone']}")
+    if config_toggles:
+        report_lines.extend(["", "=== ha-mcp Config Toggles ==="])
+        for key, value in config_toggles.items():
+            report_lines.append(f"  {key}: {value}")
+    if startup_logs:
+        report_lines.extend(
+            [
+                "",
+                f"=== Startup Logs ({len(startup_logs)} entries) ===",
+                startup_log_summary,
+            ]
+        )
+    if recent_logs:
+        report_lines.extend(
+            [
+                "",
+                f"=== Recent Tool Calls ({len(recent_logs)} entries) ===",
+                log_summary,
+            ]
+        )
+    if addon_logs:
+        report_lines.extend(["", "=== Add-on Container Logs ===", addon_logs])
+    if core_error_log:
+        report_lines.extend(["", "=== Home Assistant Error Log ===", core_error_log])
+    return "\n".join(report_lines)
+
+
+class BugReportTools:
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    async def _detect_component_version(self) -> str | None:
+        """Read the ha_mcp_tools custom component's version, best-effort.
+
+        Prefers the shared cached capability probe (``get_component_caps`` — one
+        ``ha_mcp_tools/info`` round-trip per client): a component new enough to
+        answer it (1.1.0+) reports its version there, so the report reuses that
+        cached probe instead of a bespoke round-trip. A component in the
+        0.11.0-1.1.0 band has services but no ``info`` command (caps is None),
+        so it falls back to the ``get_caller_token`` bootstrap service, whose
+        response also carries the manifest version. Returns None when the
+        component is not installed or the call fails — the report path must
+        never break on it.
+        """
+        # get_component_caps never raises (it caches/returns None on every
+        # failure mode), so no guard is needed around it.
+        caps = await get_component_caps(self._client)
+        if caps is not None:
+            return caps.component_version or None
+        try:
+            resp = await self._client.call_service(
+                "ha_mcp_tools", "get_caller_token", {}, return_response=True
+            )
+            payload = (
+                resp.get("service_response", resp) if isinstance(resp, dict) else {}
+            )
+            version = payload.get("version") if isinstance(payload, dict) else None
+            return str(version) if version else None
+        except Exception as e:
+            logger.info("Component version probe failed: %s", e)
+            return None
+
+    async def _detect_tools_entry_status(self) -> str | None:
+        """Describe the File & YAML Tools entry state for the report, best-effort.
+
+        The ``ha_mcp_tools`` services register only in that entry's setup, so
+        the service registry distinguishes "entry set up" from the #1996
+        state — integration installed but the second entry never added —
+        which the component version alone cannot show. Returns None when the
+        probe fails; the report path must never break on it.
+        """
+        from .tools_filesystem import _bootstrap_service_state
+
+        try:
+            domain_registered, bootstrap_registered = await _bootstrap_service_state(
+                self._client
+            )
+        except Exception as e:
+            logger.info("Tools-entry status probe failed: %s", e)
+            return None
+        if not domain_registered:
+            return (
+                "not set up — no ha_mcp_tools services registered; add the "
+                '"HA-MCP File & YAML Tools" entry via "Add entry" on the '
+                "HA-MCP Custom Component integration (or install the "
+                "component first)"
+            )
+        if not bootstrap_registered:
+            return "set up, but the component is pre-0.5.0 (update via HACS)"
+        return "set up (ha_mcp_tools services registered)"
+
+    async def _detect_server_entry_status(self) -> str | None:
+        """Describe the in-process "HA-MCP Server" entry state, best-effort.
+
+        Both parts of the custom component ship under the single
+        ``ha_mcp_tools`` domain, so "the component is installed" says nothing
+        about WHICH part is set up. The File & YAML tools part is covered by
+        the services probe; this one classifies the domain's config entries by
+        their flow-assigned titles to show whether the in-process server entry
+        exists — e.g. an add-on install that erroneously also added it (a
+        second, redundant server) becomes visible next to Installation Method.
+        Returns None when the probe fails; the report must never break on it.
+        """
+        try:
+            response = await self._client.send_websocket_message(
+                {"type": "config_entries/get", "domain": "ha_mcp_tools"}
+            )
+            if not isinstance(response, dict) or not response.get("success"):
+                return None
+            result = response.get("result")
+            if not isinstance(result, list):
+                return None
+        except Exception as e:
+            logger.info("Server-entry status probe failed: %s", e)
+            return None
+        server, unrecognized = _classify_component_entries(result)
+        if server:
+            return ", ".join(server)
+        if unrecognized:
+            # A renamed entry cannot be classified by title — report it
+            # rather than claiming the server entry is absent.
+            return "not identified — unrecognized ha_mcp_tools entries: " + ", ".join(
+                unrecognized
+            )
+        return "not added"
+
+    @tool(
+        name="ha_report_issue",
+        tags={"Utilities"},
         annotations={
+            "openWorldHint": False,
             "idempotentHint": True,
             "readOnlyHint": True,
-            "tags": ["system", "diagnostics", "feedback"],
             "title": "Report Issue or Feedback",
-        }
+        },
     )
     @log_tool_usage
     async def ha_report_issue(
+        self,
         tool_call_count: Annotated[
             int,
             Field(
@@ -104,9 +863,38 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 ),
             ),
         ] = 10,
+        fields: Annotated[
+            str | list[str] | None,
+            JSON_STRING_COERCION,
+            Field(
+                default=None,
+                description=(
+                    "Return only the specified top-level response keys — the "
+                    "full response (both templates + logs + diagnostics, with "
+                    "log content repeated across the raw keys and templates) "
+                    "is very large. "
+                    "None = full response. Typical for a runtime bug: "
+                    "'runtime_bug_template,suggested_title,"
+                    "runtime_bug_submit_url,duplicate_check_urls,"
+                    "anonymization_guide,instructions'; for agent feedback "
+                    "swap in agent_behavior_template and "
+                    "agent_behavior_submit_url. The templates already embed "
+                    "the relevant logs, so the raw log keys are only needed "
+                    "for your own analysis. "
+                    "Available keys: diagnostic_info, recent_logs, "
+                    "startup_logs, addon_logs, core_error_log, log_count, "
+                    "startup_log_count, formatted_report, "
+                    "runtime_bug_template, agent_behavior_template, "
+                    "anonymization_guide, suggested_title, "
+                    "runtime_bug_submit_url, agent_behavior_submit_url, "
+                    "duplicate_check_urls, missing_tool_hint, instructions."
+                ),
+            ),
+        ] = None,
+        ctx: Context | None = None,
     ) -> dict[str, Any]:
         """
-        Collect diagnostic information for filing issue reports or feedback.
+        Get diagnostic information and templates for filing issue reports or feedback.
 
         This tool generates templates for TWO types of reports:
         1. **Runtime Bug Report** - For ha-mcp errors, failures, unexpected behavior
@@ -136,16 +924,48 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - "That was inefficient"
 
         **OUTPUT:**
-        Returns both templates. Choose the appropriate one based on context.
+        Returns both templates plus diagnostic data. The full response is
+        LARGE (the captured logs appear in the raw log keys AND inside each
+        template) — pass fields=... to fetch only the keys you need once you
+        know which template applies. Key fields:
+        - `runtime_bug_template`, `agent_behavior_template` — pick based on context
+        - `recent_logs`, `startup_logs` — captured ha-mcp tool/server log entries
+        - `addon_logs` — addon container stdout/stderr (HA add-on installs only;
+          empty string otherwise)
+        - `core_error_log` — Home Assistant error log (home-assistant.log) over
+          REST; carries auth / integration errors that don't show in addon_logs
+        - `missing_tool_hint` — check this FIRST when the report is about a
+          missing/unavailable tool; a stale client tool list (not a bug) is the
+          usual cause, and refreshing the MCP connection is the fix
+        - `suggested_title`, `duplicate_check_urls`, `anonymization_guide`
         """
-        # Detect installation method and platform
+        # Detect installation method, platform, and runtime config.
         install_method = _detect_installation_method()
         platform_info = _detect_platform()
+        config_toggles = _get_config_toggles()
+        mcp_transport = _detect_mcp_transport()
+        client_info = _extract_client_info(ctx)
+        installed_version = await asyncio.to_thread(_detect_installed_version)
+        component_version = await self._detect_component_version()
+        tools_entry_status = await self._detect_tools_entry_status()
+        server_entry_status = await self._detect_server_entry_status()
 
         diagnostic_info: dict[str, Any] = {
             "ha_mcp_version": __version__,
+            "installed_version": installed_version,
+            "version_mismatch": bool(
+                installed_version and installed_version != __version__
+            ),
+            "component_version": component_version,
+            "tools_entry_status": tools_entry_status,
+            "server_entry_status": server_entry_status,
+            "instance": _instance_identity(),
             "installation_method": install_method,
             "platform": platform_info,
+            "websockets_dependency": _websockets_dependency_state(),
+            "mcp_transport": mcp_transport,
+            "mcp_client_info": client_info,
+            "config_toggles": config_toggles,
             "connection_status": "Unknown",
             "home_assistant_version": "Unknown",
             "entity_count": 0,
@@ -153,11 +973,9 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
         # Try to get Home Assistant config and connection status
         try:
-            config = await client.get_config()
+            config = await self._client.get_config()
             diagnostic_info["connection_status"] = "Connected"
-            diagnostic_info["home_assistant_version"] = config.get(
-                "version", "Unknown"
-            )
+            diagnostic_info["home_assistant_version"] = config.get("version", "Unknown")
             diagnostic_info["location_name"] = config.get("location_name", "Unknown")
             diagnostic_info["time_zone"] = config.get("time_zone", "Unknown")
         except Exception as e:
@@ -166,7 +984,7 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
         # Try to get entity count
         try:
-            states = await client.get_states()
+            states = await self._client.get_states()
             if states:
                 diagnostic_info["entity_count"] = len(states)
         except Exception as e:
@@ -180,59 +998,66 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         # Get startup logs (first minute of server operation)
         startup_logs = get_startup_logs()
 
+        # Fetch addon container logs when running as HA add-on
+        addon_logs = ""
+        if install_method == "addon":
+            addon_logs = await _fetch_addon_logs()
+
+        # Fetch the Home Assistant error log (home-assistant.log) on every
+        # install type. It's pulled over REST — which stays up even when the
+        # WebSocket path is failing — so the report captures auth / integration
+        # errors (issue #1694) that never appear in the add-on log above.
+        core_error_log = await _fetch_core_error_log(self._client)
+
         # Format logs for inclusion (sanitized summary)
         log_summary = _format_logs_for_report(recent_logs)
         startup_log_summary = _format_startup_logs(startup_logs)
 
         # Build the formatted report
-        report_lines = [
-            "=== ha-mcp Bug Report Info ===",
-            "",
-            f"ha-mcp Version: {diagnostic_info['ha_mcp_version']}",
-            f"Installation Method: {diagnostic_info['installation_method']}",
-            f"Platform: {platform_info['os']} {platform_info['os_release']} ({platform_info['architecture']})",
-            f"Python Version: {platform_info['python_version']}",
-            f"Home Assistant Version: {diagnostic_info['home_assistant_version']}",
-            f"Connection Status: {diagnostic_info['connection_status']}",
-            f"Entity Count: {diagnostic_info['entity_count']}",
-        ]
+        formatted_report = _build_formatted_report(
+            diagnostic_info,
+            mcp_transport,
+            client_info,
+            platform_info,
+            config_toggles,
+            startup_logs,
+            startup_log_summary,
+            recent_logs,
+            log_summary,
+            addon_logs,
+            core_error_log,
+        )
 
-        # Add optional fields if available
-        if "location_name" in diagnostic_info:
-            report_lines.append(f"Location Name: {diagnostic_info['location_name']}")
-        if "time_zone" in diagnostic_info:
-            report_lines.append(f"Time Zone: {diagnostic_info['time_zone']}")
-
-        if startup_logs:
-            report_lines.extend([
-                "",
-                f"=== Startup Logs ({len(startup_logs)} entries) ===",
-                startup_log_summary,
-            ])
-
-        if recent_logs:
-            report_lines.extend([
-                "",
-                f"=== Recent Tool Calls ({len(recent_logs)} entries) ===",
-                log_summary,
-            ])
-
-        formatted_report = "\n".join(report_lines)
+        # Generate suggested title up-front so it can be folded into the
+        # submission URLs as a `&title=` query param. This auto-fills the
+        # GitHub issue title field — without it, users routinely submit reports
+        # titled just "[BUG]".
+        suggested_title = _generate_bug_title(diagnostic_info, recent_logs)
+        title_query = quote_plus(suggested_title)
+        runtime_bug_submit_url = f"{RUNTIME_BUG_URL}&title={title_query}"
+        agent_behavior_submit_url = f"{AGENT_BEHAVIOR_URL}&title={title_query}"
 
         # Generate BOTH templates
         runtime_bug_template = _generate_runtime_bug_template(
-            diagnostic_info, log_summary, startup_log_summary, recent_logs, startup_logs
+            diagnostic_info,
+            log_summary,
+            startup_log_summary,
+            recent_logs,
+            startup_logs,
+            addon_logs=addon_logs,
+            core_error_log=core_error_log,
+            submit_url=runtime_bug_submit_url,
         )
 
         agent_behavior_template = _generate_agent_behavior_template(
-            diagnostic_info, log_summary, recent_logs
+            diagnostic_info,
+            log_summary,
+            recent_logs,
+            submit_url=agent_behavior_submit_url,
         )
 
         # Anonymization instructions
         anonymization_guide = _generate_anonymization_guide()
-
-        # Generate suggested title
-        suggested_title = _generate_bug_title(diagnostic_info, recent_logs)
 
         # Generate search keywords and URLs for duplicate check
         search_keywords = _generate_search_keywords(diagnostic_info, recent_logs)
@@ -241,11 +1066,25 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             for keyword in search_keywords[:3]  # Limit to top 3 keywords
         ]
 
-        return {
+        result: dict[str, Any] = {
             "success": True,
             "diagnostic_info": diagnostic_info,
             "recent_logs": recent_logs,
-            "startup_logs": startup_logs,
+            # Scrub the startup-log *messages* — they aren't sanitized at source,
+            # so the connect-URL secret path can otherwise surface here.
+            # recent_logs is also returned, but its sensitive *parameters* are
+            # key-masked at the logging chokepoint and its error_message is
+            # returned as-is to the trusted client by design (see SECURITY.md);
+            # formatted_report and addon_logs already route through
+            # _sanitize_log_text. This copies entries — the underlying log
+            # records stay raw.
+            "startup_logs": [
+                {**entry, "message": _sanitize_log_text(entry.get("message", ""))}
+                for entry in startup_logs
+            ],
+            "addon_logs": addon_logs,
+            # Already sanitized + truncated by _fetch_core_error_log.
+            "core_error_log": core_error_log,
             "log_count": len(recent_logs),
             "startup_log_count": len(startup_logs),
             "formatted_report": formatted_report,
@@ -253,12 +1092,22 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             "agent_behavior_template": agent_behavior_template,
             "anonymization_guide": anonymization_guide,
             "suggested_title": suggested_title,
+            "runtime_bug_submit_url": runtime_bug_submit_url,
+            "agent_behavior_submit_url": agent_behavior_submit_url,
             "duplicate_check_urls": duplicate_check_urls,
+            "missing_tool_hint": MISSING_TOOL_HINT,
             "instructions": (
                 "WORKFLOW FOR PRESENTING BUG REPORTS:\n\n"
+                "0. **PRE-CHECK — is the problem a missing/unavailable tool?** If "
+                "the user's issue is that a tool they expected is missing or "
+                "cannot be called, DO NOT file a bug yet. See the "
+                "`missing_tool_hint` field: the likely cause is a stale MCP "
+                "client tool list (not a server bug), fixed by refreshing or "
+                "reconnecting the MCP connection. Only continue with this report "
+                "if the tool is still missing after the user refreshes.\n\n"
                 "1. **Check for duplicates FIRST** (before presenting the template):\n"
                 "   - Use the duplicate_check_urls to search for similar issues\n"
-                "   - If gh CLI is available: use `gh issue list --search \"keyword\"`\n"
+                '   - If gh CLI is available: use `gh issue list --search "keyword"`\n'
                 "   - Otherwise: inform user to check the duplicate_check_urls\n"
                 "   - If duplicates found, ask user if they want to comment on existing issue instead\n\n"
                 "2. **Determine which template to present**:\n"
@@ -280,17 +1129,54 @@ def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 "   d. Verify no tokens, passwords, or IPs are visible\n"
                 "   e. Keep entity domains, error messages, and technical details\n"
                 "   See anonymization_guide for full details.\n\n"
-                "4. **Present the anonymized report to the user**:\n"
-                "   a. Show the suggested_title (user can edit if needed)\n"
+                "4. **Fill in the self-reported fields BEFORE presenting**:\n"
+                "   - `**AI Model:**` — write your identity on this line (provider/family + the\n"
+                "     most specific version you know, in whatever form you'd describe yourself).\n"
+                "     Do not invent a version number. If you don't know it, say so or omit the\n"
+                "     version. There are no options to pick from — just answer honestly.\n"
+                "   - `**Triggering Prompt & Tool Call:** <fill in>` — the EXACT user message\n"
+                "     and the tool call(s) that produced the bug, copy-pasted verbatim. Truncate\n"
+                "     long inputs only after anonymization. This is the single most useful field\n"
+                "     for triage — do not skip it.\n"
+                "   `MCP Transport` and `MCP Client` are auto-detected by the server (the latter\n"
+                "   from the MCP `initialize` handshake); leave both as-is unless they're clearly\n"
+                "   wrong.\n\n"
+                "5. **Present the anonymized report to the user**:\n"
+                "   a. Show the suggested_title (user can edit if needed) and tell them GitHub's\n"
+                "      title field is now pre-filled via the submission URL — they don't need to\n"
+                "      retype it.\n"
                 "   b. Present the chosen ANONYMIZED template IN A MARKDOWN CODE BLOCK (```markdown...```) for easy copy/paste\n"
-                "   c. PROMINENTLY display the submission URL at the top:\n"
-                f"      - Runtime bugs: {RUNTIME_BUG_URL}\n"
-                f"      - Agent behavior: {AGENT_BEHAVIOR_URL}\n"
+                "   c. PROMINENTLY display the submission URL at the top — these include the\n"
+                "      pre-filled title:\n"
+                "      - Runtime bugs: see runtime_bug_submit_url\n"
+                "      - Agent behavior: see agent_behavior_submit_url\n"
                 "   d. Ask them to fill in the description sections\n"
-                "   e. Remind them to review for any remaining personal information before submitting\n\n"
+                "   e. For HA add-on installs, the runtime bug template includes a collapsible '📦 Add-on Container Logs' section auto-filled from addon_logs — keep it as-is\n"
+                "   e2. When present, the template also includes a collapsible 'Home Assistant Error Log' section auto-filled from core_error_log (auth / integration errors) — keep it as-is\n"
+                "   f. Remind them to review for any remaining personal information before submitting\n\n"
                 "CRITICAL: Always ANONYMIZE the report BEFORE presenting it in markdown code blocks!"
             ),
         }
+        return project_fields(result, fields)
+
+
+def register_bug_report_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register bug report tools with the MCP server."""
+    register_tool_methods(mcp, BugReportTools(client))
+
+
+def _format_config_toggles_for_template(toggles: dict[str, Any]) -> str:
+    """Render config toggle snapshot as a markdown bullet list.
+
+    Returns a placeholder line when no toggles were collected (e.g. Settings
+    construction failed) so the template stays consistent.
+    """
+    if not toggles:
+        return "_(config toggles unavailable)_"
+    lines = []
+    for key, value in toggles.items():
+        lines.append(f"- **{key}:** `{value}`")
+    return "\n".join(lines)
 
 
 def _format_logs_for_report(logs: list[dict[str, Any]]) -> str:
@@ -308,8 +1194,8 @@ def _format_logs_for_report(logs: list[dict[str, Any]]) -> str:
 
         line = f"  {timestamp} | {tool_name} | {success} | {exec_time:.0f}ms"
         if error:
-            # Truncate error to avoid leaking sensitive info
-            error_short = str(error)[:100]
+            # Sanitize before truncating so secrets straddling the cut survive redaction.
+            error_short = _sanitize_log_text(str(error))[:100]
             line += f" | Error: {error_short}"
         lines.append(line)
 
@@ -328,7 +1214,8 @@ def _format_startup_logs(logs: list[dict[str, Any]]) -> str:
         logger_name = log.get("logger", "")
         message = log.get("message", "")
 
-        # Truncate long messages
+        # Sanitize before truncating so secrets straddling the cut survive redaction.
+        message = _sanitize_log_text(message)
         if len(message) > 200:
             message = message[:200] + "..."
 
@@ -407,7 +1294,9 @@ def _generate_search_keywords(
     keywords = set()
 
     # Find the most recent error from logs
-    last_error_log = next((log for log in reversed(recent_logs) if log.get("error_message")), None)
+    last_error_log = next(
+        (log for log in reversed(recent_logs) if log.get("error_message")), None
+    )
 
     if last_error_log:
         tool_name = last_error_log.get("tool_name")
@@ -443,6 +1332,10 @@ def _generate_runtime_bug_template(
     startup_log_summary: str,
     recent_logs: list[dict[str, Any]],
     startup_logs: list[dict[str, Any]],
+    *,
+    addon_logs: str = "",
+    core_error_log: str = "",
+    submit_url: str = RUNTIME_BUG_URL,
 ) -> str:
     """
     Generate a runtime bug report template matching runtime_bug.md format.
@@ -451,10 +1344,19 @@ def _generate_runtime_bug_template(
     copy-paste without format conflicts.
     """
     platform_info = diagnostic_info.get("platform", {})
+    config_toggles = diagnostic_info.get("config_toggles") or {}
+    mcp_transport = diagnostic_info.get("mcp_transport", "unknown")
+    client_info = diagnostic_info.get("mcp_client_info") or {}
 
     # Extract error messages from recent logs
     error_messages = _extract_error_messages(recent_logs)
-    error_section = "\n".join(error_messages) if error_messages else "<!-- No errors detected in recent logs -->"
+    error_section = (
+        "\n".join(error_messages)
+        if error_messages
+        else "<!-- No errors detected in recent logs -->"
+    )
+
+    config_toggles_section = _format_config_toggles_for_template(config_toggles)
 
     # Show startup logs section only if they exist
     startup_section = ""
@@ -474,13 +1376,53 @@ def _generate_runtime_bug_template(
 </details>
 """
 
+    # Show addon container logs section only when available (addon installs only)
+    addon_section = ""
+    if addon_logs:
+        addon_section = f"""
+---
+
+## 📦 Add-on Container Logs
+
+<details>
+<summary>Click to expand ha-mcp add-on logs</summary>
+
+```
+{addon_logs}
+```
+
+</details>
+"""
+
+    # Show the Home Assistant error log section when available (all install
+    # types). This carries the auth / integration errors that diagnose issues
+    # like #1694 and don't appear in the add-on container log above.
+    core_log_section = ""
+    if core_error_log:
+        core_log_section = f"""
+---
+
+## Home Assistant Error Log
+
+<details>
+<summary>Click to expand home-assistant.log (auth / integration errors)</summary>
+
+```
+{core_error_log}
+```
+
+</details>
+"""
+
     return f"""## 🚨 Auto-Generated by `ha_report_issue` Tool
 
 > This template was auto-generated by the ha_report_issue tool.
 > All environment info and logs below were collected automatically.
 
 **Submit this report at:**
-{RUNTIME_BUG_URL}
+{submit_url}
+
+(The submission link above pre-fills the issue title — you don't need to retype it.)
 
 ---
 
@@ -505,15 +1447,50 @@ def _generate_runtime_bug_template(
 
 ---
 
+## 💬 Triggering Prompt & Tool Call
+
+<!-- The calling AI agent fills this in. Paste, verbatim, the user message that
+     triggered this bug AND the tool call(s) that produced it. Truncate only
+     after anonymizing tokens / personal names. This is the highest-leverage
+     field for triage. -->
+
+**User prompt:** <fill in>
+
+**Tool call(s):**
+```
+<fill in — name + arguments + (truncated) response, e.g.:
+ha_call_service(domain="light", service="turn_on", entity_id="light.example")
+→ ToolError: Service not found
+>
+```
+
+---
+
 ## 🔧 Environment
 
-- **ha-mcp Version:** {diagnostic_info.get('ha_mcp_version', 'Unknown')}
-- **Installation Method:** {diagnostic_info.get('installation_method', 'Unknown')}
-- **Platform:** {platform_info.get('os', 'Unknown')} {platform_info.get('os_release', '')} ({platform_info.get('architecture', 'Unknown')})
-- **Python Version:** {platform_info.get('python_version', 'Unknown')}
-- **Home Assistant Version:** {diagnostic_info.get('home_assistant_version', 'Unknown')}
-- **Connection Status:** {diagnostic_info.get('connection_status', 'Unknown')}
-- **Entity Count:** {diagnostic_info.get('entity_count', 0)}
+- **ha-mcp Version:** {_format_version_value(diagnostic_info)}
+- **Custom Component:** {diagnostic_info.get("component_version") or "not detected (not installed, or probe failed)"}
+- **File & YAML Tools entry:** {_format_tools_entry_value(diagnostic_info)}
+- **In-process Server entry:** {_format_server_entry_value(diagnostic_info)}
+- **Installation Method:** {diagnostic_info.get("installation_method", "Unknown")}
+- **MCP Transport:** {mcp_transport} _(auto-detected — correct if wrong)_
+- **MCP Client:** {_format_client_info_for_template(client_info)} _(auto-detected from the MCP `initialize` handshake)_
+- **AI Model:**
+- **Operating System:** {platform_info.get("os", "Unknown")} {platform_info.get("os_release", "")} ({platform_info.get("architecture", "Unknown")})
+- **Python Version:** {platform_info.get("python_version", "Unknown")}
+- **Home Assistant Version:** {diagnostic_info.get("home_assistant_version", "Unknown")}
+- **Connection Status:** {diagnostic_info.get("connection_status", "Unknown")}
+- **Entity Count:** {diagnostic_info.get("entity_count", 0)}
+
+---
+
+## ⚙️ ha-mcp Configuration
+
+These flags shape which tools the agent sees, so the same report can mean
+different things depending on toggle state. Auto-collected from the running
+server:
+
+{config_toggles_section}
 
 ---
 
@@ -535,7 +1512,7 @@ def _generate_runtime_bug_template(
 ```
 
 </details>
-{startup_section}
+{startup_section}{addon_section}{core_log_section}
 ---
 
 ## 💡 Additional Context
@@ -557,13 +1534,23 @@ def _generate_agent_behavior_template(
     diagnostic_info: dict[str, Any],
     log_summary: str,
     recent_logs: list[dict[str, Any]],
+    *,
+    submit_url: str = AGENT_BEHAVIOR_URL,
 ) -> str:
     """
     Generate an agent behavior feedback template matching agent_behavior_feedback.md format.
 
     This template focuses on AI agent tool usage patterns and inefficiencies.
     """
-    platform_info = diagnostic_info.get("platform", {})
+    config_toggles = diagnostic_info.get("config_toggles") or {}
+    mcp_transport = diagnostic_info.get("mcp_transport", "unknown")
+    client_info = diagnostic_info.get("mcp_client_info") or {}
+    config_toggles_section = _format_config_toggles_for_template(config_toggles)
+
+    # _extract_error_messages and recent_logs are unused in the agent template;
+    # tool sequence already lives in log_summary. Kept in the signature so
+    # callers don't have to remember which template needs which arg.
+    del recent_logs
 
     return f"""## 🤖 Auto-Generated by `ha_report_issue` Tool
 
@@ -571,7 +1558,9 @@ def _generate_agent_behavior_template(
 > Tool call history was collected automatically to help analyze agent behavior.
 
 **Submit this feedback at:**
-{AGENT_BEHAVIOR_URL}
+{submit_url}
+
+(The submission link above pre-fills the issue title — you don't need to retype it.)
 
 ---
 
@@ -596,6 +1585,21 @@ def _generate_agent_behavior_template(
 <!-- Provide context about what you were trying to do -->
 <!-- Example: "I asked the agent to create an automation that..." -->
 
+
+---
+
+## 💬 Triggering Prompt & Tool Call
+
+<!-- The AI agent fills this in. Paste, verbatim, the user message that
+     prompted the questionable behavior AND the tool call(s) the agent made
+     in response. Truncate only after anonymizing tokens / personal names. -->
+
+**User prompt:** <fill in>
+
+**Tool call(s) the agent chose:**
+```
+<fill in — name + arguments + (truncated) response>
+```
 
 ---
 
@@ -629,11 +1633,26 @@ def _generate_agent_behavior_template(
 
 ---
 
-## 📊 Environment (Optional)
+## 📊 Environment
 
-- **ha-mcp Version:** {diagnostic_info.get('ha_mcp_version', 'Unknown')}
-- **AI Client:** (Claude Desktop / Claude Code / Other)
-- **Home Assistant Version:** {diagnostic_info.get('home_assistant_version', 'Unknown')}
+- **ha-mcp Version:** {_format_version_value(diagnostic_info)}
+- **Custom Component:** {diagnostic_info.get("component_version") or "not detected (not installed, or probe failed)"}
+- **File & YAML Tools entry:** {_format_tools_entry_value(diagnostic_info)}
+- **In-process Server entry:** {_format_server_entry_value(diagnostic_info)}
+- **Installation Method:** {diagnostic_info.get("installation_method", "Unknown")}
+- **MCP Transport:** {mcp_transport} _(auto-detected — correct if wrong)_
+- **MCP Client:** {_format_client_info_for_template(client_info)} _(auto-detected from the MCP `initialize` handshake)_
+- **AI Model:**
+- **Home Assistant Version:** {diagnostic_info.get("home_assistant_version", "Unknown")}
+
+---
+
+## ⚙️ ha-mcp Configuration
+
+These flags shape which tools the agent sees, so the same behavior may be
+expected vs. surprising depending on toggle state:
+
+{config_toggles_section}
 
 ---
 

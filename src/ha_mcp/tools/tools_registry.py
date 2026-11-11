@@ -1,222 +1,747 @@
 """
-Entity Registry and Device Registry management tools for Home Assistant.
+Device Registry management tools for Home Assistant.
 
-This module provides tools for:
-- Renaming entities (changing entity_id) with optional voice assistant exposure migration
-- Managing devices (list, get details, update, remove)
-- Convenience wrapper for renaming both entity and device together
+This module provides tools for managing devices (list, get details, update, remove).
 
 Important: Device renaming does NOT cascade to entities - they are independent registries.
 """
 
+import asyncio
 import logging
-import re
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
 from pydantic import Field
 
+from ..client.rest_client import HomeAssistantAPIError, HomeAssistantConnectionError
 from ..errors import ErrorCode, create_error_response
-from .helpers import log_tool_usage
-from .util_helpers import coerce_bool_param, parse_string_list_param
-
-# Known voice assistant identifiers
-KNOWN_ASSISTANTS = ["conversation", "cloud.alexa", "cloud.google_assistant"]
+from .auto_backup import with_auto_backup
+from .component_devices import (
+    fetch_device_list_via_component,
+    fetch_device_via_component,
+)
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    validate_identifier_not_empty,
+)
+from .tools_config_helpers import validate_registry_ids
+from .util_helpers import (
+    JSON_STRING_COERCION,
+    build_pagination_metadata,
+    parse_string_list_param,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register entity registry and device registry management tools."""
+def _process_device_domain(
+    domain: str,
+    value: str,
+    ieee_address: str | None,
+    is_z2m: bool,
+    zwave_node_id: str | None,
+) -> tuple[str | None, bool, str | None]:
+    """Return updated (ieee_address, is_z2m, zwave_node_id) for a single identifier domain."""
+    # ZHA: identifier is ["zha", "IEEE_ADDRESS"]
+    if domain == "zha":
+        return value, is_z2m, zwave_node_id
+    # Z2M: identifier is ["mqtt", "zigbee2mqtt_0xIEEE"] or "zigbee2mqtt_bridge_0xIEEE"
+    if domain == "mqtt" and "zigbee2mqtt" in value.lower():
+        extracted = (
+            "0x" + value.rsplit("_0x", maxsplit=1)[-1]
+            if "_0x" in value
+            else ieee_address
+        )
+        return extracted, True, zwave_node_id
+    # Z-Wave JS: identifier is ["zwave_js", "{home_id}-{node_id}"]
+    if domain == "zwave_js" and "-" in value:
+        return ieee_address, is_z2m, value.split("-")[1]
+    return ieee_address, is_z2m, zwave_node_id
 
-    # Internal helper functions for reuse across tools
-    async def _rename_entity_internal(
-        entity_id: str,
-        new_entity_id: str,
-        name: str | None = None,
-        icon: str | None = None,
-        preserve_voice_exposure: bool = True,
-    ) -> dict[str, Any]:
-        """Internal implementation of entity rename with voice exposure migration."""
-        try:
-            # Validate entity_id format
-            entity_pattern = r"^[a-z_]+\.[a-z0-9_]+$"
-            if not re.match(entity_pattern, entity_id):
-                return {
-                    "success": False,
-                    "error": f"Invalid entity_id format: {entity_id}",
-                    "expected_format": "domain.object_id (lowercase letters, numbers, underscores only)",
-                }
 
-            if not re.match(entity_pattern, new_entity_id):
-                return {
-                    "success": False,
-                    "error": f"Invalid new_entity_id format: {new_entity_id}",
-                    "expected_format": "domain.object_id (lowercase letters, numbers, underscores only)",
-                }
+def _extract_zigbee_info(
+    identifiers: list[Any],
+) -> tuple[list[str], str | None, bool, str | None]:
+    """Parse device identifiers into (integration_sources, ieee_address, is_z2m, zwave_node_id)."""
+    integration_sources: list[str] = []
+    ieee_address: str | None = None
+    is_z2m = False
+    zwave_node_id: str | None = None
 
-            # Extract and validate domains match
-            current_domain = entity_id.split(".")[0]
-            new_domain = new_entity_id.split(".")[0]
-
-            if current_domain != new_domain:
-                return {
-                    "success": False,
-                    "error": f"Domain mismatch: cannot change from '{current_domain}' to '{new_domain}'",
-                    "suggestion": f"New entity_id must start with '{current_domain}.'",
-                }
-
-            # Step 1: Get current voice exposure settings BEFORE rename
-            old_exposure: dict[str, bool] = {}
-            exposure_migrated = False
-            if preserve_voice_exposure:
-                try:
-                    exposure_list_msg: dict[str, Any] = {
-                        "type": "homeassistant/expose_entity/list"
-                    }
-                    exposure_result = await client.send_websocket_message(
-                        exposure_list_msg
-                    )
-                    if exposure_result.get("success"):
-                        exposed_entities = exposure_result.get("result", {}).get(
-                            "exposed_entities", {}
-                        )
-                        old_exposure = exposed_entities.get(entity_id, {})
-                        if old_exposure:
-                            logger.info(
-                                f"Found voice exposure settings for {entity_id}: {old_exposure}"
-                            )
-                except Exception as exp_err:
-                    logger.warning(
-                        f"Could not fetch exposure settings: {exp_err}. "
-                        "Continuing with rename without exposure migration."
-                    )
-                    old_exposure = {}
-
-            # Step 2: Perform the entity rename
-            message: dict[str, Any] = {
-                "type": "config/entity_registry/update",
-                "entity_id": entity_id,
-                "new_entity_id": new_entity_id,
-            }
-
-            if name is not None:
-                message["name"] = name
-            if icon is not None:
-                message["icon"] = icon
-
-            logger.info(f"Renaming entity {entity_id} to {new_entity_id}")
-            result = await client.send_websocket_message(message)
-
-            if not result.get("success"):
-                error = result.get("error", {})
-                error_msg = (
-                    error.get("message", str(error))
-                    if isinstance(error, dict)
-                    else str(error)
+    for identifier in identifiers:
+        if isinstance(identifier, (list, tuple)) and len(identifier) >= 2:
+            domain = identifier[0]
+            if isinstance(domain, str):
+                if domain not in integration_sources:
+                    integration_sources.append(domain)
+                ieee_address, is_z2m, zwave_node_id = _process_device_domain(
+                    domain,
+                    str(identifier[1]),
+                    ieee_address,
+                    is_z2m,
+                    zwave_node_id,
                 )
-                return {
-                    "success": False,
-                    "error": f"Failed to rename entity: {error_msg}",
-                    "entity_id": entity_id,
-                    "suggestions": [
-                        "Verify the entity exists using ha_search_entities()",
-                        "Check that the new entity_id doesn't already exist",
-                        "Ensure the entity has a unique_id (some legacy entities cannot be renamed)",
+
+    return integration_sources, ieee_address, is_z2m, zwave_node_id
+
+
+def _first_ieee_from_connections(
+    connections: list[Any], existing_ieee: str | None
+) -> str | None:
+    """Return existing_ieee if already set; otherwise the first 'ieee' connection value, or None."""
+    if not isinstance(connections, list) or existing_ieee:
+        return existing_ieee
+    for connection in connections:
+        if (
+            isinstance(connection, (list, tuple))
+            and len(connection) >= 2
+            and connection[0] == "ieee"
+        ):
+            return str(connection[1])
+    return existing_ieee
+
+
+def _classify_integration(integration_sources: list[str], is_z2m: bool) -> str:
+    """Return the primary integration type string for a device."""
+    if "zha" in integration_sources:
+        return "zha"
+    if is_z2m:
+        return "zigbee2mqtt"
+    if "zwave_js" in integration_sources:
+        return "zwave_js"
+    if "mqtt" in integration_sources:
+        return "mqtt"
+    if integration_sources:
+        return integration_sources[0]
+    return "unknown"
+
+
+def _get_device_info(device: dict[str, Any]) -> dict[str, Any]:
+    """Extract integration info and build a device summary dict."""
+    integration_sources, ieee_address, is_z2m, zwave_node_id = _extract_zigbee_info(
+        device.get("identifiers", [])
+    )
+    ieee_address = _first_ieee_from_connections(
+        device.get("connections", []), ieee_address
+    )
+    integration_type = _classify_integration(integration_sources, is_z2m)
+    friendly_name = device.get("name_by_user") or device.get("name")
+
+    device_info: dict[str, Any] = {
+        "device_id": device.get("id"),
+        "name": friendly_name,
+        "manufacturer": device.get("manufacturer"),
+        "model": device.get("model"),
+        "sw_version": device.get("sw_version"),
+        "area_id": device.get("area_id"),
+        "integration_type": integration_type,
+        "integration_sources": integration_sources,
+        "via_device_id": device.get("via_device_id"),
+    }
+
+    if ieee_address:
+        device_info["ieee_address"] = ieee_address
+    if integration_type == "zigbee2mqtt":
+        device_info["friendly_name"] = friendly_name
+        device_info["mqtt_topic_hint"] = f"zigbee2mqtt/{friendly_name}/..."
+    if integration_type == "zha" and ieee_address:
+        device_info["zha_trigger_hint"] = (
+            f"Use ieee '{ieee_address}' for zha_event triggers"
+        )
+    if integration_type == "zwave_js" and zwave_node_id:
+        device_info["node_id"] = zwave_node_id
+
+    return device_info
+
+
+def _build_entity_maps(
+    all_entities: list[dict[str, Any]], need_full: bool
+) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]]]:
+    """Build entity→device and device→entities lookup maps.
+
+    device_to_entities is only populated when need_full is True; building it for
+    every list-mode request would be wasteful when only entity→device lookup is needed.
+    """
+    entity_to_device: dict[str, str] = {}
+    device_to_entities: dict[str, list[dict[str, Any]]] = {}
+    for e in all_entities:
+        eid = e.get("entity_id")
+        did = e.get("device_id")
+        if eid and did:
+            entity_to_device[eid] = did
+            if need_full:
+                device_to_entities.setdefault(did, []).append(
+                    {
+                        "entity_id": eid,
+                        "name": e.get("name") or e.get("original_name"),
+                        "platform": e.get("platform"),
+                    }
+                )
+    return entity_to_device, device_to_entities
+
+
+async def _fetch_entity_rows(client: Any) -> list[dict[str, Any]]:
+    """Entity-registry rows for the device<->entity maps; tolerant ([] on failure).
+
+    ``device_list`` carries no per-device entity join (only ``device_get`` does),
+    so the full-detail list and the single-device legacy fallback still read the
+    whole ``config/entity_registry/list``. Entity-registry failure is non-fatal
+    (the caller just loses the entity list / hidden filter), matching the prior
+    concurrent-fetch behaviour.
+    """
+    entity_result = await client.send_websocket_message(
+        {"type": "config/entity_registry/list"}
+    )
+    return entity_result.get("result", []) if entity_result.get("success") else []
+
+
+async def _strict_entity_rows(client: Any) -> list[dict[str, Any]]:
+    """Full entity registry; raises SERVICE_CALL_FAILED on a failed read.
+
+    The device-id resolver's fallback read. Unlike the tolerant
+    :func:`_fetch_entity_rows` (whose callers treat a missing entity list as a
+    non-fatal degrade), a failed read here MUST surface as a service failure rather
+    than collapse to ``[]`` — otherwise the resolver would misreport a real entity
+    as ENTITY_NOT_FOUND when the read itself failed (a double transient failure:
+    the targeted ``get`` failed, then this fallback list failed too).
+    """
+    entity_result = await client.send_websocket_message(
+        {"type": "config/entity_registry/list"}
+    )
+    if not entity_result.get("success"):
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.SERVICE_CALL_FAILED,
+                f"Failed to access entity registry: {entity_result.get('error', 'Unknown error')}",
+            )
+        )
+    return list(entity_result.get("result", []))
+
+
+async def _legacy_device_rows(client: Any) -> list[dict[str, Any]]:
+    """Full device registry via the legacy ``config/device_registry/list``.
+
+    Raises SERVICE_CALL_FAILED when the read fails, preserving the prior
+    fatal-on-device-registry-failure contract.
+    """
+    list_result = await client.send_websocket_message(
+        {"type": "config/device_registry/list"}
+    )
+    if not list_result.get("success"):
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.SERVICE_CALL_FAILED,
+                f"Failed to access device registry: {list_result.get('error', 'Unknown error')}",
+            )
+        )
+    return list(list_result.get("result", []))
+
+
+async def _fetch_device_rows(client: Any) -> list[dict[str, Any]]:
+    """Full device registry — component ``device_list`` or legacy list.
+
+    Routes through ``ha_mcp_tools/device_list`` when the component serves it (the
+    raw ``DeviceEntry`` shape, byte-identical to ``config/device_registry/list``),
+    else the legacy WS list. Used for LIST mode, where the whole registry is the
+    intended payload.
+    """
+    result = await fetch_device_list_via_component(client)
+    if result is not None:
+        return list(result.get("devices", []))
+    return await _legacy_device_rows(client)
+
+
+# HA core replies with this error code (ERR_NOT_FOUND) from
+# ``config/entity_registry/get`` for a genuinely unknown entity. Any other failure
+# code is a transient / structural WS problem, NOT HA's "unknown entity" verdict.
+_ENTITY_NOT_FOUND_CODE = "not_found"
+
+
+async def _resolve_device_id_via_legacy(client: Any, entity_id: str) -> str:
+    """Resolve entity_id → device_id via the full ``config/entity_registry/list``.
+
+    The whole-registry scan :func:`_resolve_device_id_for_entity` replaced, kept as
+    the fallback for a transient failure of the targeted read so a real entity is
+    never misreported as nonexistent. Uses the STRICT list read so a failure of
+    THIS fallback surfaces as a service failure rather than an empty list that would
+    itself misreport the entity as ENTITY_NOT_FOUND. Raises ENTITY_NOT_FOUND only
+    when the read succeeds and the entity is absent or carries no device (the same
+    contract).
+    """
+    entity_to_device, _ = _build_entity_maps(
+        await _strict_entity_rows(client), need_full=False
+    )
+    device_id = entity_to_device.get(entity_id)
+    if device_id:
+        return device_id
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.ENTITY_NOT_FOUND,
+            f"Entity '{entity_id}' not found or has no associated device",
+            suggestions=["Use ha_search() to find valid entity IDs"],
+            context={"entity_id": entity_id},
+        )
+    )
+    raise AssertionError  # unreachable: raise_tool_error is NoReturn
+
+
+async def _resolve_device_id_for_entity(client: Any, entity_id: str) -> str:
+    """Resolve an entity_id to its device_id via a single native entity read.
+
+    Uses HA's targeted ``config/entity_registry/get`` (one entity, no
+    whole-registry dump) rather than scanning the full entity registry. HA returns
+    ``success: false`` both for a genuinely unknown entity (error code
+    ``not_found``) AND for a transient failure, so the two are told apart by the
+    structured error code: ``not_found`` (or a successful read with no device)
+    raises ENTITY_NOT_FOUND — the same contract the old full-map lookup produced —
+    while any OTHER failure falls back to the legacy whole-registry read so a WS
+    hiccup never misreports a real entity as nonexistent.
+    """
+    result = await client.send_websocket_message(
+        {"type": "config/entity_registry/get", "entity_id": entity_id}
+    )
+    if result.get("success"):
+        device_id = (result.get("result") or {}).get("device_id")
+        if device_id:
+            return str(device_id)
+    elif result.get("error_code") != _ENTITY_NOT_FOUND_CODE:
+        return await _resolve_device_id_via_legacy(client, entity_id)
+    raise_tool_error(
+        create_error_response(
+            ErrorCode.ENTITY_NOT_FOUND,
+            f"Entity '{entity_id}' not found or has no associated device",
+            suggestions=["Use ha_search() to find valid entity IDs"],
+            context={"entity_id": entity_id},
+        )
+    )
+    raise AssertionError  # unreachable: raise_tool_error is NoReturn
+
+
+async def _single_device_and_entities(
+    client: Any, device_id: str
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """(``all_devices``, ``device_to_entities``) for a single-device lookup.
+
+    When the component serves ``device_get`` and the device exists, returns
+    ``[device]`` plus its entity map — both from ONE ``device_get(include_entities)``
+    frame, so neither the device NOR the entity registry is dumped. Falls back to
+    the legacy full device + entity registries (so a not-found error can still
+    suggest valid ids and the device's entities are still listed) when the device
+    is absent (component said ``None``), the component can't serve device_get, or
+    the component served the device but not the additive entities half (no
+    ``entities`` key — an older device_get predating ``include_entities``): the
+    join's absence degrades to legacy rather than reporting a device with zero
+    entities.
+    """
+    result = await fetch_device_via_component(client, device_id, include_entities=True)
+    if result is not None:
+        device = result.get("device")
+        entities = result.get("entities")
+        if isinstance(device, dict) and isinstance(entities, list):
+            _, device_to_entities = _build_entity_maps(entities, need_full=True)
+            return [device], device_to_entities
+        # Either an authoritative not-found (device is None) — fall through so the
+        # error carries available_device_ids — or a component that served
+        # device_get without the entities half. Both take the legacy device AND
+        # entity registries.
+    # Device registry first, then entity registry — the legacy wire order,
+    # which the #1297 error-contract test pins with an ordered mock.
+    all_devices = await _legacy_device_rows(client)
+    all_entities = await _fetch_entity_rows(client)
+    _, device_to_entities = _build_entity_maps(all_entities, need_full=True)
+    return all_devices, device_to_entities
+
+
+async def _lookup_device_for_remove(client: Any, device_id: str) -> dict[str, Any]:
+    """Return the raw device row for ``ha_remove_device``; raise if it does not exist.
+
+    Uses the component's ``device_get`` for the single-device read when available
+    (no whole-registry dump), falling back to the legacy full list — also used to
+    build the not-found error's available-ids suggestion.
+    """
+    result = await fetch_device_via_component(client, device_id)
+    if result is not None:
+        device = result.get("device")
+        if isinstance(device, dict):
+            return device
+    all_rows = await _legacy_device_rows(client)
+    device = next((d for d in all_rows if d.get("id") == device_id), None)
+    if device is None:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                f"Device not found: {device_id}",
+                suggestions=["Use ha_get_device() to find valid device IDs"],
+                context={
+                    "device_id": device_id,
+                    "available_device_ids": [
+                        d.get("id") for d in all_rows[:10] if d.get("id")
                     ],
+                },
+            )
+        )
+        return {}  # unreachable: raise_tool_error always raises
+    return device
+
+
+async def _enrich_zha_metrics(
+    client: Any, device_info: dict[str, Any], warnings: list[str]
+) -> None:
+    """Fetch ZHA radio metrics (LQI/RSSI) and add to device_info in-place.
+
+    Enrichment is best-effort, but a skipped fetch is named in ``warnings`` so
+    a device answered without ``radio_metrics`` is distinguishable from one
+    whose radio genuinely reports none (#1947).
+    """
+    try:
+        zha_result = await client.send_websocket_message({"type": "zha/devices"})
+        if zha_result.get("success"):
+            zha_by_ieee = {
+                d.get("ieee"): d for d in zha_result.get("result", []) if d.get("ieee")
+            }
+            zha_dev = zha_by_ieee.get(device_info["ieee_address"])
+            if zha_dev:
+                device_info["radio_metrics"] = {
+                    "lqi": zha_dev.get("lqi"),
+                    "rssi": zha_dev.get("rssi"),
                 }
+        else:
+            warnings.append(
+                f"ZHA radio metrics unavailable: {zha_result.get('error') or 'request failed'}"
+            )
+    except (
+        HomeAssistantConnectionError,
+        HomeAssistantAPIError,
+        TimeoutError,
+        OSError,
+    ) as e:
+        logger.warning(
+            "Could not fetch ZHA radio metrics for device %s: %s",
+            device_info.get("device_id"),
+            e,
+        )
+        warnings.append(f"ZHA radio metrics unavailable: {e}")
 
-            entity_entry = result.get("result", {}).get("entity_entry", {})
 
-            # Step 3: Migrate voice exposure settings to the new entity_id
-            exposure_migration_result: dict[str, Any] = {}
-            if preserve_voice_exposure and old_exposure:
-                try:
-                    # Find which assistants the entity was exposed to
-                    exposed_assistants = [
-                        asst for asst in KNOWN_ASSISTANTS if old_exposure.get(asst)
-                    ]
-                    hidden_assistants = [
-                        asst
-                        for asst in KNOWN_ASSISTANTS
-                        if old_exposure.get(asst) is False
-                    ]
+async def _enrich_zwave_status(
+    client: Any, device_id: str, device_info: dict[str, Any], warnings: list[str]
+) -> None:
+    """Fetch Z-Wave node status and add to device_info in-place.
 
-                    # Apply exposure to new entity
-                    if exposed_assistants:
-                        expose_msg: dict[str, Any] = {
-                            "type": "homeassistant/expose_entity",
-                            "assistants": exposed_assistants,
-                            "entity_ids": [new_entity_id],
-                            "should_expose": True,
-                        }
-                        expose_result = await client.send_websocket_message(expose_msg)
-                        if expose_result.get("success"):
-                            exposure_migrated = True
-                            logger.info(
-                                f"Migrated exposure to {exposed_assistants} for {new_entity_id}"
-                            )
-                        else:
-                            logger.warning(
-                                f"Failed to migrate exposure settings: {expose_result.get('error')}"
-                            )
-
-                    # Apply hidden settings to new entity
-                    if hidden_assistants:
-                        hide_msg: dict[str, Any] = {
-                            "type": "homeassistant/expose_entity",
-                            "assistants": hidden_assistants,
-                            "entity_ids": [new_entity_id],
-                            "should_expose": False,
-                        }
-                        hide_result = await client.send_websocket_message(hide_msg)
-                        if hide_result.get("success"):
-                            exposure_migrated = True
-                            logger.info(
-                                f"Migrated hidden settings to {hidden_assistants} for {new_entity_id}"
-                            )
-
-                    exposure_migration_result = {
-                        "migrated": exposure_migrated,
-                        "exposed_to": exposed_assistants,
-                        "hidden_from": hidden_assistants,
-                    }
-                except Exception as migrate_err:
-                    logger.warning(f"Error migrating exposure settings: {migrate_err}")
-                    exposure_migration_result = {
-                        "migrated": False,
-                        "error": str(migrate_err),
-                    }
-
-            # Build response
-            response: dict[str, Any] = {
-                "success": True,
-                "old_entity_id": entity_id,
-                "new_entity_id": new_entity_id,
-                "entity_entry": entity_entry,
-                "message": f"Successfully renamed entity from {entity_id} to {new_entity_id}",
-                "warning": "Remember to update any automations, scripts, or dashboards that reference the old entity_id",
+    Best-effort like the ZHA metrics, and named in ``warnings`` on failure for
+    the same reason (#1947).
+    """
+    try:
+        zwave_result = await client.send_websocket_message(
+            {"type": "zwave_js/node_status", "device_id": device_id}
+        )
+        if zwave_result.get("success"):
+            node_data = zwave_result.get("result", {})
+            device_info["node_status"] = {
+                "node_id": node_data.get("node_id"),
+                "status": node_data.get("status"),
+                "is_routing": node_data.get("is_routing"),
+                "is_secure": node_data.get("is_secure"),
+                "highest_security_class": node_data.get("highest_security_class"),
+                "zwave_plus_version": node_data.get("zwave_plus_version"),
+                "is_controller_node": node_data.get("is_controller_node"),
             }
+        else:
+            warnings.append(
+                f"Z-Wave node status unavailable: {zwave_result.get('error') or 'request failed'}"
+            )
+    except (
+        HomeAssistantConnectionError,
+        HomeAssistantAPIError,
+        TimeoutError,
+        OSError,
+    ) as e:
+        logger.warning(
+            "Could not fetch Z-Wave node status for device %s: %s",
+            device_info.get("device_id"),
+            e,
+        )
+        warnings.append(f"Z-Wave node status unavailable: {e}")
 
-            if preserve_voice_exposure:
-                if exposure_migration_result:
-                    response["voice_exposure_migration"] = exposure_migration_result
-                elif not old_exposure:
-                    response["voice_exposure_migration"] = {
-                        "migrated": False,
-                        "note": "No custom voice exposure settings found for original entity",
-                    }
 
-            return response
+async def _enrich_matter_diagnostics(
+    client: Any, device_id: str, device_info: dict[str, Any], warnings: list[str]
+) -> None:
+    """Fetch Matter node diagnostics and add to device_info in-place.
 
-        except Exception as e:
-            logger.error(f"Error renaming entity: {e}")
-            return {
-                "success": False,
-                "error": f"Entity rename failed: {str(e)}",
-                "entity_id": entity_id,
+    Mirrors _enrich_zwave_status: surfaces the Matter equivalent of Z-Wave node
+    status — network type (wifi/thread), reachability, IPs and joined fabrics,
+    and names a skipped fetch in ``warnings`` (#1947).
+    """
+    try:
+        result = await client.send_websocket_message(
+            {"type": "matter/node_diagnostics", "device_id": device_id}
+        )
+        if result.get("success"):
+            data = result.get("result", {})
+            device_info["node_diagnostics"] = {
+                "network_type": data.get("network_type"),
+                "node_type": data.get("node_type"),
+                "available": data.get("available"),
+                "network_name": data.get("network_name"),
+                # Upstream NodeDiagnostics misspells the field "ip_adresses"
+                # (single d); read that key but surface it correctly.
+                "ip_addresses": data.get("ip_adresses"),
+                "mac_address": data.get("mac_address"),
+                "active_fabrics": data.get("active_fabrics"),
+                "active_fabric_index": data.get("active_fabric_index"),
             }
+        else:
+            warnings.append(
+                f"Matter node diagnostics unavailable: {result.get('error') or 'request failed'}"
+            )
+    except (
+        HomeAssistantConnectionError,
+        HomeAssistantAPIError,
+        TimeoutError,
+        OSError,
+    ) as e:
+        warnings.append(f"Matter node diagnostics unavailable: {e}")
+        logger.warning(
+            "Could not fetch Matter node diagnostics for device %s: %s",
+            device_info.get("device_id"),
+            e,
+        )
+
+
+async def _get_single_device_result(
+    client: Any,
+    device_id: str,
+    entity_id: str | None,
+    all_devices: list[dict[str, Any]],
+    device_to_entities: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Return the full-detail single-device response dict."""
+    device = next((d for d in all_devices if d.get("id") == device_id), None)
+    if not device:
+        raise_tool_error(
+            create_error_response(
+                ErrorCode.RESOURCE_NOT_FOUND,
+                f"Device not found: {device_id}",
+                suggestions=["Use ha_get_device() to find valid device IDs"],
+                context={
+                    "device_id": device_id,
+                    "available_device_ids": [
+                        d.get("id") for d in all_devices[:10] if d.get("id")
+                    ],
+                },
+            )
+        )
+        return {}  # unreachable: raise_tool_error always raises
+
+    enrichment_warnings: list[str] = []
+    device_info = _get_device_info(device)
+    device_info["entities"] = device_to_entities.get(device_id, [])
+    device_info["name_by_user"] = device.get("name_by_user")
+    device_info["default_name"] = device.get("name")
+    device_info["hw_version"] = device.get("hw_version")
+    device_info["serial_number"] = device.get("serial_number")
+    device_info["disabled_by"] = device.get("disabled_by")
+    device_info["labels"] = device.get("labels", [])
+    device_info["config_entries"] = device.get("config_entries", [])
+    device_info["connections"] = device.get("connections", [])
+    device_info["identifiers"] = device.get("identifiers", [])
+
+    if device_info.get("integration_type") == "zha" and device_info.get("ieee_address"):
+        await _enrich_zha_metrics(client, device_info, enrichment_warnings)
+    if device_info.get("integration_type") == "zwave_js" and device_info.get("node_id"):
+        await _enrich_zwave_status(client, device_id, device_info, enrichment_warnings)
+    if device_info.get("integration_type") == "matter":
+        await _enrich_matter_diagnostics(
+            client, device_id, device_info, enrichment_warnings
+        )
+
+    entities = device_info.get("entities", [])
+    response: dict[str, Any] = {
+        "success": True,
+        "device": device_info,
+        "entities": entities,  # Also at top level for backward compatibility
+        "entity_count": len(entities),
+        "queried_by": "entity_id" if entity_id else "device_id",
+        "queried_entity_id": entity_id,
+    }
+    if enrichment_warnings:
+        # Top-level list[str] per the response contract — never nested under
+        # ``device``, where a caller reading the payload would miss it.
+        response["warnings"] = enrichment_warnings
+    return response
+
+
+def _matches_integration(
+    device_info: dict[str, Any], integration_lower: str, named_types: list[str]
+) -> bool:
+    """Check whether a device matches the requested integration filter."""
+    if integration_lower in named_types:
+        return bool(device_info.get("integration_type") == integration_lower)
+    return integration_lower in device_info.get("integration_sources", [])
+
+
+def _filter_devices(
+    all_devices: list[dict[str, Any]],
+    area_id: str | None,
+    manufacturer_lower: str | None,
+    integration_lower: str | None,
+    device_to_entities: dict[str, list[dict[str, Any]]],
+    detail_level: Literal["summary", "full"],
+) -> list[dict[str, Any]]:
+    """Filter devices for list mode and optionally attach entity lists."""
+    named_types = ["zigbee2mqtt", "zha", "zwave_js"]
+    matched: list[dict[str, Any]] = []
+    for device in all_devices:
+        if area_id and device.get("area_id") != area_id:
+            continue
+        device_man = (device.get("manufacturer") or "").lower()
+        if manufacturer_lower and manufacturer_lower not in device_man:
+            continue
+        device_info = _get_device_info(device)
+        if integration_lower and not _matches_integration(
+            device_info, integration_lower, named_types
+        ):
+            continue
+        if detail_level == "full":
+            device_info["entities"] = device_to_entities.get(device.get("id") or "", [])
+        matched.append(device_info)
+    return matched
+
+
+def _add_integration_hints(
+    result: dict[str, Any],
+    integration_lower: str | None,
+    matched_devices: list[dict[str, Any]],
+) -> None:
+    """Add Z2M bridge info and integration-specific usage hints to result in-place."""
+    if integration_lower == "zigbee2mqtt":
+        bridge_info = None
+        for d in matched_devices:
+            if (
+                d.get("via_device_id") is None
+                and "bridge" in (d.get("name") or "").lower()
+            ):
+                bridge_info = {
+                    "device_id": d.get("device_id"),
+                    "name": d.get("name"),
+                    "ieee_address": d.get("ieee_address"),
+                }
+                break
+        if bridge_info:
+            result["bridge"] = bridge_info
+        result["usage_hint"] = (
+            "Use 'friendly_name' for MQTT topics: zigbee2mqtt/{friendly_name}/action"
+        )
+    elif integration_lower == "zha":
+        result["usage_hint"] = (
+            "Use 'ieee_address' for zha_event triggers in automations"
+        )
+    elif integration_lower == "zwave_js":
+        result["usage_hint"] = (
+            "Use node_id for Z-Wave device identification. "
+            "Single device lookup includes node status (security, routing)."
+        )
+
+
+def _list_devices_result(
+    all_devices: list[dict[str, Any]],
+    device_to_entities: dict[str, list[dict[str, Any]]],
+    integration: str | None,
+    area_id: str | None,
+    manufacturer: str | None,
+    limit: int,
+    offset: int,
+    detail_level: Literal["summary", "full"],
+) -> dict[str, Any]:
+    """Build the paginated device list response."""
+    integration_lower = integration.lower() if integration else None
+    manufacturer_lower = manufacturer.lower() if manufacturer else None
+
+    matched_devices = _filter_devices(
+        all_devices,
+        area_id,
+        manufacturer_lower,
+        integration_lower,
+        device_to_entities,
+        detail_level,
+    )
+    total_matched = len(matched_devices)
+    paginated = matched_devices[offset : offset + limit]
+
+    result: dict[str, Any] = {
+        "success": True,
+        **build_pagination_metadata(total_matched, offset, limit, len(paginated)),
+        "total_devices": len(all_devices),
+        "devices": paginated,
+        "detail_level": detail_level,
+    }
+
+    filters_applied = []
+    if integration:
+        result["integration_filter"] = integration
+        filters_applied.append(f"integration={integration}")
+    if area_id:
+        result["area_filter"] = area_id
+        filters_applied.append(f"area_id={area_id}")
+    if manufacturer:
+        result["manufacturer_filter"] = manufacturer
+        filters_applied.append(f"manufacturer={manufacturer}")
+    if filters_applied:
+        result["filters"] = filters_applied
+
+    _add_integration_hints(result, integration_lower, matched_devices)
+    return result
+
+
+async def _remove_device_config_entries(
+    client: Any,
+    device_id: str,
+    config_entries: list[str],
+) -> list[dict[str, Any]]:
+    """Remove device from each config entry concurrently; returns per-entry results."""
+    raw = await asyncio.gather(
+        *(
+            client.send_websocket_message(
+                {
+                    "type": "config/device_registry/remove_config_entry",
+                    "device_id": device_id,
+                    "config_entry_id": config_entry_id,
+                }
+            )
+            for config_entry_id in config_entries
+        ),
+        return_exceptions=True,
+    )
+    results: list[dict[str, Any]] = []
+    for config_entry_id, r in zip(config_entries, raw, strict=True):
+        if isinstance(r, BaseException):
+            results.append(
+                {"config_entry_id": config_entry_id, "success": False, "error": str(r)}
+            )
+        else:
+            results.append(
+                {
+                    "config_entry_id": config_entry_id,
+                    "success": r.get("success", False),
+                    "error": r.get("error") if not r.get("success") else None,
+                }
+            )
+    return results
+
+
+class RegistryTools:
+    """Device registry tools: get, update, and remove devices."""
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
 
     async def _update_device_internal(
+        self,
         device_id: str,
         name: str | None = None,
         area_id: str | None = None,
@@ -225,7 +750,6 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
     ) -> dict[str, Any]:
         """Internal implementation of device update."""
         try:
-            # Build update message
             message: dict[str, Any] = {
                 "type": "config/device_registry/update",
                 "device_id": device_id,
@@ -254,14 +778,26 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 updates_made.append(f"labels={labels}")
 
             if not updates_made:
-                return {
-                    "success": False,
-                    "error": "No updates specified",
-                    "suggestion": "Provide at least one of: name, area_id, disabled_by, or labels",
-                }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "No updates specified",
+                        suggestions=[
+                            "Provide at least one of: name, area_id, disabled_by, or labels",
+                        ],
+                        context={"device_id": device_id},
+                    )
+                )
+
+            # Issue #2159: HA stores an unknown area_id or label_id on the
+            # device verbatim. Device labels replace the existing set, so the
+            # supplied list is the full set to check; an empty list clears.
+            await validate_registry_ids(
+                self._client, area_id, labels, None, fail_closed=True
+            )
 
             logger.info(f"Updating device {device_id}: {', '.join(updates_made)}")
-            result = await client.send_websocket_message(message)
+            result = await self._client.send_websocket_message(message)
 
             if result.get("success"):
                 device_entry = result.get("result", {})
@@ -278,7 +814,7 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                         "labels": device_entry.get("labels", []),
                     },
                     "message": f"Device updated: {', '.join(updates_made)}",
-                    "note": "Remember: Device rename does NOT cascade to entities. Use ha_rename_entity() to rename entities.",
+                    "note": "Remember: Device rename does NOT cascade to entities. Use ha_set_entity(new_entity_id=...) to rename entities.",
                 }
             else:
                 error = result.get("error", {})
@@ -287,114 +823,42 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                     if isinstance(error, dict)
                     else str(error)
                 )
-                return {
-                    "success": False,
-                    "error": f"Failed to update device: {error_msg}",
-                    "device_id": device_id,
-                    "suggestions": [
-                        "Verify the device_id exists using ha_get_device()",
-                        "Check that area_id exists if specified",
-                    ],
-                }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        f"Failed to update device: {error_msg}",
+                        suggestions=[
+                            "Verify the device_id exists using ha_get_device()",
+                            "Check that area_id exists if specified",
+                        ],
+                        context={"device_id": device_id},
+                    )
+                )
 
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error updating device: {e}")
-            return {
-                "success": False,
-                "error": f"Device update failed: {str(e)}",
-                "device_id": device_id,
-            }
+            exception_to_structured_error(
+                e,
+                context={"device_id": device_id},
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 
-    @mcp.tool(annotations={"destructiveHint": True, "title": "Rename Entity"})
-    @log_tool_usage
-    async def ha_rename_entity(
-        entity_id: Annotated[
-            str,
-            Field(description="Current entity ID to rename (e.g., 'light.old_name')"),
-        ],
-        new_entity_id: Annotated[
-            str,
-            Field(
-                description="New entity ID (e.g., 'light.new_name'). Domain must match the original."
-            ),
-        ],
-        name: Annotated[
-            str | None,
-            Field(
-                description="Optional: New friendly name for the entity",
-                default=None,
-            ),
-        ] = None,
-        icon: Annotated[
-            str | None,
-            Field(
-                description="Optional: New icon (e.g., 'mdi:lightbulb')",
-                default=None,
-            ),
-        ] = None,
-        preserve_voice_exposure: Annotated[
-            bool | str | None,
-            Field(
-                description=(
-                    "Migrate voice assistant exposure settings to the new entity_id. "
-                    "Defaults to True. Set to False to skip exposure migration."
-                ),
-                default=None,
-            ),
-        ] = None,
-    ) -> dict[str, Any]:
-        """
-        Rename a Home Assistant entity by changing its entity_id.
-
-        Changes the entity_id (e.g., light.old_name -> light.new_name).
-        The domain must remain the same - you cannot change a light to a switch.
-
-        VOICE ASSISTANT EXPOSURE:
-        By default, this function preserves voice assistant exposure settings
-        (Alexa, Google Assistant, Assist) when renaming. The exposure settings
-        are stored separately from the entity registry and must be migrated
-        manually. Set preserve_voice_exposure=False to skip this migration.
-
-        IMPORTANT LIMITATIONS:
-        - References in automations/scripts/dashboards are NOT automatically updated
-        - Entity history is preserved (HA 2022.4+)
-        - Some entities cannot be renamed:
-          - Entities without unique IDs
-          - Entities disabled by integration
-
-        EXAMPLES:
-        - Rename light: ha_rename_entity("light.bedroom_1", "light.master_bedroom")
-        - Rename with friendly name: ha_rename_entity("sensor.temp", "sensor.living_room_temp", name="Living Room Temperature")
-        - Rename without exposure migration: ha_rename_entity("light.old", "light.new", preserve_voice_exposure=False)
-
-        NOTE: This is different from renaming a device. Device and entity renaming are independent.
-        Renaming a device does NOT rename its entities. See ha_update_device() for device renaming.
-        For renaming both entity and device together, use ha_rename_entity_and_device().
-        """
-        # Parse preserve_voice_exposure (default True)
-        should_preserve_exposure = coerce_bool_param(
-            preserve_voice_exposure, "preserve_voice_exposure", default=True
-        )
-        assert should_preserve_exposure is not None  # default=True guarantees non-None
-        # Delegate to internal implementation
-        return await _rename_entity_internal(
-            entity_id=entity_id,
-            new_entity_id=new_entity_id,
-            name=name,
-            icon=icon,
-            preserve_voice_exposure=should_preserve_exposure,
-        )
-
-    @mcp.tool(
+    @tool(
+        name="ha_get_device",
+        tags={"Device Registry", "Zigbee", "Z-Wave", "Matter"},
         annotations={
+            "openWorldHint": False,
             "idempotentHint": True,
             "readOnlyHint": True,
-            "tags": ["system", "zigbee"],
-            "title": "Get Device",
-        }
+            "title": "Get Device (incl. Zigbee/ZHA/Z2M, Z-Wave and Matter)",
+        },
     )
     @log_tool_usage
     async def ha_get_device(
+        self,
         device_id: Annotated[
             str | None,
             Field(
@@ -412,7 +876,7 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         integration: Annotated[
             str | None,
             Field(
-                description="Filter devices by integration: 'zha', 'zigbee2mqtt', 'mqtt', 'hue', etc.",
+                description="Filter devices by integration: 'zha', 'zigbee2mqtt', 'zwave_js', 'mqtt', 'hue', etc.",
                 default=None,
             ),
         ] = None,
@@ -430,299 +894,112 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 default=None,
             ),
         ] = None,
+        limit: Annotated[
+            int,
+            Field(
+                default=50,
+                ge=1,
+                le=200,
+                description="Max devices to return per page in list mode (default: 50)",
+            ),
+        ] = 50,
+        offset: Annotated[
+            int,
+            Field(
+                default=0,
+                ge=0,
+                description="Number of devices to skip for pagination (default: 0)",
+            ),
+        ] = 0,
+        detail_level: Annotated[
+            Literal["summary", "full"],
+            Field(
+                default="summary",
+                description=(
+                    "'summary': basic device info and protocol identifiers (default for list mode). "
+                    "'full': include entities and all integration details. "
+                    "Single device lookups always return full detail."
+                ),
+            ),
+        ] = "summary",
     ) -> dict[str, Any]:
-        """
-        Get device information - list all devices or get details for a specific one.
+        """Get device information with pagination, including Zigbee (ZHA/Z2M) and Z-Wave JS devices.
 
-        Without device_id/entity_id: Lists all devices with optional filters.
-        With device_id or entity_id: Returns detailed info for that specific device.
+        Without device_id/entity_id: Lists devices with optional filters and pagination.
+        With device_id or entity_id: Returns full detail for that specific device.
 
-        **List all devices:**
-        - All devices: ha_get_device()
+        **List devices (paginated):**
+        - First page: ha_get_device()
+        - Next page: ha_get_device(offset=50)
         - By area: ha_get_device(area_id="living_room")
-        - By manufacturer: ha_get_device(manufacturer="Philips")
         - By integration: ha_get_device(integration="zigbee2mqtt")
-        - Combined filters: ha_get_device(integration="zha", area_id="kitchen")
+        - Full details in list: ha_get_device(detail_level="full", limit=10)
 
-        **Single device lookup:**
+        **Single device lookup (always full detail):**
         - By device_id: ha_get_device(device_id="abc123")
         - By entity_id: ha_get_device(entity_id="light.living_room")
 
-        **Zigbee automation tips:**
-        - ZHA triggers: Use `ieee_address` for zha_event triggers
-        - Z2M triggers: Use `friendly_name` for MQTT topics (zigbee2mqtt/{friendly_name}/action)
-
-        **Returns (list mode):**
-        - List of devices with device_id, name, manufacturer, model, area_id
-
-        **Returns (single device):**
-        - Full device details including integration_type, ieee_address, entities
+        **Zigbee:** integration="zha" or "zigbee2mqtt". Returns ieee_address, radio metrics.
+        **Z-Wave:** integration="zwave_js". Returns node_id, node_status.
+        **Matter:** integration="matter". Returns node_diagnostics (network type,
+        reachability, IPs, fabrics). For management use ha_manage_radio.
         """
         try:
-            # Get device registry
-            list_message: dict[str, Any] = {"type": "config/device_registry/list"}
-            list_result = await client.send_websocket_message(list_message)
+            # entity_id -> device_id is a single native entity read (no dump).
+            if entity_id and not device_id:
+                device_id = await _resolve_device_id_for_entity(self._client, entity_id)
 
-            if not list_result.get("success"):
-                return {
-                    "success": False,
-                    "error": f"Failed to access device registry: {list_result.get('error', 'Unknown error')}",
-                }
+            if device_id:
+                # Single-device lookup: the device AND its entities come from one
+                # component device_get(include_entities) frame — no device- or
+                # entity-registry dump — or the legacy registries when the
+                # component can't serve it.
+                all_devices, device_to_entities = await _single_device_and_entities(
+                    self._client, device_id
+                )
+                return await _get_single_device_result(
+                    self._client, device_id, entity_id, all_devices, device_to_entities
+                )
 
-            all_devices = list_result.get("result", [])
-
-            # Get entity registry
-            entity_message: dict[str, Any] = {"type": "config/entity_registry/list"}
-            entity_result = await client.send_websocket_message(entity_message)
-            all_entities = (
-                entity_result.get("result", []) if entity_result.get("success") else []
+            # List mode: the device rows come from the component's device_list (or
+            # legacy list). The entity registry is read only for the full-detail
+            # list (a bulk device->entity map, where one dump beats N joins) and
+            # skipped for a summary list.
+            need_full = detail_level == "full"
+            all_entities = await _fetch_entity_rows(self._client) if need_full else []
+            _, device_to_entities = _build_entity_maps(all_entities, need_full)
+            all_devices = await _fetch_device_rows(self._client)
+            return _list_devices_result(
+                all_devices,
+                device_to_entities,
+                integration,
+                area_id,
+                manufacturer,
+                limit,
+                offset,
+                detail_level,
             )
 
-            # Build entity -> device_id map
-            entity_to_device: dict[str, str] = {}
-            device_to_entities: dict[str, list[dict[str, Any]]] = {}
-            for e in all_entities:
-                eid = e.get("entity_id")
-                did = e.get("device_id")
-                if eid and did:
-                    entity_to_device[eid] = did
-                    if did not in device_to_entities:
-                        device_to_entities[did] = []
-                    device_to_entities[did].append(
-                        {
-                            "entity_id": eid,
-                            "name": e.get("name") or e.get("original_name"),
-                            "platform": e.get("platform"),
-                        }
-                    )
-
-            # If entity_id provided, find the device_id
-            if entity_id and not device_id:
-                device_id = entity_to_device.get(entity_id)
-                if not device_id:
-                    return {
-                        "success": False,
-                        "error": f"Entity '{entity_id}' not found or has no associated device",
-                        "suggestion": "Use ha_search_entities() to find valid entity IDs",
-                    }
-
-            # Helper function to extract integration info from a device
-            def get_device_info(device: dict[str, Any]) -> dict[str, Any]:
-                identifiers = device.get("identifiers", [])
-                connections = device.get("connections", [])
-
-                # Determine integration type and extract IEEE address
-                integration_sources = []
-                ieee_address = None
-                friendly_name = device.get("name_by_user") or device.get("name")
-                is_z2m = False
-
-                for identifier in identifiers:
-                    if isinstance(identifier, (list, tuple)) and len(identifier) >= 2:
-                        domain = identifier[0]
-                        value = str(identifier[1])
-                        if domain not in integration_sources:
-                            integration_sources.append(domain)
-
-                        # ZHA: identifier is ["zha", "IEEE_ADDRESS"]
-                        if domain == "zha":
-                            ieee_address = value
-
-                        # Z2M: identifier is ["mqtt", "zigbee2mqtt_0xIEEE"]
-                        if domain == "mqtt" and "zigbee2mqtt" in value.lower():
-                            is_z2m = True
-                            # Extract IEEE from "zigbee2mqtt_0x..." or "zigbee2mqtt_bridge_0x..."
-                            if "_0x" in value:
-                                ieee_address = "0x" + value.split("_0x")[-1]
-
-                # Also check connections for IEEE
-                for connection in connections:
-                    if isinstance(connection, (list, tuple)) and len(connection) >= 2:
-                        if connection[0] == "ieee" and not ieee_address:
-                            ieee_address = connection[1]
-
-                # Determine primary integration type
-                if "zha" in integration_sources:
-                    integration_type = "zha"
-                elif is_z2m:
-                    integration_type = "zigbee2mqtt"
-                elif "mqtt" in integration_sources:
-                    integration_type = "mqtt"
-                elif integration_sources:
-                    integration_type = integration_sources[0]
-                else:
-                    integration_type = "unknown"
-
-                device_info: dict[str, Any] = {
-                    "device_id": device.get("id"),
-                    "name": friendly_name,
-                    "manufacturer": device.get("manufacturer"),
-                    "model": device.get("model"),
-                    "sw_version": device.get("sw_version"),
-                    "area_id": device.get("area_id"),
-                    "integration_type": integration_type,
-                    "integration_sources": integration_sources,
-                    "via_device_id": device.get("via_device_id"),
-                }
-
-                # Add Zigbee-specific info
-                if ieee_address:
-                    device_info["ieee_address"] = ieee_address
-
-                if integration_type == "zigbee2mqtt":
-                    device_info["friendly_name"] = friendly_name
-                    device_info["mqtt_topic_hint"] = f"zigbee2mqtt/{friendly_name}/..."
-
-                if integration_type == "zha" and ieee_address:
-                    device_info["zha_trigger_hint"] = (
-                        f"Use ieee '{ieee_address}' for zha_event triggers"
-                    )
-
-                return device_info
-
-            # Single device lookup mode
-            if device_id:
-                device = next(
-                    (d for d in all_devices if d.get("id") == device_id), None
-                )
-                if not device:
-                    return {
-                        "success": False,
-                        "error": f"Device not found: {device_id}",
-                        "suggestion": "Use ha_get_device() to find valid device IDs",
-                    }
-
-                device_info = get_device_info(device)
-                device_info["entities"] = device_to_entities.get(device_id, [])
-
-                # Add extra fields for single lookup
-                device_info["name_by_user"] = device.get("name_by_user")
-                device_info["default_name"] = device.get("name")
-                device_info["hw_version"] = device.get("hw_version")
-                device_info["serial_number"] = device.get("serial_number")
-                device_info["disabled_by"] = device.get("disabled_by")
-                device_info["labels"] = device.get("labels", [])
-                device_info["config_entries"] = device.get("config_entries", [])
-                device_info["connections"] = device.get("connections", [])
-                device_info["identifiers"] = device.get("identifiers", [])
-
-                entities = device_info.get("entities", [])
-                return {
-                    "success": True,
-                    "device": device_info,
-                    "entities": entities,  # Also at top level for backward compatibility
-                    "entity_count": len(entities),
-                    "queried_by": "entity_id" if entity_id else "device_id",
-                    "queried_entity_id": entity_id,
-                }
-
-            # List mode - filter devices by any combination of filters
-            matched_devices = []
-            integration_lower = integration.lower() if integration else None
-            manufacturer_lower = manufacturer.lower() if manufacturer else None
-
-            for device in all_devices:
-                # Apply area filter
-                if area_id and device.get("area_id") != area_id:
-                    continue
-
-                # Apply manufacturer filter
-                if manufacturer_lower:
-                    device_manufacturer = (device.get("manufacturer") or "").lower()
-                    if manufacturer_lower not in device_manufacturer:
-                        continue
-
-                device_info = get_device_info(device)
-
-                # Apply integration filter if specified
-                if integration_lower:
-                    # Match integration
-                    if (
-                        integration_lower == "zigbee2mqtt"
-                        and device_info["integration_type"] != "zigbee2mqtt"
-                    ):
-                        continue
-                    elif (
-                        integration_lower == "zha"
-                        and device_info["integration_type"] != "zha"
-                    ):
-                        continue
-                    elif (
-                        integration_lower not in ["zigbee2mqtt", "zha"]
-                        and integration_lower not in device_info.get("integration_sources", [])
-                    ):
-                        continue
-
-                device_info["entities"] = device_to_entities.get(
-                    device.get("id"), []
-                )
-                matched_devices.append(device_info)
-
-            # Build result
-            result: dict[str, Any] = {
-                "success": True,
-                "count": len(matched_devices),
-                "total_devices": len(all_devices),
-                "devices": matched_devices,
-            }
-
-            # Add filter info
-            filters_applied = []
-            if integration:
-                result["integration_filter"] = integration
-                filters_applied.append(f"integration={integration}")
-            if area_id:
-                result["area_filter"] = area_id
-                filters_applied.append(f"area_id={area_id}")
-            if manufacturer:
-                result["manufacturer_filter"] = manufacturer
-                filters_applied.append(f"manufacturer={manufacturer}")
-
-            if filters_applied:
-                result["filters"] = filters_applied
-
-            # Find bridge device for Z2M
-            if integration_lower == "zigbee2mqtt":
-                bridge_info = None
-                for d in matched_devices:
-                    if (
-                        d.get("via_device_id") is None
-                        and "bridge" in (d.get("name") or "").lower()
-                    ):
-                        bridge_info = {
-                            "device_id": d.get("device_id"),
-                            "name": d.get("name"),
-                            "ieee_address": d.get("ieee_address"),
-                        }
-                        break
-                if bridge_info:
-                    result["bridge"] = bridge_info
-                result["usage_hint"] = (
-                    "Use 'friendly_name' for MQTT topics: zigbee2mqtt/{friendly_name}/action"
-                )
-            elif integration_lower == "zha":
-                result["usage_hint"] = (
-                    "Use 'ieee_address' for zha_event triggers in automations"
-                )
-
-            return result
-
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error getting device: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to get device: {str(e)}",
-            }
+            exception_to_structured_error(e)
+            return None  # unreachable: exception_to_structured_error always raises
 
-    @mcp.tool(
+    @tool(
+        name="ha_set_device",
+        tags={"Device Registry"},
         annotations={
+            "openWorldHint": False,
             "destructiveHint": True,
-            "tags": ["system"],
-            "title": "Update Device",
-        }
+            "title": "Set Device",
+        },
     )
+    @with_auto_backup(domain="device", id_param="device_id")
     @log_tool_usage
-    async def ha_update_device(
+    async def ha_set_device(
+        self,
         device_id: Annotated[
             str,
             Field(description="Device ID to update"),
@@ -750,6 +1027,7 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         ] = None,
         labels: Annotated[
             str | list[str] | None,
+            JSON_STRING_COERCION,
             Field(
                 description="Labels to assign to the device (replaces existing labels)",
                 default=None,
@@ -760,11 +1038,11 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         Update device properties such as name, area, disabled state, or labels.
 
         IMPORTANT: Renaming a device does NOT rename its entities!
-        Device and entity names are independent. To rename entities, use ha_rename_entity().
+        Device and entity names are independent. To rename entities, use ha_set_entity(new_entity_id=...).
 
         Common workflow for full rename:
-        1. ha_update_device(device_id="abc", name="Living Room Sensor")  # Rename device
-        2. ha_rename_entity(entity_id="sensor.old", new_entity_id="sensor.living_room")  # Rename entities separately
+        1. ha_set_device(device_id="abc", name="Living Room Sensor")  # Rename device
+        2. ha_set_entity("sensor.old", new_entity_id="sensor.living_room")  # Rename entities separately
 
         PARAMETERS:
         - name: Sets the user-defined display name (name_by_user)
@@ -773,25 +1051,35 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - labels: List of labels (replaces existing labels)
 
         EXAMPLES:
-        - Rename device: ha_update_device("abc123", name="Living Room Hub")
-        - Move to area: ha_update_device("abc123", area_id="living_room")
-        - Disable device: ha_update_device("abc123", disabled_by="user")
-        - Enable device: ha_update_device("abc123", disabled_by="")
-        - Add labels: ha_update_device("abc123", labels=["important", "sensor"])
+        - Rename device: ha_set_device("abc123", name="Living Room Hub")
+        - Move to area: ha_set_device("abc123", area_id="living_room")
+        - Disable device: ha_set_device("abc123", disabled_by="user")
+        - Enable device: ha_set_device("abc123", disabled_by="")
+        - Add labels: ha_set_device("abc123", labels=["important", "sensor"])
         """
-        # Parse labels if provided as string
         parsed_labels = None
         if labels is not None:
             try:
                 parsed_labels = parse_string_list_param(labels, "labels")
             except ValueError as e:
-                return create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"Invalid labels parameter: {e}",
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        f"Invalid labels parameter: {e}",
+                    )
                 )
 
-        # Delegate to internal implementation
-        return await _update_device_internal(
+        # Empty/whitespace device_id would reach the
+        # ``config/device_registry/update`` WS message inside
+        # ``_update_device_internal`` and surface as a misleading HA
+        # "device not found" — same destructive-WS-call class as the
+        # ``ha_remove_device`` guard added in this PR.
+        validate_identifier_not_empty(
+            device_id,
+            "device_id",
+            suggestions=["Use ha_get_device() to find valid device IDs"],
+        )
+        return await self._update_device_internal(
             device_id=device_id,
             name=name,
             area_id=area_id,
@@ -799,16 +1087,20 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
             labels=parsed_labels,
         )
 
-    @mcp.tool(
+    @tool(
+        name="ha_remove_device",
+        tags={"Device Registry"},
         annotations={
+            "openWorldHint": False,
             "destructiveHint": True,
             "idempotentHint": True,
-            "tags": ["system"],
             "title": "Remove Device",
-        }
+        },
     )
+    @with_auto_backup(domain="device", id_param="device_id")
     @log_tool_usage
     async def ha_remove_device(
+        self,
         device_id: Annotated[
             str,
             Field(description="Device ID to remove from the registry"),
@@ -829,63 +1121,36 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - Remove orphaned device: ha_remove_device("abc123def456")
 
         NOTE: For most use cases, consider disabling the device instead:
-        ha_update_device(device_id="abc123", disabled_by="user")
+        ha_set_device(device_id="abc123", disabled_by="user")
         """
         try:
-            # First, get device details to find config entries
-            list_message: dict[str, Any] = {"type": "config/device_registry/list"}
-            list_result = await client.send_websocket_message(list_message)
-
-            if not list_result.get("success"):
-                return {
-                    "success": False,
-                    "error": f"Failed to access device registry: {list_result.get('error', 'Unknown error')}",
-                }
-
-            devices = list_result.get("result", [])
-            device = next((d for d in devices if d.get("id") == device_id), None)
-
-            if not device:
-                return {
-                    "success": False,
-                    "error": f"Device not found: {device_id}",
-                    "suggestion": "Use ha_get_device() to find valid device IDs",
-                }
+            # Empty/whitespace device_id would slip past the local-filter dict
+            # lookup below and surface as a generic "Device not found: " error
+            # after a wasted registry-list round-trip.
+            validate_identifier_not_empty(
+                device_id,
+                "device_id",
+                suggestions=["Use ha_get_device() to find valid device IDs"],
+            )
+            device = await _lookup_device_for_remove(self._client, device_id)
 
             config_entries = device.get("config_entries", [])
-
+            device_name = device.get("name_by_user") or device.get("name")
             if not config_entries:
-                return {
-                    "success": False,
-                    "error": "Device has no config entries - cannot be removed via this method",
-                    "device_id": device_id,
-                    "device_name": device.get("name_by_user") or device.get("name"),
-                    "suggestion": "This device may be managed by an integration directly. Try disabling it instead.",
-                }
-
-            # Remove device from each config entry
-            removal_results = []
-            for config_entry_id in config_entries:
-                remove_message: dict[str, Any] = {
-                    "type": "config/device_registry/remove_config_entry",
-                    "device_id": device_id,
-                    "config_entry_id": config_entry_id,
-                }
-
-                remove_result = await client.send_websocket_message(remove_message)
-                removal_results.append(
-                    {
-                        "config_entry_id": config_entry_id,
-                        "success": remove_result.get("success", False),
-                        "error": (
-                            remove_result.get("error")
-                            if not remove_result.get("success")
-                            else None
-                        ),
-                    }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        "Device has no config entries - cannot be removed via this method",
+                        suggestions=[
+                            "This device may be managed by an integration directly. Try disabling it instead.",
+                        ],
+                        context={"device_id": device_id, "device_name": device_name},
+                    )
                 )
 
-            # Check if all removals succeeded
+            removal_results = await _remove_device_config_entries(
+                self._client, device_id, config_entries
+            )
             all_succeeded = all(r["success"] for r in removal_results)
             any_succeeded = any(r["success"] for r in removal_results)
 
@@ -893,7 +1158,7 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 return {
                     "success": True,
                     "device_id": device_id,
-                    "device_name": device.get("name_by_user") or device.get("name"),
+                    "device_name": device_name,
                     "config_entries_removed": len(config_entries),
                     "message": f"Successfully removed device from {len(config_entries)} config entry/entries",
                 }
@@ -902,218 +1167,37 @@ def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                     "success": True,
                     "partial": True,
                     "device_id": device_id,
-                    "device_name": device.get("name_by_user") or device.get("name"),
+                    "device_name": device_name,
                     "removal_results": removal_results,
                     "message": "Device partially removed - some config entries could not be removed",
                 }
             else:
-                return {
-                    "success": False,
-                    "error": "Failed to remove device from any config entries",
-                    "device_id": device_id,
-                    "removal_results": removal_results,
-                    "suggestion": "Device may be actively managed by its integration. Try disabling it instead.",
-                }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.SERVICE_CALL_FAILED,
+                        "Failed to remove device from any config entries",
+                        suggestions=[
+                            "Device may be actively managed by its integration. Try disabling it instead.",
+                        ],
+                        context={
+                            "device_id": device_id,
+                            "removal_results": removal_results,
+                        },
+                    )
+                )
 
+        except ToolError:
+            raise
         except Exception as e:
             logger.error(f"Error removing device: {e}")
-            return {
-                "success": False,
-                "error": f"Device removal failed: {str(e)}",
-                "device_id": device_id,
-            }
-
-    @mcp.tool(
-        annotations={"destructiveHint": True, "title": "Rename Entity and Device"}
-    )
-    @log_tool_usage
-    async def ha_rename_entity_and_device(
-        entity_id: Annotated[
-            str,
-            Field(
-                description="Entity ID to rename (e.g., 'light.bedroom_lamp'). Used to find associated device."
-            ),
-        ],
-        new_entity_id: Annotated[
-            str,
-            Field(
-                description="New entity ID (e.g., 'light.master_bedroom_lamp'). Domain must match."
-            ),
-        ],
-        new_device_name: Annotated[
-            str | None,
-            Field(
-                description="New display name for the device. If not provided, device name is not changed.",
-                default=None,
-            ),
-        ] = None,
-        new_entity_name: Annotated[
-            str | None,
-            Field(
-                description="New friendly name for the entity. If not provided, entity name is not changed.",
-                default=None,
-            ),
-        ] = None,
-        preserve_voice_exposure: Annotated[
-            bool | str | None,
-            Field(
-                description=(
-                    "Migrate voice assistant exposure settings to the new entity_id. "
-                    "Defaults to True."
-                ),
-                default=None,
-            ),
-        ] = None,
-    ) -> dict[str, Any]:
-        """
-        Convenience tool to rename both an entity and its associated device in one operation.
-
-        This tool:
-        1. Finds the device associated with the entity
-        2. Renames the entity (changing entity_id)
-        3. Renames the device (changing display name)
-        4. Preserves voice assistant exposure settings (by default)
-
-        WHEN TO USE:
-        - When you want to rename a device and its primary entity together
-        - For smart home devices where device and entity should have matching names
-
-        IMPORTANT:
-        - If the entity has multiple associated entities (e.g., a smart bulb with brightness, color, etc.),
-          only the specified entity is renamed. Other entities retain their original IDs.
-        - If the entity has no associated device, only the entity is renamed.
-
-        EXAMPLES:
-        - Rename lamp: ha_rename_entity_and_device("light.bedroom_1", "light.master_bedroom", "Master Bedroom Lamp")
-        - Rename only entity_id: ha_rename_entity_and_device("sensor.temp", "sensor.living_room_temp")
-
-        See also:
-        - ha_rename_entity() - Rename only the entity
-        - ha_update_device() - Update only the device
-        """
-        try:
-            # Parse preserve_voice_exposure (default True)
-            should_preserve_exposure = coerce_bool_param(
-                preserve_voice_exposure, "preserve_voice_exposure", default=True
+            exception_to_structured_error(
+                e,
+                context={"device_id": device_id},
             )
-            assert should_preserve_exposure is not None  # default=True guarantees non-None
+            return None  # unreachable: exception_to_structured_error always raises
+        return None  # py/mixed-returns: explicit terminal; error handlers above always raise (NoReturn), unreachable
 
-            results: dict[str, Any] = {
-                "entity_rename": None,
-                "device_rename": None,
-            }
 
-            # Step 1: Find the device associated with this entity
-            entity_registry_msg: dict[str, Any] = {
-                "type": "config/entity_registry/list"
-            }
-            entity_registry_result = await client.send_websocket_message(
-                entity_registry_msg
-            )
-
-            device_id = None
-            if entity_registry_result.get("success"):
-                entities = entity_registry_result.get("result", [])
-                for ent in entities:
-                    if ent.get("entity_id") == entity_id:
-                        device_id = ent.get("device_id")
-                        break
-
-            # Step 2: Rename the entity using internal helper (handles voice exposure migration)
-            entity_rename_result = await _rename_entity_internal(
-                entity_id=entity_id,
-                new_entity_id=new_entity_id,
-                name=new_entity_name,
-                preserve_voice_exposure=should_preserve_exposure,
-            )
-
-            results["entity_rename"] = entity_rename_result
-
-            if not entity_rename_result.get("success"):
-                return {
-                    "success": False,
-                    "error": f"Entity rename failed: {entity_rename_result.get('error')}",
-                    "results": results,
-                }
-
-            # Step 3: Rename the device if we found one and a new name was provided
-            if device_id and new_device_name:
-                device_rename_result = await _update_device_internal(
-                    device_id=device_id,
-                    name=new_device_name,
-                )
-                results["device_rename"] = device_rename_result
-
-                if not device_rename_result.get("success"):
-                    # Entity was renamed but device rename failed - report partial success
-                    return {
-                        "success": True,
-                        "partial": True,
-                        "message": "Entity renamed successfully but device rename failed",
-                        "old_entity_id": entity_id,
-                        "new_entity_id": new_entity_id,
-                        "device_id": device_id,
-                        "results": results,
-                        "warning": f"Device rename failed: {device_rename_result.get('error')}",
-                    }
-            elif device_id and not new_device_name:
-                results["device_rename"] = {
-                    "skipped": True,
-                    "reason": "No new_device_name provided",
-                    "device_id": device_id,
-                }
-            elif not device_id:
-                results["device_rename"] = {
-                    "skipped": True,
-                    "reason": "Entity has no associated device",
-                }
-
-            # Build success response
-            response: dict[str, Any] = {
-                "success": True,
-                "old_entity_id": entity_id,
-                "new_entity_id": new_entity_id,
-                "device_id": device_id,
-                "results": results,
-            }
-
-            if (
-                device_id
-                and new_device_name
-                and results["device_rename"].get("success")
-            ):
-                response["message"] = (
-                    f"Successfully renamed entity ({entity_id} -> {new_entity_id}) "
-                    f"and device ({new_device_name})"
-                )
-            elif device_id:
-                response["message"] = (
-                    f"Successfully renamed entity ({entity_id} -> {new_entity_id}). "
-                    f"Device name was not changed."
-                )
-            else:
-                response["message"] = (
-                    f"Successfully renamed entity ({entity_id} -> {new_entity_id}). "
-                    f"No associated device found."
-                )
-
-            # Include voice exposure migration info if available
-            if entity_rename_result.get("voice_exposure_migration"):
-                response["voice_exposure_migration"] = entity_rename_result[
-                    "voice_exposure_migration"
-                ]
-
-            response["warning"] = (
-                "Remember to update any automations, scripts, or dashboards "
-                "that reference the old entity_id"
-            )
-
-            return response
-
-        except Exception as e:
-            logger.error(f"Error in rename entity and device: {e}")
-            return {
-                "success": False,
-                "error": f"Rename failed: {str(e)}",
-                "entity_id": entity_id,
-            }
+def register_registry_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register device registry management tools."""
+    register_tool_methods(mcp, RegistryTools(client))

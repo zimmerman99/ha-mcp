@@ -1,16 +1,17 @@
 """
-E2E tests for ha_get_history and ha_get_statistics tools.
+E2E tests for ha_get_history tool (history and statistics sources).
 
 Tests the historical data retrieval functionality for accessing
-state change history and long-term statistics.
+state change history and long-term statistics via ha_get_history.
 """
 
 import logging
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
-from ...utilities.assertions import assert_mcp_success, parse_mcp_result
+from ...utilities.assertions import assert_mcp_success, parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +44,22 @@ class TestGetHistory:
 
         if inner_data["entities"]:
             entity_history = inner_data["entities"][0]
-            assert "entity_id" in entity_history, (
-                f"Missing entity_id: {entity_history}"
-            )
+            assert "entity_id" in entity_history, f"Missing entity_id: {entity_history}"
             assert entity_history["entity_id"] == "sun.sun", (
                 f"Entity ID mismatch: {entity_history}"
             )
             assert "states" in entity_history, f"Missing states: {entity_history}"
 
-            state_count = entity_history.get("count", len(entity_history.get("states", [])))
+            state_count = entity_history.get(
+                "count", len(entity_history.get("states", []))
+            )
             logger.info(f"Retrieved {state_count} state changes for sun.sun")
 
             if entity_history.get("states"):
                 first_state = entity_history["states"][0]
-                logger.info(f"First state: {first_state.get('state')} at {first_state.get('last_changed')}")
+                logger.info(
+                    f"First state: {first_state.get('state')} at {first_state.get('last_changed')}"
+                )
         else:
             logger.info("No history data available (may be normal for short periods)")
 
@@ -114,15 +117,12 @@ class TestGetHistory:
 
         # Search for a sensor to add to the query
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "sensor", "limit": 2},
+            "ha_search",
+            {"domain_filter": "sensor", "limit": 2},
         )
         search_data = parse_mcp_result(search_result)
 
-        if "data" in search_data:
-            sensors = search_data.get("data", {}).get("results", [])
-        else:
-            sensors = search_data.get("results", [])
+        sensors = search_data.get("entities", [])
 
         entities = ["sun.sun"]
         if sensors:
@@ -165,16 +165,18 @@ class TestGetHistory:
         if inner_data.get("entities"):
             entity_history = inner_data["entities"][0]
             states = entity_history.get("states", [])
-            total_available = entity_history.get("total_available", len(states))
+            total_count = entity_history.get("total_count", len(states))
 
-            logger.info(f"Returned {len(states)} states (total available: {total_available})")
+            logger.info(
+                f"Returned {len(states)} states (total available: {total_count})"
+            )
 
             # Should respect limit
             assert len(states) <= 5, f"Limit not respected: {len(states)} states"
 
-            # Check truncated flag if more data was available
-            if entity_history.get("truncated"):
-                logger.info("Response correctly marked as truncated")
+            # Check has_more flag if more data was available
+            if entity_history.get("has_more"):
+                logger.info("Response correctly marked as has_more")
 
     async def test_get_history_minimal_response(self, mcp_client):
         """Test history with minimal_response option."""
@@ -221,7 +223,9 @@ class TestGetHistory:
             logger.info(f"Full response state fields: {list(first_state.keys())}")
             # Full response should include attributes
             if "attributes" in first_state:
-                logger.info(f"Attributes included: {list(first_state['attributes'].keys())}")
+                logger.info(
+                    f"Attributes included: {list(first_state['attributes'].keys())}"
+                )
 
     async def test_get_history_nonexistent_entity(self, mcp_client):
         """Test history for non-existent entity."""
@@ -244,7 +248,9 @@ class TestGetHistory:
             if inner_data.get("entities"):
                 entity_history = inner_data["entities"][0]
                 states = entity_history.get("states", [])
-                logger.info(f"Non-existent entity returned {len(states)} states (expected 0)")
+                logger.info(
+                    f"Non-existent entity returned {len(states)} states (expected 0)"
+                )
         else:
             logger.info("Non-existent entity properly handled")
 
@@ -266,7 +272,9 @@ class TestGetHistory:
         # History data may be nested in 'data' key
         inner_data = data.get("data", data)
         if inner_data.get("success") or "entities" in inner_data:
-            logger.info(f"Comma-separated entities accepted: {len(inner_data.get('entities', []))} entities")
+            logger.info(
+                f"Comma-separated entities accepted: {len(inner_data.get('entities', []))} entities"
+            )
         else:
             logger.info("Comma-separated format may not be supported")
 
@@ -304,15 +312,23 @@ class TestGetHistory:
 
             for idx, state in enumerate(states):
                 # Verify both timestamp fields are present
-                assert "last_changed" in state, f"State {idx} missing 'last_changed': {state}"
-                assert "last_updated" in state, f"State {idx} missing 'last_updated': {state}"
+                assert "last_changed" in state, (
+                    f"State {idx} missing 'last_changed': {state}"
+                )
+                assert "last_updated" in state, (
+                    f"State {idx} missing 'last_updated': {state}"
+                )
 
                 # Verify timestamps are not null
                 last_changed = state["last_changed"]
                 last_updated = state["last_updated"]
 
-                assert last_changed is not None, f"State {idx} has null last_changed: {state}"
-                assert last_updated is not None, f"State {idx} has null last_updated: {state}"
+                assert last_changed is not None, (
+                    f"State {idx} has null last_changed: {state}"
+                )
+                assert last_updated is not None, (
+                    f"State {idx} has null last_updated: {state}"
+                )
 
                 # Verify timestamps are valid ISO 8601 strings
                 assert isinstance(last_changed, str), (
@@ -326,39 +342,46 @@ class TestGetHistory:
                 try:
                     datetime.fromisoformat(last_changed.replace("Z", "+00:00"))
                 except ValueError as e:
-                    pytest.fail(f"State {idx} last_changed not valid ISO format: {last_changed}: {e}")
+                    pytest.fail(
+                        f"State {idx} last_changed not valid ISO format: {last_changed}: {e}"
+                    )
 
                 try:
                     datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
                 except ValueError as e:
-                    pytest.fail(f"State {idx} last_updated not valid ISO format: {last_updated}: {e}")
+                    pytest.fail(
+                        f"State {idx} last_updated not valid ISO format: {last_updated}: {e}"
+                    )
 
-            logger.info("✓ All state entries have valid last_changed and last_updated timestamps")
-            logger.info(f"Sample: last_changed={states[0]['last_changed']}, last_updated={states[0]['last_updated']}")
+            logger.info(
+                "✓ All state entries have valid last_changed and last_updated timestamps"
+            )
+            logger.info(
+                f"Sample: last_changed={states[0]['last_changed']}, last_updated={states[0]['last_updated']}"
+            )
         else:
-            logger.warning("No state history available for test (may be normal for short periods)")
+            logger.warning(
+                "No state history available for test (may be normal for short periods)"
+            )
 
 
 @pytest.mark.asyncio
 @pytest.mark.core
-class TestGetStatistics:
-    """Test ha_get_statistics tool functionality."""
+class TestGetHistoryStatisticsSource:
+    """Test ha_get_history with source="statistics" functionality."""
 
     async def test_get_statistics_single_entity(self, mcp_client):
         """Test retrieving statistics for a sensor with state_class."""
-        logger.info("Testing ha_get_statistics")
+        logger.info("Testing ha_get_history with source=statistics")
 
         # Search for a sensor with state_class (numeric sensors)
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
+            "ha_search",
             {"query": "temperature", "domain_filter": "sensor", "limit": 5},
         )
         search_data = parse_mcp_result(search_result)
 
-        if "data" in search_data:
-            sensors = search_data.get("data", {}).get("results", [])
-        else:
-            sensors = search_data.get("results", [])
+        sensors = search_data.get("entities", [])
 
         # Try to find a numeric sensor
         test_sensor = None
@@ -371,14 +394,11 @@ class TestGetStatistics:
         if not test_sensor:
             # Fallback: try any sensor
             search_result = await mcp_client.call_tool(
-                "ha_search_entities",
-                {"query": "", "domain_filter": "sensor", "limit": 5},
+                "ha_search",
+                {"domain_filter": "sensor", "limit": 5},
             )
             search_data = parse_mcp_result(search_result)
-            if "data" in search_data:
-                sensors = search_data.get("data", {}).get("results", [])
-            else:
-                sensors = search_data.get("results", [])
+            sensors = search_data.get("entities", [])
             if sensors:
                 test_sensor = sensors[0].get("entity_id")
 
@@ -388,8 +408,9 @@ class TestGetStatistics:
         logger.info(f"Testing statistics with: {test_sensor}")
 
         result = await mcp_client.call_tool(
-            "ha_get_statistics",
+            "ha_get_history",
             {
+                "source": "statistics",
                 "entity_ids": test_sensor,
                 "start_time": "7d",
                 "period": "day",
@@ -402,47 +423,51 @@ class TestGetStatistics:
         inner_data = data.get("data", data)
         if inner_data.get("success") or "entities" in inner_data:
             assert "entities" in inner_data, f"Missing 'entities': {data}"
-            logger.info(f"Statistics retrieved for {len(inner_data.get('entities', []))} entities")
+            logger.info(
+                f"Statistics retrieved for {len(inner_data.get('entities', []))} entities"
+            )
 
             if inner_data["entities"]:
                 stats_data = inner_data["entities"][0]
-                stats_count = stats_data.get("count", len(stats_data.get("statistics", [])))
+                stats_count = stats_data.get(
+                    "count", len(stats_data.get("statistics", []))
+                )
                 logger.info(f"Retrieved {stats_count} statistical periods")
                 logger.info(f"Period type: {stats_data.get('period')}")
                 if stats_data.get("unit_of_measurement"):
                     logger.info(f"Unit: {stats_data['unit_of_measurement']}")
         else:
             # Statistics may not be available for all sensors
-            logger.info(f"Statistics not available: {inner_data.get('error', 'Unknown error')}")
+            logger.info(
+                f"Statistics not available: {inner_data.get('error', 'Unknown error')}"
+            )
             if "warnings" in inner_data or "suggestions" in inner_data:
                 logger.info("This is expected for sensors without state_class")
 
     async def test_get_statistics_different_periods(self, mcp_client):
         """Test statistics with different aggregation periods."""
-        logger.info("Testing ha_get_statistics with different periods")
+        logger.info("Testing ha_get_history statistics with different periods")
 
         # Find a sensor
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "sensor", "limit": 1},
+            "ha_search",
+            {"domain_filter": "sensor", "limit": 1},
         )
         search_data = parse_mcp_result(search_result)
-        if "data" in search_data:
-            sensors = search_data.get("data", {}).get("results", [])
-        else:
-            sensors = search_data.get("results", [])
+        sensors = search_data.get("entities", [])
 
         if not sensors:
             pytest.skip("No sensors available for test")
 
         test_sensor = sensors[0].get("entity_id")
 
-        periods = ["5minute", "hour", "day", "week", "month"]
+        periods = ["5minute", "hour", "day", "week", "month", "year"]
 
         for period in periods:
             result = await mcp_client.call_tool(
-                "ha_get_statistics",
+                "ha_get_history",
                 {
+                    "source": "statistics",
                     "entity_ids": test_sensor,
                     "start_time": "30d",
                     "period": period,
@@ -457,22 +482,21 @@ class TestGetStatistics:
                 logger.info(f"Period '{period}' accepted")
             else:
                 # 5minute may not be available for older data
-                logger.info(f"Period '{period}' may not have data: {str(inner_data.get('error', ''))[:50]}")
+                logger.info(
+                    f"Period '{period}' may not have data: {str(inner_data.get('error', ''))[:50]}"
+                )
 
     async def test_get_statistics_specific_types(self, mcp_client):
         """Test statistics with specific statistic types."""
-        logger.info("Testing ha_get_statistics with specific types")
+        logger.info("Testing ha_get_history statistics with specific types")
 
         # Find a sensor
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "sensor", "limit": 1},
+            "ha_search",
+            {"domain_filter": "sensor", "limit": 1},
         )
         search_data = parse_mcp_result(search_result)
-        if "data" in search_data:
-            sensors = search_data.get("data", {}).get("results", [])
-        else:
-            sensors = search_data.get("results", [])
+        sensors = search_data.get("entities", [])
 
         if not sensors:
             pytest.skip("No sensors available for test")
@@ -480,8 +504,9 @@ class TestGetStatistics:
         test_sensor = sensors[0].get("entity_id")
 
         result = await mcp_client.call_tool(
-            "ha_get_statistics",
+            "ha_get_history",
             {
+                "source": "statistics",
                 "entity_ids": test_sensor,
                 "start_time": "7d",
                 "period": "day",
@@ -500,26 +525,31 @@ class TestGetStatistics:
             logger.info("Specific statistic types query succeeded")
 
             # Check if requested types are in response
-            if inner_data.get("entities") and inner_data["entities"][0].get("statistics"):
+            if inner_data.get("entities") and inner_data["entities"][0].get(
+                "statistics"
+            ):
                 first_stat = inner_data["entities"][0]["statistics"][0]
                 logger.info(f"Statistic fields returned: {list(first_stat.keys())}")
         else:
-            logger.info(f"Statistics query failed (may be expected): {str(inner_data.get('error', ''))[:50]}")
+            logger.info(
+                f"Statistics query failed (may be expected): {str(inner_data.get('error', ''))[:50]}"
+            )
 
     async def test_get_statistics_invalid_period(self, mcp_client):
         """Test statistics with invalid period."""
-        logger.info("Testing ha_get_statistics with invalid period")
+        logger.info("Testing ha_get_history statistics with invalid period")
 
-        result = await mcp_client.call_tool(
-            "ha_get_statistics",
+        # Use safe_call_tool since we expect this to fail (invalid period)
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
             {
+                "source": "statistics",
                 "entity_ids": "sun.sun",
                 "start_time": "7d",
                 "period": "invalid_period",
             },
         )
-
-        data = parse_mcp_result(result)
 
         # Statistics data may be nested in 'data' key
         inner_data = data.get("data", data)
@@ -539,12 +569,13 @@ class TestGetStatistics:
 
     async def test_get_statistics_entity_without_state_class(self, mcp_client):
         """Test statistics for entity without state_class (should return warning)."""
-        logger.info("Testing ha_get_statistics with entity without state_class")
+        logger.info("Testing ha_get_history statistics with entity without state_class")
 
         # sun.sun doesn't have state_class
         result = await mcp_client.call_tool(
-            "ha_get_statistics",
+            "ha_get_history",
             {
+                "source": "statistics",
                 "entity_ids": "sun.sun",
                 "start_time": "7d",
                 "period": "day",
@@ -558,15 +589,18 @@ class TestGetStatistics:
         # May succeed but with warnings or empty data
         if inner_data.get("success") or "entities" in inner_data:
             if inner_data.get("warnings"):
-                logger.info(f"Properly warned about no statistics: {inner_data['warnings']}")
+                logger.info(
+                    f"Properly warned about no statistics: {inner_data['warnings']}"
+                )
             entities_data = inner_data.get("entities", [])
             if entities_data and entities_data[0].get("count") == 0:
-                logger.info("Entity returned 0 statistics (expected for non-numeric entity)")
+                logger.info(
+                    "Entity returned 0 statistics (expected for non-numeric entity)"
+                )
         else:
             logger.info("Properly returned error for entity without state_class")
 
 
-@pytest.mark.asyncio
 @pytest.mark.core
 async def test_get_history_query_params_in_response(mcp_client):
     """Test that query parameters are included in response."""
@@ -591,10 +625,135 @@ async def test_get_history_query_params_in_response(mcp_client):
     if "query_params" in inner_data:
         params = inner_data["query_params"]
         logger.info(f"Query params in response: {params}")
-        assert params.get("minimal_response") is True, f"minimal_response mismatch: {params}"
+        assert params.get("minimal_response") is True, (
+            f"minimal_response mismatch: {params}"
+        )
         assert params.get("significant_changes_only") is True, (
             f"significant_changes_only mismatch: {params}"
         )
         assert params.get("limit") == 10, f"limit mismatch: {params}"
     else:
         logger.info("query_params not in response (may be by design)")
+
+
+@pytest.mark.core
+class TestGetHistoryNegativeInputs:
+    """Negative-input tests for ha_get_history."""
+
+    async def test_empty_string_entity_id_rejected(self, mcp_client: Any) -> None:
+        """Rejects an invalid entity ID that cannot be resolved by the WebSocket handler.
+
+        The empty string reaches the WS history handler which replies with
+        ``success=False``. That failure is raised as
+        ``HomeAssistantCommandError`` and classified by the terminal
+        ``command failed:`` branch as ``SERVICE_CALL_FAILED`` (a WS
+        command failure is a known failure mode, not an unexpected
+        internal error).
+        """
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
+            {"entity_ids": "", "start_time": "1h"},
+        )
+        assert result["success"] is False
+        assert result["error"]["code"] == "SERVICE_CALL_FAILED"
+
+    async def test_empty_list_entity_ids_rejected(self, mcp_client: Any) -> None:
+        """Rejects an empty list before any network call is made."""
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
+            {"entity_ids": [], "start_time": "1h"},
+        )
+        assert result["success"] is False
+        assert result["error"]["code"] == "VALIDATION_MISSING_PARAMETER"
+
+    async def test_offset_pagination_single_entity(self, mcp_client: Any) -> None:
+        """Offset pagination works for a single entity and returns correct metadata.
+
+        Queries ``input_number.e2e_pagination_seed`` — the entity that the seed
+        recorder DB in ``tests/initial_test_state/home-assistant_v2.db`` ships
+        with 11 pre-baked state-change rows for. The conftest fixture shifts
+        those rows' timestamps forward each session so they fall inside any
+        reasonable history window. Previous reliance on
+        ``sensor.home_temperature`` (which never existed in the seed) was the
+        original cause of the silent skip flagged by #366.
+
+        Previously HAOS-skipped (#1349 hypothesis: states_meta orphan). The
+        real cause was diagnosed in PR #1361 from the inaddon diagnostics
+        artifact: ``refresh_recorder_in_qcow2`` left the workdir DB in WAL
+        mode with unsynced WAL frames, so the .db copy-in landed in the
+        qcow2 missing pages. HA Core's ``basic_sanity_check`` raised
+        ``sqlite3.DatabaseError: database disk image is malformed`` on
+        first boot and renamed the seed to ``.corrupt.<ts>`` before
+        starting with an empty DB — making the live state the only row
+        ha_get_history could surface. Fixed by checkpointing WAL and
+        switching to DELETE journal mode pre-UPDATE in
+        ``haos_runtime.refresh_recorder_in_qcow2``.
+        """
+        target = "input_number.e2e_pagination_seed"
+        # First page: offset=0, limit=5
+        result_p1 = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
+            {"entity_ids": target, "start_time": "24h", "limit": 5, "offset": 0},
+        )
+        # safe_call_tool returns the parsed envelope; the history payload is
+        # nested under "data" — matches the unwrap pattern used by
+        # test_get_history_single_entity earlier in this file. Without this
+        # unwrap the assertions below read the wrong dict level and
+        # `success` is always None — a latent bug uncovered by the same
+        # #366 audit.
+        inner_p1 = result_p1.get("data", result_p1)
+        # The seed ships ≥10 rows for ``input_number.e2e_pagination_seed`` and
+        # the conftest fixture shifts their timestamps into the 24h window.
+        # Pagination preconditions are therefore guaranteed; assert rather
+        # than pytest.skip so a regression (empty seed, broken refresh)
+        # fails loudly instead of silently passing.
+        assert inner_p1.get("success"), (
+            f"ha_get_history failed for {target}: {inner_p1!r}"
+        )
+        entities_p1 = inner_p1.get("entities", [])
+        assert entities_p1, f"No entities returned for {target}: {inner_p1!r}"
+
+        entity_p1 = entities_p1[0]
+        assert entity_p1["offset"] == 0
+        assert entity_p1["limit"] == 5
+        assert entity_p1["total_count"] >= 10, (
+            f"Expected >=10 seeded rows for {target}, got "
+            f"{entity_p1['total_count']} - recorder seed or timestamp refresh "
+            f"may be broken; see conftest._refresh_recorder_timestamps."
+        )
+        assert entity_p1["has_more"] is True
+        assert entity_p1["next_offset"] == 5
+
+        # Second page: offset=5
+        result_p2 = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
+            {"entity_ids": target, "start_time": "24h", "limit": 5, "offset": 5},
+        )
+        inner_p2 = result_p2.get("data", result_p2)
+        assert inner_p2.get("success")
+        entity_p2 = inner_p2["entities"][0]
+        assert entity_p2["offset"] == 5
+        assert entity_p2["total_count"] == entity_p1["total_count"]
+        assert len(entity_p2.get("states", [])) >= 1, (
+            f"Second page returned no rows: {entity_p2!r}"
+        )
+
+    async def test_multi_entity_offset_rejected(self, mcp_client: Any) -> None:
+        """offset > 0 with multiple entity_ids is rejected before any network call."""
+        result = await safe_call_tool(
+            mcp_client,
+            "ha_get_history",
+            {
+                "entity_ids": ["sensor.home_temperature", "sensor.home_humidity"],
+                "start_time": "1h",
+                "offset": 1,
+                "limit": 5,
+            },
+        )
+        assert result["success"] is False
+        assert result["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert "single entity_id" in result["error"]["message"]

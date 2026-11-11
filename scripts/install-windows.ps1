@@ -4,8 +4,34 @@
 
 $ErrorActionPreference = "Stop"
 
-# Configuration
-$ConfigDir = "$env:APPDATA\Claude"
+# Configuration: detect which Claude Desktop variant is installed so the
+# config lands where Claude will actually read it. Get-AppxPackage queries
+# the package registry, which is authoritative — it won't match a stale
+# %LOCALAPPDATA%\Packages\Claude_* folder left behind after an MSIX uninstall.
+try {
+    $ClaudeAppx = Get-AppxPackage -Name Claude -ErrorAction Stop | Select-Object -First 1
+} catch {
+    $ClaudeAppx = $null
+}
+
+if ($ClaudeAppx) {
+    $ConfigDir = "$env:LOCALAPPDATA\Packages\$($ClaudeAppx.PackageFamilyName)\LocalCache\Roaming\Claude"
+    $DetectedVariant = "Microsoft Store install"
+} else {
+    # Fallback for environments where Get-AppxPackage isn't usable (e.g.,
+    # Constrained Language Mode under WDAC/AppLocker, Server Core/Nano).
+    # Pin to the Anthropic publisher hash so we don't pick up an unrelated
+    # SKU, and require LocalCache\Roaming\Claude to exist so we don't write
+    # into a "zombie" folder left behind after an MSIX uninstall.
+    $MsixPackage = Get-ChildItem "$env:LOCALAPPDATA\Packages" -Filter "Claude_pzs8sxrjxfjjc" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($MsixPackage -and (Test-Path "$($MsixPackage.FullName)\LocalCache\Roaming\Claude")) {
+        $ConfigDir = "$($MsixPackage.FullName)\LocalCache\Roaming\Claude"
+        $DetectedVariant = "Microsoft Store install"
+    } else {
+        $ConfigDir = "$env:APPDATA\Claude"
+        $DetectedVariant = "Traditional install"
+    }
+}
 $ConfigFile = "$ConfigDir\claude_desktop_config.json"
 $DemoUrl = "https://ha-mcp-demo-server.qc-h.net"
 $DemoToken = "demo"
@@ -18,10 +44,7 @@ Write-Host ""
 
 # Step 1: Check/install uv
 Write-Host "Step 1: Checking for uv..." -ForegroundColor Yellow
-$uvInstalled = $null
-try {
-    $uvInstalled = Get-Command uvx -ErrorAction SilentlyContinue
-} catch {}
+$uvInstalled = Get-Command uvx -ErrorAction SilentlyContinue
 
 if ($uvInstalled) {
     Write-Host "  uv is already installed" -ForegroundColor Green
@@ -37,13 +60,15 @@ if ($uvInstalled) {
         Write-Host "  Please install manually:" -ForegroundColor Red
         Write-Host "  winget install astral-sh.uv" -ForegroundColor Cyan
         Write-Host "  OR download from: https://docs.astral.sh/uv/" -ForegroundColor Cyan
-        exit 1
+        throw
     }
 }
 Write-Host ""
 
 # Step 2: Configure Claude Desktop
 Write-Host "Step 2: Configuring Claude Desktop..." -ForegroundColor Yellow
+Write-Host "  Detected: $DetectedVariant" -ForegroundColor Cyan
+Write-Host "  Config path: $ConfigDir" -ForegroundColor Cyan
 $ClaudeNotInstalled = $false
 if (-not (Test-Path $ConfigDir)) {
     $ClaudeNotInstalled = $true
@@ -55,23 +80,13 @@ if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
 }
 
-# The MCP server config
-$HaMcpConfig = @{
-    command = "uvx"
-    args = @("ha-mcp@latest")
-    env = @{
-        HOMEASSISTANT_URL = $DemoUrl
-        HOMEASSISTANT_TOKEN = $DemoToken
-    }
-}
-
 # The properly formatted JSON config
 $JsonConfig = @"
 {
   "mcpServers": {
     "Home Assistant": {
       "command": "uvx",
-      "args": ["--refresh", "ha-mcp@latest"],
+      "args": ["--python", "3.13", "--refresh", "ha-mcp@latest"],
       "env": {
         "HOMEASSISTANT_URL": "$DemoUrl",
         "HOMEASSISTANT_TOKEN": "$DemoToken"
@@ -114,7 +129,7 @@ Write-Host ""
 Write-Host "Step 3: Pre-downloading ha-mcp..." -ForegroundColor Yellow
 Write-Host "  This speeds up Claude Desktop startup..."
 try {
-    & uvx --refresh ha-mcp@latest --version 2>&1 | Out-Null
+    & uvx --python 3.13 --refresh ha-mcp@latest --version 2>&1 | Out-Null
     Write-Host "  Dependencies cached" -ForegroundColor Green
 } catch {
     Write-Host "  Pre-download skipped (will download on first use)" -ForegroundColor Yellow
@@ -154,5 +169,3 @@ Write-Host "  Replace HOMEASSISTANT_TOKEN with your token"
 Write-Host "  (Generate token in HA: Profile > Security > Long-lived tokens)"
 Write-Host ""
 
-# Exit successfully
-exit 0

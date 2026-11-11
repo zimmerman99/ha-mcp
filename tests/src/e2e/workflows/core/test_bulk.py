@@ -8,17 +8,18 @@ Note: ha_bulk_control expects 'operations' parameter as a list of dicts,
 each containing 'entity_id' and 'action' keys.
 """
 
-import json
 import logging
 
 import pytest
 
-from ...utilities.assertions import assert_mcp_success, parse_mcp_result
+from ...utilities.assertions import assert_mcp_success, parse_mcp_result, safe_call_tool
 
 logger = logging.getLogger(__name__)
 
 
-def create_operations(entities: list[str], action: str, parameters: dict | None = None) -> list[dict]:
+def create_operations(
+    entities: list[str], action: str, parameters: dict | None = None
+) -> list[dict]:
     """Create operations list for bulk_control."""
     ops = []
     for entity_id in entities:
@@ -27,6 +28,16 @@ def create_operations(entities: list[str], action: str, parameters: dict | None 
             op["parameters"] = parameters
         ops.append(op)
     return ops
+
+
+def _extract_bulk_boolean_entity_id(data: dict) -> str | None:
+    """Extract the input_boolean entity_id from a set_helper response."""
+    entity_id = data.get("entity_id")
+    if not entity_id:
+        helper_id = data.get("data", {}).get("id")
+        if helper_id:
+            entity_id = f"input_boolean.{helper_id}"
+    return entity_id
 
 
 @pytest.mark.asyncio
@@ -60,7 +71,9 @@ class TestBulkControl:
         assert "total_operations" in data, f"Missing total_operations: {data}"
         assert data["total_operations"] == 1, f"Should have 1 operation: {data}"
 
-        logger.info(f"Bulk turn_on executed: successful={data.get('successful_commands')}")
+        logger.info(
+            f"Bulk turn_on executed: successful={data.get('successful_commands')}"
+        )
 
         # Verify state changed
         state_result = await mcp_client.call_tool(
@@ -94,7 +107,9 @@ class TestBulkControl:
         )
 
         data = assert_mcp_success(result, "Bulk turn_off single light")
-        logger.info(f"Bulk turn_off executed: successful={data.get('successful_commands')}")
+        logger.info(
+            f"Bulk turn_off executed: successful={data.get('successful_commands')}"
+        )
 
         # Verify state changed
         state_result = await mcp_client.call_tool(
@@ -127,7 +142,9 @@ class TestBulkControl:
         )
 
         data = assert_mcp_success(result, "Bulk toggle")
-        logger.info(f"Bulk toggle executed: successful={data.get('successful_commands')}")
+        logger.info(
+            f"Bulk toggle executed: successful={data.get('successful_commands')}"
+        )
 
         # Verify state toggled
         state_result = await mcp_client.call_tool(
@@ -149,15 +166,12 @@ class TestBulkControl:
 
         # Search for multiple lights
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "light", "limit": 5},
+            "ha_search",
+            {"domain_filter": "light", "limit": 5},
         )
         search_data = parse_mcp_result(search_result)
 
-        if "data" in search_data:
-            results = search_data.get("data", {}).get("results", [])
-        else:
-            results = search_data.get("results", [])
+        results = search_data.get("entities", [])
 
         if len(results) < 2:
             pytest.skip("Need at least 2 lights for multi-entity bulk test")
@@ -186,7 +200,7 @@ class TestBulkControl:
             {"operations": operations},
         )
 
-        data = assert_mcp_success(result, "Bulk turn_off multiple lights")
+        assert_mcp_success(result, "Bulk turn_off multiple lights")
         logger.info("Multiple lights bulk turn_off executed")
 
     async def test_bulk_control_with_parameters(self, mcp_client, test_light_entity):
@@ -206,7 +220,9 @@ class TestBulkControl:
         )
 
         data = assert_mcp_success(result, "Bulk turn_on with brightness")
-        logger.info(f"Bulk with brightness executed: successful={data.get('successful_commands')}")
+        logger.info(
+            f"Bulk with brightness executed: successful={data.get('successful_commands')}"
+        )
 
         # Verify brightness was applied
         state_result = await mcp_client.call_tool(
@@ -224,36 +240,15 @@ class TestBulkControl:
                     f"Brightness should be around 77: {brightness}"
                 )
 
-    async def test_bulk_control_json_string_operations(self, mcp_client, test_light_entity):
-        """Test bulk_control accepts operations as JSON string."""
-        logger.info("Testing ha_bulk_control with JSON string operations")
-
-        # First turn off the light
-        await mcp_client.call_tool(
-            "ha_call_service",
-            {"domain": "light", "service": "turn_off", "entity_id": test_light_entity},
-        )
-
-        # Operations as JSON string
-        operations_json = json.dumps([{"entity_id": test_light_entity, "action": "on"}])
-        result = await mcp_client.call_tool(
-            "ha_bulk_control",
-            {"operations": operations_json},
-        )
-
-        data = assert_mcp_success(result, "Bulk with JSON string operations")
-        logger.info(f"JSON string operations accepted: successful={data.get('successful_commands')}")
-
     async def test_bulk_control_empty_operations(self, mcp_client):
         """Test bulk_control with empty operations list."""
         logger.info("Testing ha_bulk_control with empty operations list")
 
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_bulk_control",
             {"operations": []},
         )
-
-        data = parse_mcp_result(result)
 
         # Should return error or indicate no operations
         if data.get("success"):
@@ -268,24 +263,18 @@ class TestBulkControl:
 
         # Search for light and switch entities
         light_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "light", "limit": 2},
+            "ha_search",
+            {"domain_filter": "light", "limit": 2},
         )
         light_data = parse_mcp_result(light_result)
-        if "data" in light_data:
-            light_results = light_data.get("data", {}).get("results", [])
-        else:
-            light_results = light_data.get("results", [])
+        light_results = light_data.get("entities", [])
 
         switch_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "switch", "limit": 2},
+            "ha_search",
+            {"domain_filter": "switch", "limit": 2},
         )
         switch_data = parse_mcp_result(switch_result)
-        if "data" in switch_data:
-            switch_results = switch_data.get("data", {}).get("results", [])
-        else:
-            switch_results = switch_data.get("results", [])
+        switch_results = switch_data.get("entities", [])
 
         entities = []
         if light_results:
@@ -305,7 +294,9 @@ class TestBulkControl:
         )
 
         data = assert_mcp_success(result, "Bulk toggle mixed domains")
-        logger.info(f"Mixed domain bulk toggle executed: total={data.get('total_operations')}")
+        logger.info(
+            f"Mixed domain bulk toggle executed: total={data.get('total_operations')}"
+        )
 
     async def test_bulk_control_nonexistent_entity(self, mcp_client, test_light_entity):
         """Test bulk_control gracefully handles non-existent entities."""
@@ -329,7 +320,9 @@ class TestBulkControl:
             if failed > 0:
                 logger.info(f"Properly reported failed commands: {failed}")
             else:
-                logger.info("Bulk operation completed (non-existent entity may be ignored)")
+                logger.info(
+                    "Bulk operation completed (non-existent entity may be ignored)"
+                )
         else:
             logger.info("Bulk operation returned error as expected")
 
@@ -339,15 +332,12 @@ class TestBulkControl:
 
         # Search for lights
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "light", "limit": 3},
+            "ha_search",
+            {"domain_filter": "light", "limit": 3},
         )
         search_data = parse_mcp_result(search_result)
 
-        if "data" in search_data:
-            results = search_data.get("data", {}).get("results", [])
-        else:
-            results = search_data.get("results", [])
+        results = search_data.get("entities", [])
 
         if len(results) < 2:
             pytest.skip("Need at least 2 lights for parallel test")
@@ -374,15 +364,12 @@ class TestBulkControl:
 
         # Search for lights
         search_result = await mcp_client.call_tool(
-            "ha_search_entities",
-            {"query": "", "domain_filter": "light", "limit": 3},
+            "ha_search",
+            {"domain_filter": "light", "limit": 3},
         )
         search_data = parse_mcp_result(search_result)
 
-        if "data" in search_data:
-            results = search_data.get("data", {}).get("results", [])
-        else:
-            results = search_data.get("results", [])
+        results = search_data.get("entities", [])
 
         if len(results) < 2:
             pytest.skip("Need at least 2 lights for sequential test")
@@ -412,15 +399,6 @@ async def test_bulk_control_with_input_booleans(mcp_client, cleanup_tracker):
     """Test bulk_control with input_boolean helpers."""
     logger.info("Testing ha_bulk_control with input_boolean helpers")
 
-    # Helper function to extract entity_id
-    def get_entity_id(data: dict) -> str | None:
-        entity_id = data.get("entity_id")
-        if not entity_id:
-            helper_id = data.get("helper_data", {}).get("id")
-            if helper_id:
-                entity_id = f"input_boolean.{helper_id}"
-        return entity_id
-
     # Create two test input_booleans
     entity_ids = []
     for i in range(2):
@@ -434,7 +412,7 @@ async def test_bulk_control_with_input_booleans(mcp_client, cleanup_tracker):
         )
         create_data = parse_mcp_result(create_result)
         if create_data.get("success"):
-            entity_id = get_entity_id(create_data)
+            entity_id = _extract_bulk_boolean_entity_id(create_data)
             if entity_id:
                 entity_ids.append(entity_id)
                 cleanup_tracker.track("input_boolean", entity_id)
@@ -442,7 +420,6 @@ async def test_bulk_control_with_input_booleans(mcp_client, cleanup_tracker):
 
     if len(entity_ids) < 2:
         pytest.skip("Could not create test input_booleans")
-
 
     # Bulk turn on
     operations = create_operations(entity_ids, "on")
@@ -452,7 +429,9 @@ async def test_bulk_control_with_input_booleans(mcp_client, cleanup_tracker):
     )
 
     data = assert_mcp_success(result, "Bulk turn_on input_booleans")
-    logger.info(f"Bulk turn_on input_booleans executed: total={data.get('total_operations')}")
+    logger.info(
+        f"Bulk turn_on input_booleans executed: total={data.get('total_operations')}"
+    )
 
     # Verify states changed
     for entity_id in entity_ids:
@@ -469,7 +448,7 @@ async def test_bulk_control_with_input_booleans(mcp_client, cleanup_tracker):
     # Cleanup
     for entity_id in entity_ids:
         await mcp_client.call_tool(
-            "ha_config_remove_helper",
-            {"helper_type": "input_boolean", "helper_id": entity_id},
+            "ha_remove_helpers_integrations",
+            {"helper_type": "input_boolean", "target": entity_id, "confirm": True},
         )
     logger.info("Test input_booleans cleaned up")

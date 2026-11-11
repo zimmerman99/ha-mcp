@@ -9,23 +9,126 @@ import json
 import logging
 from typing import Any
 
+from fastmcp.exceptions import ToolError
+
 logger = logging.getLogger(__name__)
 
 
+def extract_error_message(data: dict[str, Any]) -> str:
+    """Extract an error-message string from a parsed MCP failure result.
+
+    Handles both string errors and the modern structured-error dict-form
+    (`{"error": {"code": ..., "message": ...}}`) returned by
+    `create_error_response` in `src/ha_mcp/errors.py`. Returns an empty
+    string when the result has no error key, so callers can chain
+    `.lower()` / `in` membership checks without needing a `isinstance`
+    guard at the call site (refs #366).
+    """
+    error_obj = data.get("error", "")
+    if isinstance(error_obj, dict):
+        return str(error_obj.get("message", ""))
+    return str(error_obj)
+
+
+def _parse_error_result(result) -> dict[str, Any]:
+    """Parse an error-flagged result, whose content is a serialized ToolError."""
+    if hasattr(result, "content") and result.content:
+        if hasattr(result.content[0], "text"):
+            error_text = result.content[0].text
+            try:
+                # ToolError content is JSON-serialized structured error
+                return json.loads(error_text)
+            except json.JSONDecodeError:
+                return {"success": False, "error": error_text}
+    return {"success": False, "error": "Unknown error (isError=true)"}
+
+
 def parse_mcp_result(result) -> dict[str, Any]:
-    """Parse MCP tool result from FastMCP client response."""
+    """Parse MCP tool result from FastMCP client response.
+
+    Handles both success responses and error-flagged responses. When the
+    error flag is set, the error content is parsed as JSON if possible.
+    """
+    # General contract of this shared helper: an already-parsed dict comes
+    # back unchanged. Several hundred e2e call sites feed results through
+    # here, and not all of them come from the client — the tests' own
+    # _safe_tool_call wrappers return a plain marked dict when a call times
+    # out or errors. Running such a dict through the content extraction
+    # below would replace both its discrimination markers and its real
+    # error text with the generic "No content in result" placeholder.
+    if isinstance(result, dict):
+        return result
+
+    # Check if this is an error response (from ToolError). fastmcp's
+    # CallToolResult spells the flag ``is_error``; the raw MCP CallToolResult
+    # spells it ``isError``. Accept either so the gate holds whichever type
+    # reaches this helper.
+    if getattr(result, "is_error", False) or getattr(result, "isError", False):
+        return _parse_error_result(result)
+
+    # Tools that return a FastMCP ``ToolResult`` with a non-text content block
+    # (e.g. ``include_screenshot`` / ``return_screenshot`` attach an image)
+    # carry their real payload in ``structured_content`` — the content block is
+    # the image, not JSON. Prefer it when text parsing isn't possible.
+    structured = getattr(result, "structured_content", None)
+
     if hasattr(result, "content") and result.content:
         if hasattr(result.content[0], "text"):
             response_text = result.content[0].text
             try:
                 return json.loads(response_text)
             except json.JSONDecodeError:
-                try:
-                    return eval(response_text)
-                except Exception:
-                    return {"raw_response": response_text}
+                return {"raw_response": response_text}
+        if isinstance(structured, dict):
+            return structured
         return {"content": str(result.content[0])}
+    if isinstance(structured, dict):
+        return structured
     return {"error": "No content in result"}
+
+
+def tool_error_to_result(exc: ToolError) -> dict[str, Any]:
+    """Convert a ToolError exception to a parsed result dict.
+
+    When tools raise ToolError, FastMCP clients may raise instead of returning
+    a result with isError=true. This function converts the exception back to
+    a dict that can be used with the same assertion logic.
+
+    Args:
+        exc: The ToolError exception
+
+    Returns:
+        A dict with success=False and error information
+    """
+    error_msg = str(exc)
+    try:
+        # ToolError message is JSON-serialized structured error
+        return json.loads(error_msg)
+    except json.JSONDecodeError:
+        return {"success": False, "error": {"message": error_msg}}
+
+
+async def safe_call_tool(
+    mcp_client, tool_name: str, params: dict[str, Any]
+) -> dict[str, Any]:
+    """Call an MCP tool and return parsed result, handling ToolError exceptions.
+
+    This is useful for tests that expect tools to fail and want to inspect
+    the error response without catching exceptions manually.
+
+    Args:
+        mcp_client: The MCP client instance
+        tool_name: Name of the tool to call
+        params: Parameters to pass to the tool
+
+    Returns:
+        Parsed result dict (success or failure)
+    """
+    try:
+        result = await mcp_client.call_tool(tool_name, params)
+        return parse_mcp_result(result)
+    except ToolError as exc:
+        return tool_error_to_result(exc)
 
 
 def assert_mcp_success(result, operation_name: str = "operation"):
@@ -39,10 +142,8 @@ def assert_mcp_success(result, operation_name: str = "operation"):
     data = parse_mcp_result(result)
 
     # Handle different success indicators
-    # Some tools return success in the top level, others in data.success
     success_indicators = [
         data.get("success") is True,
-        data.get("data", {}).get("success") is True,
         # If no explicit success field but has data and no error, consider success
         ("data" in data and data.get("error") is None and data.get("success") is None),
         # Bulk operations success: has operational data without explicit success field
@@ -62,9 +163,7 @@ def assert_mcp_success(result, operation_name: str = "operation"):
     ]
 
     if not any(success_indicators):
-        error_msg = data.get("error") or data.get("data", {}).get(
-            "error", "Unknown error"
-        )
+        error_msg = data.get("error", "Unknown error")
         suggestions = data.get("suggestions", [])
 
         failure_msg = f"{operation_name} failed: {error_msg}"
@@ -96,7 +195,7 @@ def assert_mcp_failure(
 
     # If expected error specified, check for it
     if expected_error:
-        error_msg = str(data.get("error", ""))
+        error_msg = extract_error_message(data)
         if expected_error.lower() not in error_msg.lower():
             raise AssertionError(
                 f"{operation_name} failed but error message doesn't contain '{expected_error}'. "
@@ -133,81 +232,6 @@ def assert_entity_state(
     logger.debug(f"✅ Entity {entity_id} has expected state: {expected_state}")
 
 
-def assert_entity_attribute(
-    state_data: dict[str, Any], attribute_name: str, expected_value: Any, entity_id: str
-):
-    """
-    Assert that entity has expected attribute value.
-
-    Args:
-        state_data: Parsed MCP get_state result
-        attribute_name: Name of attribute to check
-        expected_value: Expected attribute value
-        entity_id: Entity ID for error message
-    """
-    if not state_data.get("success", True):
-        raise AssertionError(
-            f"Failed to get state for {entity_id}: {state_data.get('error')}"
-        )
-
-    attributes = state_data.get("data", {}).get("attributes", {})
-
-    if attribute_name not in attributes:
-        raise AssertionError(f"Entity {entity_id} missing attribute '{attribute_name}'")
-
-    actual_value = attributes[attribute_name]
-
-    if actual_value != expected_value:
-        raise AssertionError(
-            f"Entity {entity_id} attribute '{attribute_name}' is {actual_value}, expected {expected_value}"
-        )
-
-    logger.debug(f"✅ Entity {entity_id} attribute {attribute_name} = {expected_value}")
-
-
-def assert_automation_config(
-    config_data: dict[str, Any], expected_fields: dict[str, Any], automation_id: str
-):
-    """
-    Assert that automation configuration contains expected fields.
-
-    Args:
-        config_data: Parsed automation config from get action
-        expected_fields: Dictionary of field name -> expected value
-        automation_id: Automation ID for error message
-    """
-    if not config_data.get("success", True):
-        raise AssertionError(
-            f"Failed to get config for {automation_id}: {config_data.get('error')}"
-        )
-
-    config = config_data.get("config", {})
-
-    for field_name, expected_value in expected_fields.items():
-        if field_name not in config:
-            raise AssertionError(
-                f"Automation {automation_id} missing field '{field_name}'"
-            )
-
-        actual_value = config[field_name]
-
-        # Handle list/dict comparisons
-        if isinstance(expected_value, list | dict):
-            if len(actual_value) != len(expected_value):
-                raise AssertionError(
-                    f"Automation {automation_id} field '{field_name}' has {len(actual_value)} items, "
-                    f"expected {len(expected_value)}"
-                )
-        else:
-            if actual_value != expected_value:
-                raise AssertionError(
-                    f"Automation {automation_id} field '{field_name}' is {actual_value}, "
-                    f"expected {expected_value}"
-                )
-
-    logger.debug(f"✅ Automation {automation_id} config matches expected fields")
-
-
 def assert_search_results(
     search_data: dict[str, Any],
     min_results: int = 0,
@@ -228,7 +252,7 @@ def assert_search_results(
     if not search_data.get("success", True):
         raise AssertionError(f"Search failed: {search_data.get('error')}")
 
-    results = search_data.get("results", [])
+    results = search_data.get("entities", search_data.get("results", []))
     result_count = len(results)
 
     if result_count < min_results:
@@ -296,65 +320,6 @@ def assert_template_evaluation(
     )
 
 
-def assert_bulk_operation_success(
-    bulk_data: dict[str, Any],
-    expected_operations: int,
-    allow_partial_failure: bool = False,
-):
-    """
-    Assert bulk operation completed successfully.
-
-    Args:
-        bulk_data: Parsed bulk operation result
-        expected_operations: Number of operations that should have been submitted
-        allow_partial_failure: Whether individual operation failures are acceptable
-    """
-    if not bulk_data.get("success", False):
-        raise AssertionError(f"Bulk operation failed: {bulk_data.get('error')}")
-
-    operation_ids = bulk_data.get("operation_ids", [])
-
-    if len(operation_ids) != expected_operations:
-        raise AssertionError(
-            f"Bulk operation created {len(operation_ids)} operations, expected {expected_operations}"
-        )
-
-    logger.debug(f"✅ Bulk operation started {len(operation_ids)} operations")
-
-
-def assert_logbook_contains(
-    logbook_data: dict[str, Any], search_text: str, case_sensitive: bool = False
-):
-    """
-    Assert that logbook contains entries with specified text.
-
-    Args:
-        logbook_data: Parsed logbook result
-        search_text: Text to search for in logbook entries
-        case_sensitive: Whether search should be case sensitive
-    """
-    if not logbook_data.get("success", False):
-        raise AssertionError(f"Logbook query failed: {logbook_data.get('error')}")
-
-    entries = logbook_data.get("entries", [])
-
-    if not entries:
-        raise AssertionError("Logbook contains no entries")
-
-    search_func = str if case_sensitive else lambda x: str(x).lower()
-    target = search_func(search_text)
-
-    for entry in entries:
-        entry_text = search_func(entry)
-        if target in entry_text:
-            logger.debug(f"✅ Found '{search_text}' in logbook")
-            return
-
-    raise AssertionError(
-        f"Logbook doesn't contain '{search_text}' in {len(entries)} entries"
-    )
-
-
 class MCPAssertions:
     """
     Context manager for MCP-specific assertions with better error reporting.
@@ -377,18 +342,49 @@ class MCPAssertions:
     async def call_tool_success(
         self, tool_name: str, params: dict[str, Any]
     ) -> dict[str, Any]:
-        """Call MCP tool and assert success."""
-        result = await self.client.call_tool(tool_name, params)
-        return assert_mcp_success(result, f"{tool_name}({list(params.keys())})")
+        """Call MCP tool and assert success.
+
+        If ToolError is raised, the assertion fails with the error details.
+        """
+        try:
+            result = await self.client.call_tool(tool_name, params)
+            return assert_mcp_success(result, f"{tool_name}({list(params.keys())})")
+        except ToolError as exc:
+            error_data = tool_error_to_result(exc)
+            raise AssertionError(
+                f"{tool_name}({list(params.keys())}) should have succeeded but raised ToolError: "
+                f"{error_data.get('error', str(exc))}"
+            ) from exc
 
     async def call_tool_failure(
         self, tool_name: str, params: dict[str, Any], expected_error: str | None = None
     ) -> dict[str, Any]:
-        """Call MCP tool and assert failure."""
-        result = await self.client.call_tool(tool_name, params)
-        return assert_mcp_failure(
-            result, f"{tool_name}({list(params.keys())})", expected_error
-        )
+        """Call MCP tool and assert failure.
+
+        Handles both legacy dict returns and new ToolError exceptions.
+        """
+        operation_name = f"{tool_name}({list(params.keys())})"
+        try:
+            result = await self.client.call_tool(tool_name, params)
+            return assert_mcp_failure(result, operation_name, expected_error)
+        except ToolError as exc:
+            # Convert ToolError to result dict and validate
+            data = tool_error_to_result(exc)
+            # Verify this is actually a failure
+            if data.get("success"):
+                raise AssertionError(
+                    f"{operation_name} should have failed but succeeded"
+                ) from exc
+            # Check expected error if specified
+            if expected_error:
+                error_msg = extract_error_message(data)
+                if expected_error.lower() not in error_msg.lower():
+                    raise AssertionError(
+                        f"{operation_name} failed but error message doesn't contain "
+                        f"'{expected_error}'. Actual error: {error_msg}"
+                    ) from exc
+            logger.debug(f"✅ {operation_name} failed as expected (via ToolError)")
+            return data
 
     def assert_entity_state(
         self, state_data: dict[str, Any], expected_state: str, entity_id: str
@@ -441,24 +437,23 @@ async def wait_for_automation(
     import asyncio
     import time
 
-    start_time = time.time()
+    start_time = time.monotonic()
 
-    while time.time() - start_time < timeout:
-        result = await mcp_client.call_tool(
+    while time.monotonic() - start_time < timeout:
+        # Use safe_call_tool to handle ToolError exceptions
+        parsed = await safe_call_tool(
+            mcp_client,
             "ha_config_get_automation",
             {"identifier": automation_id},
         )
-        parsed = parse_mcp_result(result)
 
         if parsed.get("success"):
             logger.debug(
-                f"Automation {automation_id} found after {time.time() - start_time:.2f}s"
+                f"Automation {automation_id} found after {time.monotonic() - start_time:.2f}s"
             )
             return parsed.get("config")
 
         await asyncio.sleep(poll_interval)
 
-    logger.warning(
-        f"Automation {automation_id} not found after {timeout}s timeout"
-    )
+    logger.warning(f"Automation {automation_id} not found after {timeout}s timeout")
     return None

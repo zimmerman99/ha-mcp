@@ -5,6 +5,7 @@ Simple connection test to verify E2E test setup works.
 import logging
 
 import pytest
+
 from ..utilities.assertions import assert_mcp_success, assert_search_results
 
 logger = logging.getLogger(__name__)
@@ -16,11 +17,9 @@ async def test_simple_connection(mcp_client):
     """Test basic MCP client connection and tool execution."""
     logger.info("☀️ Testing basic MCP connection with sun.sun entity")
 
-    # Test a simple tool that doesn't use WebSocket - just get state
-    result = await mcp_client.call_tool(
-        "ha_get_state",
-        {"entity_id": "sun.sun"},  # Sun entity should always exist
-    )
+    # Test a simple tool that doesn't use WebSocket - just get state.
+    # sun.sun is part of default_config and guaranteed by conftest entity wait.
+    result = await mcp_client.call_tool("ha_get_state", {"entity_id": "sun.sun"})
 
     # Parse and verify the result using standard assertion utility
     data = assert_mcp_success(result, "Get state request")
@@ -46,7 +45,7 @@ async def test_tool_listing(mcp_client):
 
     # Verify some expected tools are present
     tool_names = [tool.name for tool in tools]
-    expected_tools = ["ha_search_entities", "ha_get_overview", "ha_get_state"]
+    expected_tools = ["ha_search", "ha_get_overview", "ha_get_state"]
 
     for expected in expected_tools:
         assert expected in tool_names, f"Missing expected tool: {expected}"
@@ -60,9 +59,7 @@ async def test_entity_search(mcp_client):
     """Test basic entity search functionality."""
     logger.info("🔍 Testing entity search with 'light' query")
 
-    result = await mcp_client.call_tool(
-        "ha_search_entities", {"query": "light", "limit": 5}
-    )
+    result = await mcp_client.call_tool("ha_search", {"query": "light", "limit": 5})
 
     # Parse and verify using standard assertion utility
     data = assert_mcp_success(result, "Entity search")
@@ -73,7 +70,7 @@ async def test_entity_search(mcp_client):
         search_data, min_results=0
     )  # Allow 0 results in test environment
 
-    results = search_data.get("results", [])
+    results = search_data.get("entities", [])
     logger.info(f"✅ Found {len(results)} entities matching 'light'")
 
     # Just verify we get some structure back, don't require specific entities

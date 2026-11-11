@@ -17,6 +17,7 @@ import sys
 import time
 from pathlib import Path
 
+import docker.errors
 import requests
 from testcontainers.core.container import DockerContainer
 
@@ -45,8 +46,8 @@ class HomeAssistantTestEnvironment:
 
     def _setup_config_directory(self) -> Path:
         """Set up Home Assistant configuration directory."""
-        import tempfile
         import shutil
+        import tempfile
 
         # Create temporary directory for HA config
         config_dir = Path(tempfile.mkdtemp(prefix="ha_test_env_"))
@@ -102,8 +103,9 @@ class HomeAssistantTestEnvironment:
         config_dir = self._setup_config_directory()
 
         # Create container with port configuration
-        # renovate: datasource=docker depName=ghcr.io/home-assistant/home-assistant
-        container = DockerContainer("ghcr.io/home-assistant/home-assistant:2026.1.3")
+        from test_constants import HA_TEST_IMAGE
+
+        container = DockerContainer(HA_TEST_IMAGE)
 
         # Check for custom port via environment variable
         custom_port = os.environ.get("HA_TEST_PORT")
@@ -113,14 +115,15 @@ class HomeAssistantTestEnvironment:
                 container = container.with_bind_ports(8123, port)
                 logger.info(f"🔌 Using fixed port {port} (from HA_TEST_PORT)")
             except ValueError:
-                logger.warning(f"⚠️ Invalid HA_TEST_PORT '{custom_port}', using random port")
+                logger.warning(
+                    f"⚠️ Invalid HA_TEST_PORT '{custom_port}', using random port"
+                )
                 container = container.with_bind_ports(8123, None)
         else:
             container = container.with_bind_ports(8123, None)  # Random host port
 
         self.container = (
-            container
-            .with_volume_mapping(str(config_dir), "/config", "rw")
+            container.with_volume_mapping(str(config_dir), "/config", "rw")
             .with_env("TZ", "UTC")
             .with_kwargs(privileged=True)
         )
@@ -143,10 +146,10 @@ class HomeAssistantTestEnvironment:
         """Wait for Home Assistant to be ready."""
         logger.info("⏳ Waiting for Home Assistant to become ready...")
 
-        start_time = time.time()
+        start_time = time.monotonic()
         attempts = 0
 
-        while time.time() - start_time < timeout:
+        while time.monotonic() - start_time < timeout:
             attempts += 1
             try:
                 # Check frontend (no auth required) to see if HA is up
@@ -217,7 +220,9 @@ class HomeAssistantTestEnvironment:
         cmd = [sys.executable, "-m", "pytest", "tests/src/e2e/", "-v", "--tb=short"]
 
         try:
-            result = subprocess.run(cmd, env=env, cwd=Path(__file__).parent.parent)
+            result = subprocess.run(
+                cmd, env=env, cwd=Path(__file__).parent.parent, check=False
+            )
             if result.returncode == 0:
                 logger.info("✅ All tests passed!")
             else:
@@ -254,7 +259,7 @@ class HomeAssistantTestEnvironment:
                     print("✅ Ready")
                 else:
                     print(f"⚠️ Status {response.status_code}")
-            except:
+            except Exception:
                 print("❌ Not accessible")
         else:
             print("🐳 Container Status: Not running")
@@ -274,6 +279,44 @@ def show_menu() -> str:
         if choice in ["1", "2", "3"]:
             return choice
         print("❌ Invalid choice. Please enter 1, 2, or 3.")
+
+
+def _run_non_interactive(env: HomeAssistantTestEnvironment) -> None:
+    # Non-interactive mode: wait for interrupt, and exit if the container dies
+    # so systemd's Restart=on-failure kicks in with a fresh instance.
+    logger.info("🔄 Running in non-interactive mode. Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(30)
+            if env.container:
+                wrapped = env.container.get_wrapped_container()
+                wrapped.reload()
+                if wrapped.status not in ("running",):
+                    logger.error(
+                        f"❌ Container stopped unexpectedly "
+                        f"(status: {wrapped.status}), exiting for restart..."
+                    )
+                    sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("\n🛑 Received interrupt signal")
+    except (OSError, RuntimeError, docker.errors.DockerException) as e:
+        logger.error(f"❌ Watchdog failure: {e}, exiting for restart...")
+        sys.exit(1)
+
+
+def _run_interactive_menu(env: HomeAssistantTestEnvironment) -> None:
+    # Interactive menu loop
+    while True:
+        choice = show_menu()
+
+        if choice == "1":
+            env.run_tests()
+        elif choice == "2":
+            env.stop_container()
+            print("👋 Goodbye!")
+            break
+        elif choice == "3":
+            env.print_status()
 
 
 def main():
@@ -301,26 +344,9 @@ def main():
         env.print_status()
 
         if args.no_interactive:
-            # Non-interactive mode: just wait for interrupt
-            logger.info("🔄 Running in non-interactive mode. Press Ctrl+C to stop.")
-            try:
-                while True:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                logger.info("\n🛑 Received interrupt signal")
+            _run_non_interactive(env)
         else:
-            # Interactive menu loop
-            while True:
-                choice = show_menu()
-
-                if choice == "1":
-                    env.run_tests()
-                elif choice == "2":
-                    env.stop_container()
-                    print("👋 Goodbye!")
-                    break
-                elif choice == "3":
-                    env.print_status()
+            _run_interactive_menu(env)
 
     except KeyboardInterrupt:
         print("\n🛑 Interrupted by user")

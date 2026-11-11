@@ -1,15 +1,17 @@
 """Tests for tool annotations compliance with MCP Directory Policy.
 
-Every tool MUST have exactly one of:
+Every tool MUST declare its safety behavior with one of:
 - readOnlyHint: true - For tools that only read data
 - destructiveHint: true - For tools that modify data or have side effects
+- destructiveHint: false - For non-read-only tools whose side effects are not
+  destructive (for example, a reversible setting update or restart)
 
 Additionally, every tool SHOULD have a title for UI display.
 """
 
+import ast
 import re
 from pathlib import Path
-
 
 
 def get_tools_dir() -> Path:
@@ -17,45 +19,89 @@ def get_tools_dir() -> Path:
     return Path(__file__).parent.parent.parent.parent / "src" / "ha_mcp" / "tools"
 
 
+def _parse_decorator_args(decorator_args: str, func_name: str, file_name: str) -> dict:
+    """Parse decorator arguments into a tool info dict."""
+    has_read_only = (
+        "readOnlyHint" in decorator_args
+        and "True" in decorator_args.split("readOnlyHint")[1][:20]
+    )
+    has_destructive = (
+        "destructiveHint" in decorator_args
+        and "True" in decorator_args.split("destructiveHint")[1][:20]
+    )
+    has_explicit_non_destructive = (
+        "destructiveHint" in decorator_args
+        and "False" in decorator_args.split("destructiveHint")[1][:20]
+    )
+    has_title = "title" in decorator_args
+    has_tags = "tags=" in decorator_args or "tags =" in decorator_args
+    has_open_world = (
+        re.search(r'["\']openWorldHint["\']\s*:\s*(True|False)', decorator_args)
+        is not None
+    )
+
+    return {
+        "file": file_name,
+        "function": func_name,
+        "has_read_only_hint": has_read_only,
+        "has_destructive_hint": has_destructive,
+        "has_explicit_non_destructive_hint": has_explicit_non_destructive,
+        "has_title": has_title,
+        "has_tags": has_tags,
+        "has_open_world_hint": has_open_world,
+        "decorator_args": decorator_args.strip(),
+    }
+
+
 def extract_tool_decorators(file_path: Path) -> list[dict]:
-    """Extract @mcp.tool decorator information from a Python file."""
+    """Extract @mcp.tool and @tool decorator information from a Python file."""
     content = file_path.read_text(encoding="utf-8")
-    tools = []
+    # Pattern 1: @mcp.tool(...) — closure pattern.
+    # The decorator-skip ``(?:@\w+(?:\([^()]*\))?\s*)*`` accepts bare
+    # decorators (``@log_tool_usage``) AND SINGLE-LEVEL parenthesized ones
+    # such as ``@with_auto_backup(domain="entity", id_param="entity_id",
+    # client=client)`` between ``@mcp.tool`` and ``async def``; the old
+    # bare-only ``(?:@\w+\s*)*`` dropped those backed-up tools from the count.
+    # ``\([^()]*\)`` does NOT span nested parens, so a closure-form tool whose
+    # decorator args contain them would stay unmatched; no tool does today
+    # (``ha_set_entity``'s ``id_fn=lambda`` is class-form, so Pattern 2 takes
+    # it), and test_tool_scan_finds_every_annotated_tool fails loudly if one
+    # ever falls out. Requiring decorators-then-``async def`` (not arbitrary
+    # text) keeps docstring ``@mcp.tool(...)`` mentions from matching.
+    pattern = r"@mcp\.tool\(([^)]*)\)\s*(?:@\w+(?:\([^()]*\))?\s*)*async def (\w+)"
+    tools = [
+        _parse_decorator_args(m.group(1), m.group(2), file_path.name)
+        for m in re.finditer(pattern, content, re.DOTALL)
+    ]
 
-    # Find all @mcp.tool decorators with their annotations
-    # Pattern matches @mcp.tool(...) followed by async def function_name
-    pattern = r'@mcp\.tool\(([^)]*)\)\s*(?:@\w+\s*)*async def (\w+)'
-
-    for match in re.finditer(pattern, content, re.DOTALL):
-        decorator_args = match.group(1)
-        func_name = match.group(2)
-
-        # Check for annotations
-        has_read_only = 'readOnlyHint' in decorator_args and 'True' in decorator_args.split('readOnlyHint')[1][:20]
-        has_destructive = 'destructiveHint' in decorator_args and 'True' in decorator_args.split('destructiveHint')[1][:20]
-        has_title = 'title' in decorator_args
-
-        tools.append({
-            'file': file_path.name,
-            'function': func_name,
-            'has_read_only_hint': has_read_only,
-            'has_destructive_hint': has_destructive,
-            'has_title': has_title,
-            'decorator_args': decorator_args.strip(),
-        })
+    # Pattern 2: @tool(name="ha_*", ...) — class method pattern.
+    # Uses (.*?) non-greedy (DOTALL) so ) inside annotation strings (e.g.
+    # "title": "Get Device (incl. ...)" ) don't prematurely close the match.
+    # Decorator-skip allows single-level parens like @with_auto_backup(...).
+    class_pattern = r'@tool\(\s*\n?\s*name="(ha_\w+)"[,\s]*(.*?)\)\s*(?:@\w+(?:\([^()]*\))?\s*)*async def \w+'
+    tools.extend(
+        _parse_decorator_args(
+            f'name="{m.group(1)}", {m.group(2)}', m.group(1), file_path.name
+        )
+        for m in re.finditer(class_pattern, content, re.DOTALL)
+    )
 
     # Also find bare @mcp.tool without arguments
-    bare_pattern = r'@mcp\.tool\s*\n\s*(?:@\w+\s*)*async def (\w+)'
+    bare_pattern = r"@mcp\.tool\s*\n\s*(?:@\w+\s*)*async def (\w+)"
     for match in re.finditer(bare_pattern, content):
         func_name = match.group(1)
-        tools.append({
-            'file': file_path.name,
-            'function': func_name,
-            'has_read_only_hint': False,
-            'has_destructive_hint': False,
-            'has_title': False,
-            'decorator_args': '',
-        })
+        tools.append(
+            {
+                "file": file_path.name,
+                "function": func_name,
+                "has_read_only_hint": False,
+                "has_destructive_hint": False,
+                "has_explicit_non_destructive_hint": False,
+                "has_title": False,
+                "has_open_world_hint": False,
+                "decorator_args": "",
+            }
+        )
 
     return tools
 
@@ -78,17 +124,18 @@ class TestToolAnnotations:
     """Test suite for MCP tool annotation compliance."""
 
     def test_all_tools_have_required_hint(self):
-        """Every tool must have exactly one of readOnlyHint or destructiveHint."""
+        """Every tool must explicitly describe read-only/destructive behavior."""
         tools = get_all_tools()
 
         missing_hints = []
         both_hints = []
 
         for tool in tools:
-            has_read = tool['has_read_only_hint']
-            has_destructive = tool['has_destructive_hint']
+            has_read = tool["has_read_only_hint"]
+            has_destructive = tool["has_destructive_hint"]
+            has_non_destructive = tool["has_explicit_non_destructive_hint"]
 
-            if not has_read and not has_destructive:
+            if not has_read and not has_destructive and not has_non_destructive:
                 missing_hints.append(f"{tool['file']}:{tool['function']}")
             elif has_read and has_destructive:
                 both_hints.append(f"{tool['file']}:{tool['function']}")
@@ -114,7 +161,7 @@ class TestToolAnnotations:
         missing_titles = [
             f"{tool['file']}:{tool['function']}"
             for tool in tools
-            if not tool['has_title']
+            if not tool["has_title"]
         ]
 
         assert not missing_titles, (
@@ -122,19 +169,201 @@ class TestToolAnnotations:
             + "\n  ".join(missing_titles)
         )
 
+    def test_all_tools_have_open_world_hint(self):
+        """Every tool must set openWorldHint explicitly (true or false).
+
+        The MCP default is true, so an omitted value silently marks a local
+        tool as open-world. This guards the explicit value; the true/false
+        choice itself is a behaviour judgement left to review.
+        """
+        tools = get_all_tools()
+
+        missing_open_world = [
+            f"{tool['file']}:{tool['function']}"
+            for tool in tools
+            if not tool["has_open_world_hint"]
+        ]
+
+        assert not missing_open_world, (
+            f"Tools missing openWorldHint annotation ({len(missing_open_world)}):\n  "
+            + "\n  ".join(missing_open_world)
+            + "\n\nAdd openWorldHint (true if the tool reaches external systems, "
+            "false if it only touches local Home Assistant state) to each "
+            "@tool() decorator; the MCP default is true."
+        )
+
+    def test_tool_scan_finds_every_annotated_tool(self):
+        """The scan must not silently drop a tool from the checks above.
+
+        The closure-form pattern ``@mcp.tool\\(([^)]*)\\)`` cannot span a ``)``,
+        so a future decorator whose args contain one (e.g. a title like
+        "Get Logs (verbose)") would fall out of get_all_tools() and escape every
+        annotation assertion -- inheriting the MCP default openWorldHint=true
+        unnoticed. Every tool sets openWorldHint exactly once, so the scanned
+        count must equal the occurrences across the tool files; a drop breaks
+        parity and fails here instead of passing silently.
+        """
+        tools = get_all_tools()
+        occurrences = sum(
+            py_file.read_text(encoding="utf-8").count("openWorldHint")
+            for py_file in sorted(get_tools_dir().glob("*.py"))
+            if not py_file.name.startswith("_")
+        )
+
+        assert len(tools) == occurrences, (
+            f"Tool scan found {len(tools)} tools but {occurrences} openWorldHint "
+            f"occurrences across the tool files. A tool the regex cannot parse is "
+            f"dropped from get_all_tools() and skips every annotation check. Fix "
+            f"the pattern in extract_tool_decorators() (a ')' inside the decorator "
+            f"args is the usual cause) rather than adjusting this count."
+        )
+
+    def test_server_registered_tools_have_open_world_hint(self):
+        """Tools registered directly on the server must also set openWorldHint.
+
+        get_all_tools() only scans src/ha_mcp/tools, so ha_get_skill_guide --
+        registered in server.py via self.mcp.tool(...) -- would otherwise keep
+        the implicit open-world default. Parse server.py's AST and assert every
+        self.mcp.tool(...) registration carries openWorldHint.
+        """
+        server_py = get_tools_dir().parent / "server.py"
+        tree = ast.parse(server_py.read_text(encoding="utf-8"), filename=str(server_py))
+
+        registrations = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "tool"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "mcp"
+        ]
+        assert registrations, (
+            "no self.mcp.tool(...) registrations found in server.py -- "
+            "the scanner's shape assumption drifted"
+        )
+
+        # ha_get_skill_guide registers as name=SKILL_TOOL_NAME, not a literal, so
+        # resolve module-level string constants to keep failures naming the tool
+        # rather than "<unknown>".
+        constants = {
+            target.id: node.value.value
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+
+        def tool_name(call: ast.Call) -> str:
+            value = next((kw.value for kw in call.keywords if kw.arg == "name"), None)
+            if isinstance(value, ast.Constant):
+                return str(value.value)
+            if isinstance(value, ast.Name):
+                return constants.get(value.id, value.id)
+            return "<unknown>" if value is None else ast.unparse(value)
+
+        missing = []
+        for call in registrations:
+            name = tool_name(call)
+            annotations = next(
+                (kw.value for kw in call.keywords if kw.arg == "annotations"), None
+            )
+            keys = (
+                {k.value for k in annotations.keys if isinstance(k, ast.Constant)}
+                if isinstance(annotations, ast.Dict)
+                else set()
+            )
+            if "openWorldHint" not in keys:
+                missing.append(name)
+
+        assert not missing, (
+            f"server-registered tools missing openWorldHint: {missing}. Add it to "
+            "the annotations dict in the self.mcp.tool(...) call in server.py."
+        )
+
+    def test_search_proxy_tools_have_open_world_hint(self):
+        """Runtime tool-search proxies must also set openWorldHint.
+
+        When ENABLE_TOOL_SEARCH=true, CategorizedSearchTransform builds
+        ha_search_tools and the ha_call_* proxies at runtime via
+        ToolAnnotations(...), which the src/ha_mcp/tools scan never sees. Assert
+        every ToolAnnotations construction in categorized_search.py sets
+        openWorldHint so those proxies don't inherit the implicit default.
+        """
+        transform_py = get_tools_dir().parent / "transforms" / "categorized_search.py"
+        tree = ast.parse(
+            transform_py.read_text(encoding="utf-8"), filename=str(transform_py)
+        )
+        constructions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ToolAnnotations"
+        ]
+        assert constructions, (
+            "no ToolAnnotations(...) constructions found in categorized_search.py "
+            "-- the scanner's shape assumption drifted"
+        )
+
+        missing = sum(
+            1
+            for c in constructions
+            if not any(kw.arg == "openWorldHint" for kw in c.keywords)
+        )
+        assert missing == 0, (
+            f"{missing} of {len(constructions)} ToolAnnotations(...) in "
+            "categorized_search.py omit openWorldHint; the runtime search proxies "
+            "would inherit the MCP default. Set it explicitly on each proxy."
+        )
+
+    def test_all_tools_have_tags(self):
+        """Every tool must have a tags= parameter for categorization."""
+        tools = get_all_tools()
+
+        missing_tags = [
+            f"{tool['file']}:{tool['function']}"
+            for tool in tools
+            if not tool["has_tags"]
+        ]
+
+        assert not missing_tags, (
+            f"Tools missing tags= parameter ({len(missing_tags)}):\n  "
+            + "\n  ".join(missing_tags)
+            + "\n\nAdd tags={'Category Name'} to each @mcp.tool() decorator."
+        )
+
+    def test_ha_check_config_removed_and_folded(self):
+        """ha_check_config was removed and folded into ha_get_system_health
+        (include='config_check'). Lock the removal at the source registration so
+        a bad merge that re-adds the @tool block fails CI."""
+        system_src = (get_tools_dir() / "tools_system.py").read_text(encoding="utf-8")
+        assert 'name="ha_check_config"' not in system_src, (
+            "ha_check_config was removed in favor of "
+            "ha_get_system_health(include='config_check'); it must not be "
+            "re-registered."
+        )
+        assert 'name="ha_get_system_health"' in system_src
+
     def test_tool_count_sanity_check(self):
         """Sanity check that we're finding a reasonable number of tools."""
         tools = get_all_tools()
 
-        # We should have at least 50 tools (currently ~82)
+        # We should have at least 50 tools (currently ~92)
         assert len(tools) >= 50, f"Only found {len(tools)} tools, expected at least 50"
 
         # We should have a mix of read-only and destructive tools
-        read_only_count = sum(1 for t in tools if t['has_read_only_hint'])
-        destructive_count = sum(1 for t in tools if t['has_destructive_hint'])
+        read_only_count = sum(1 for t in tools if t["has_read_only_hint"])
+        destructive_count = sum(1 for t in tools if t["has_destructive_hint"])
 
-        assert read_only_count >= 20, f"Only {read_only_count} read-only tools, expected at least 20"
-        assert destructive_count >= 20, f"Only {destructive_count} destructive tools, expected at least 20"
+        assert read_only_count >= 20, (
+            f"Only {read_only_count} read-only tools, expected at least 20"
+        )
+        assert destructive_count >= 19, (
+            f"Only {destructive_count} destructive tools, expected at least 19"
+        )
 
     def test_total_tool_count_limit(self):
         """Ensure total tool count doesn't exceed reasonable limits.
@@ -176,18 +405,28 @@ class TestToolAnnotations:
         """Tools with readOnlyHint should have read-only names (get, list, search, etc)."""
         tools = get_all_tools()
 
-        read_only_tools = [t for t in tools if t['has_read_only_hint']]
-
-        # These prefixes/patterns indicate read-only operations
-        read_only_patterns = ['get', 'list', 'search', 'check', 'eval', 'render']
+        read_only_tools = [t for t in tools if t["has_read_only_hint"]]
 
         suspicious = []
         for tool in read_only_tools:
-            func = tool['function'].lower()
+            func = tool["function"].lower()
             # If it starts with a modifying verb, it's suspicious
             # Note: "list_updates" is OK (listing updates), "update_zone" is suspicious
-            modifying_prefixes = ['create_', 'set_', 'delete_', 'update_', 'add_', 'remove_', 'assign_', 'restart', 'reload']
-            if any(func.startswith(f'ha_{prefix}') or func.startswith(prefix) for prefix in modifying_prefixes):
+            modifying_prefixes = [
+                "create_",
+                "set_",
+                "delete_",
+                "update_",
+                "add_",
+                "remove_",
+                "assign_",
+                "restart",
+                "reload",
+            ]
+            if any(
+                func.startswith(f"ha_{prefix}") or func.startswith(prefix)
+                for prefix in modifying_prefixes
+            ):
                 suspicious.append(f"{tool['file']}:{tool['function']}")
 
         assert not suspicious, (
@@ -199,21 +438,41 @@ class TestToolAnnotations:
         """Tools with destructiveHint should have modifying names."""
         tools = get_all_tools()
 
-        destructive_tools = [t for t in tools if t['has_destructive_hint']]
+        destructive_tools = [t for t in tools if t["has_destructive_hint"]]
 
         # These patterns indicate destructive/modifying operations
-        destructive_patterns = ['create', 'set', 'delete', 'update', 'add', 'remove', 'assign', 'restart', 'reload', 'restore', 'import', 'rename', 'call', 'bulk', 'config_set', 'config_delete']
+        destructive_patterns = [
+            "create",
+            "set",
+            "delete",
+            "update",
+            "add",
+            "remove",
+            "assign",
+            "restart",
+            "reload",
+            "restore",
+            "import",
+            "rename",
+            "call",
+            "bulk",
+            "config_set",
+            "config_delete",
+        ]
 
         suspicious = []
         for tool in destructive_tools:
-            func = tool['function'].lower()
+            func = tool["function"].lower()
             # If it has only get/list/search patterns and destructiveHint, that's suspicious
             if not any(pattern in func for pattern in destructive_patterns):
                 # Exception: ha_call_service and ha_bulk_control are correctly destructive
-                if func not in ['ha_call_service', 'ha_bulk_control']:
+                if func not in ["ha_call_service", "ha_bulk_control"]:
                     suspicious.append(f"{tool['file']}:{tool['function']}")
 
         # This is a warning, not a hard failure - some tools might legitimately be destructive
         # even without obvious naming
         if suspicious:
-            print("\nNote: These destructive tools don't have typical modifying names:\n  " + "\n  ".join(suspicious))
+            print(
+                "\nNote: These destructive tools don't have typical modifying names:\n  "
+                + "\n  ".join(suspicious)
+            )

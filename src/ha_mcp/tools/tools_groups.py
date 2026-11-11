@@ -8,24 +8,168 @@ Home Assistant entity groups (old-style groups created via group.set service).
 import logging
 from typing import Annotated, Any
 
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import tool
 from pydantic import Field
 
-from .helpers import log_tool_usage
+from ..client.rest_client import (
+    HomeAssistantAuthError,
+    HomeAssistantConnectionError,
+)
+from ..errors import ErrorCode, create_error_response
+from .auto_backup import with_auto_backup
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    validate_identifier_not_empty,
+)
+from .util_helpers import (
+    JSON_STRING_COERCION,
+    build_pagination_metadata,
+    wait_for_entity_registered,
+    wait_for_entity_removed,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
-    """Register Home Assistant entity group management tools."""
+class GroupTools:
+    """Entity group management tools for Home Assistant."""
 
-    @mcp.tool(annotations={"idempotentHint": True, "readOnlyHint": True, "tags": ["group"], "title": "List Groups"})
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    @staticmethod
+    def _validate_group_params(
+        object_id: str,
+        entities: list[str] | None,
+        add_entities: list[str] | None,
+        remove_entities: list[str] | None,
+    ) -> None:
+        """Validate group parameters: object_id format, mutual exclusivity, and non-empty lists."""
+        # Validate object_id doesn't contain invalid characters
+        if "." in object_id:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Invalid object_id: '{object_id}'. Do not include 'group.' prefix or dots.",
+                    context={"object_id": object_id},
+                    suggestions=["Provide object_id without 'group.' prefix or dots"],
+                )
+            )
+
+        # Check mutual exclusivity of entity operations
+        entity_ops = [
+            ("entities", entities),
+            ("add_entities", add_entities),
+            ("remove_entities", remove_entities),
+        ]
+        provided_ops = [
+            (op_name, val) for op_name, val in entity_ops if val is not None
+        ]
+
+        if len(provided_ops) > 1:
+            op_names = [op_name for op_name, _ in provided_ops]
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    f"Only one of entities, add_entities, or remove_entities can be provided. Got: {op_names}",
+                    context={"object_id": object_id, "provided_ops": op_names},
+                    suggestions=[
+                        "Use only one of: entities, add_entities, or remove_entities"
+                    ],
+                )
+            )
+
+        # Validate non-empty lists
+        if entities is not None and not entities:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "Entities list cannot be empty",
+                    context={"object_id": object_id},
+                    suggestions=["Provide at least one entity ID in the entities list"],
+                )
+            )
+        if add_entities is not None and not add_entities:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "add_entities list cannot be empty",
+                    context={"object_id": object_id},
+                    suggestions=[
+                        "Provide at least one entity ID in the add_entities list"
+                    ],
+                )
+            )
+
+    @staticmethod
+    def _build_group_service_data(
+        object_id: str,
+        name: str | None,
+        icon: str | None,
+        all_on: bool | None,
+        entities: list[str] | None,
+        add_entities: list[str] | None,
+        remove_entities: list[str] | None,
+    ) -> dict[str, Any]:
+        """Build service data dict for group.set service call."""
+        service_data: dict[str, Any] = {
+            "object_id": object_id,
+        }
+        if name is not None:
+            service_data["name"] = name
+        if icon is not None:
+            service_data["icon"] = icon
+        if all_on is not None:
+            service_data["all"] = all_on
+        if entities is not None:
+            service_data["entities"] = entities
+        if add_entities is not None:
+            service_data["add_entities"] = add_entities
+        if remove_entities is not None:
+            service_data["remove_entities"] = remove_entities
+        return service_data
+
+    @tool(
+        name="ha_config_list_groups",
+        tags={"Groups"},
+        annotations={
+            "openWorldHint": False,
+            "idempotentHint": True,
+            "readOnlyHint": True,
+            "title": "List Groups",
+        },
+    )
     @log_tool_usage
-    async def ha_config_list_groups() -> dict[str, Any]:
+    async def ha_config_list_groups(
+        self,
+        limit: Annotated[
+            int,
+            Field(
+                default=100,
+                ge=1,
+                le=500,
+                description="Max groups to return per page (default: 100)",
+            ),
+        ] = 100,
+        offset: Annotated[
+            int,
+            Field(
+                default=0,
+                ge=0,
+                description="Number of groups to skip for pagination (default: 0)",
+            ),
+        ] = 0,
+    ) -> dict[str, Any]:
         """
-        List all Home Assistant entity groups with their member entities.
+        List Home Assistant entity groups with their member entities.
 
-        Returns all groups created via group.set service or YAML configuration,
-        including:
+        Returns one page of groups created via group.set service or YAML
+        configuration; `total_count` and `has_more` report the full set. Each
+        group includes:
         - Entity ID (group.xxx)
         - Friendly name
         - State (on/off based on member states)
@@ -34,14 +178,15 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - All mode (if all entities must be on)
 
         EXAMPLES:
-        - List all groups: ha_config_list_groups()
+        - First page of groups: ha_config_list_groups()
+        - Next page: ha_config_list_groups(offset=100)
 
         **NOTE:** This returns old-style groups (created via group.set or YAML).
         Platform-specific groups (light groups, cover groups) are separate entities.
         """
         try:
             # Get all entity states and filter for groups
-            states = await client.get_states()
+            states = await self._client.get_states()
 
             groups = []
             for state in states:
@@ -61,32 +206,53 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                         }
                     )
 
-            # Sort by friendly name or entity_id
+            # Sort by friendly name, then entity_id: the unique tiebreaker keeps
+            # groups with the same name in a stable order, so a page boundary
+            # cannot duplicate or skip one when get_states() order shifts.
             groups.sort(
-                key=lambda g: (g.get("friendly_name") or g.get("entity_id", "")).lower()
+                key=lambda g: (
+                    (g.get("friendly_name") or g.get("entity_id", "")).lower(),
+                    g.get("entity_id", ""),
+                )
             )
+
+            total_count = len(groups)
+            paginated_groups = groups[offset : offset + limit]
 
             return {
                 "success": True,
-                "count": len(groups),
-                "groups": groups,
-                "message": f"Found {len(groups)} group(s)",
+                "groups": paginated_groups,
+                **build_pagination_metadata(
+                    total_count, offset, limit, len(paginated_groups)
+                ),
+                "message": f"Found {total_count} group(s)",
             }
 
         except Exception as e:
             logger.error(f"Error listing groups: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to list groups: {str(e)}",
-                "suggestions": [
+            exception_to_structured_error(
+                e,
+                context={"operation": "list_groups"},
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify REST API is accessible",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
 
-    @mcp.tool(annotations={"destructiveHint": True, "tags": ["group"], "title": "Create or Update Group"})
+    @tool(
+        name="ha_config_set_group",
+        tags={"Groups"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "title": "Create or Update Group",
+        },
+    )
+    @with_auto_backup(domain="group", id_param="object_id")
     @log_tool_usage
     async def ha_config_set_group(
+        self,
         object_id: Annotated[
             str,
             Field(
@@ -95,6 +261,7 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         ],
         entities: Annotated[
             list[str] | None,
+            JSON_STRING_COERCION,
             Field(
                 description="List of entity IDs for the group. Required when creating new group. When updating, replaces all entities (mutually exclusive with add_entities/remove_entities).",
                 default=None,
@@ -123,6 +290,7 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         ] = None,
         add_entities: Annotated[
             list[str] | None,
+            JSON_STRING_COERCION,
             Field(
                 description="Add these entities to an existing group (mutually exclusive with entities)",
                 default=None,
@@ -130,17 +298,32 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         ] = None,
         remove_entities: Annotated[
             list[str] | None,
+            JSON_STRING_COERCION,
             Field(
                 description="Remove these entities from an existing group (mutually exclusive with entities)",
                 default=None,
             ),
         ] = None,
+        wait: Annotated[
+            bool,
+            Field(
+                description="Wait for group to be queryable before returning. Default: True. Set to False for bulk operations.",
+                default=True,
+            ),
+        ] = True,
     ) -> dict[str, Any]:
         """
-        Create or update a Home Assistant entity group.
+        Create or update a service-based Home Assistant entity group via the group.set service.
 
-        Uses the group.set service to create a new group or update an existing one.
-        Groups are useful for organizing entities and controlling them together.
+        **When NOT to use:** for typical "combine these entities into one controllable group"
+        requests, prefer `ha_config_set_helper(helper_type="group", ...)`. Config-entry-backed
+        groups are registered in the entity registry, so `ha_set_entity` can assign them to
+        areas and they are deletable via `ha_remove_helpers_integrations`.
+
+        **When to use:** compatibility with existing groups already configured via group.set
+        or YAML, or the rare case where entity-registry membership is explicitly unwanted.
+        Groups created here are only removable via `ha_config_remove_group` —
+        `ha_remove_helpers_integrations` will not find them.
 
         **For NEW groups:** Provide object_id and entities (required).
         **For EXISTING groups:** Provide object_id and any fields to update.
@@ -156,72 +339,64 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         **NOTE:** entities, add_entities, and remove_entities are mutually exclusive.
         """
         try:
-            # Validate object_id doesn't contain invalid characters
-            if "." in object_id:
-                return {
-                    "success": False,
-                    "error": f"Invalid object_id: '{object_id}'. Do not include 'group.' prefix or dots.",
-                    "object_id": object_id,
-                }
+            # ``_validate_group_params`` only catches dots in object_id and
+            # entity-list issues; empty/whitespace object_id would slip
+            # through to ``call_service("group", "set", {"object_id": "", ...})``
+            # and surface as a misleading HA service-call failure. Symmetric
+            # with the ``ha_config_remove_group`` pre-flight added in this PR.
+            validate_identifier_not_empty(
+                object_id,
+                "object_id",
+                suggestions=[
+                    "Use ha_config_list_groups() to find existing group object_ids",
+                    "Or provide a fresh object_id (without 'group.' prefix) to create a new group",
+                ],
+                context={"operation": "set_group"},
+            )
+            self._validate_group_params(
+                object_id, entities, add_entities, remove_entities
+            )
 
-            # Check mutual exclusivity of entity operations
-            entity_ops = [
-                ("entities", entities),
-                ("add_entities", add_entities),
-                ("remove_entities", remove_entities),
-            ]
-            provided_ops = [
-                (op_name, val) for op_name, val in entity_ops if val is not None
-            ]
-
-            if len(provided_ops) > 1:
-                op_names = [op_name for op_name, _ in provided_ops]
-                return {
-                    "success": False,
-                    "error": f"Only one of entities, add_entities, or remove_entities can be provided. Got: {op_names}",
-                    "object_id": object_id,
-                }
-
-            # Validate non-empty lists
-            if entities is not None and not entities:
-                return {
-                    "success": False,
-                    "error": "Entities list cannot be empty",
-                    "object_id": object_id,
-                }
-            if add_entities is not None and not add_entities:
-                return {
-                    "success": False,
-                    "error": "add_entities list cannot be empty",
-                    "object_id": object_id,
-                }
-
-            # Build service data
-            service_data: dict[str, Any] = {
-                "object_id": object_id,
-            }
-
-            if name is not None:
-                service_data["name"] = name
-            if icon is not None:
-                service_data["icon"] = icon
-            if all_on is not None:
-                service_data["all"] = all_on
-            if entities is not None:
-                service_data["entities"] = entities
-            if add_entities is not None:
-                service_data["add_entities"] = add_entities
-            if remove_entities is not None:
-                service_data["remove_entities"] = remove_entities
+            service_data = self._build_group_service_data(
+                object_id,
+                name,
+                icon,
+                all_on,
+                entities,
+                add_entities,
+                remove_entities,
+            )
 
             # Call group.set service
-            await client.call_service("group", "set", service_data)
+            await self._client.call_service("group", "set", service_data)
 
             entity_id = f"group.{object_id}"
-            updated_fields = [k for k in service_data.keys() if k != "object_id"]
+            updated_fields = [k for k in service_data if k != "object_id"]
 
             # Determine if this was a create or update based on fields provided
-            is_create = entities is not None and name is None and add_entities is None and remove_entities is None
+            is_create = (
+                entities is not None
+                and name is None
+                and add_entities is None
+                and remove_entities is None
+            )
+
+            result: dict[str, Any] = {}
+            if wait:
+                action_word = "created" if is_create else "updated"
+                try:
+                    registered = await wait_for_entity_registered(
+                        self._client, entity_id
+                    )
+                    if not registered:
+                        result.setdefault("warnings", []).append(
+                            f"Group {action_word} but {entity_id} not yet queryable. "
+                            "It may take a moment to become available."
+                        )
+                except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
+                    result.setdefault("warnings", []).append(
+                        f"Group {action_word} but verification failed: {e}"
+                    )
 
             return {
                 "success": True,
@@ -229,36 +404,62 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
                 "object_id": object_id,
                 "updated_fields": updated_fields,
                 "message": f"Successfully {'created' if is_create else 'updated'} group: {entity_id}",
+                **result,
             }
 
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error setting group: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to set group: {str(e)}",
-                "object_id": object_id,
-                "suggestions": [
+            logger.error(f"Error setting group {object_id!r}: {e}")
+            exception_to_structured_error(
+                e,
+                context={"object_id": object_id},
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify all entity IDs in the entities list exist",
                     "Ensure object_id is valid (no dots, no 'group.' prefix)",
                     "Use ha_config_list_groups() to see existing groups",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
 
-    @mcp.tool(annotations={"destructiveHint": True, "idempotentHint": True, "tags": ["group"], "title": "Remove Group"})
+    @tool(
+        name="ha_config_remove_group",
+        tags={"Groups"},
+        annotations={
+            "openWorldHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "title": "Remove Group",
+        },
+    )
+    @with_auto_backup(domain="group", id_param="object_id")
     @log_tool_usage
     async def ha_config_remove_group(
+        self,
         object_id: Annotated[
             str,
             Field(
                 description="Group identifier without 'group.' prefix (e.g., 'living_room_lights')"
             ),
         ],
+        wait: Annotated[
+            bool,
+            Field(
+                description="Wait for group to be fully removed before returning. Default: True.",
+                default=True,
+            ),
+        ] = True,
     ) -> dict[str, Any]:
         """
-        Remove a Home Assistant entity group.
+        Remove a service-based Home Assistant entity group via the group.remove service.
 
-        Uses the group.remove service to delete the group.
+        **When NOT to use:** for groups created through `ha_config_set_helper(helper_type="group", ...)`,
+        use `ha_remove_helpers_integrations`. Those config-entry-backed groups are not reachable via the
+        group.remove service.
+
+        **When to use:** removing groups created with `ha_config_set_group` or defined in YAML
+        via `group:` configuration. Config-entry-backed deletion tools cannot find these.
 
         EXAMPLES:
         - Remove group: ha_config_remove_group("living_room_lights")
@@ -271,36 +472,74 @@ def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         - This only removes old-style groups, not platform-specific groups.
         """
         try:
-            # Validate object_id
+            # Empty/whitespace would surface as a misleading service-call failure.
+            # Runs before the "." format check below so the empty/whitespace
+            # case is named first; the order is locked by the test in
+            # TestGroupsIdentifierValidation.
+            validate_identifier_not_empty(
+                object_id,
+                "object_id",
+                suggestions=[
+                    "Use ha_config_list_groups() to find existing group object_ids"
+                ],
+                context={"operation": "remove_group"},
+            )
+            # Validate object_id format
             if "." in object_id:
-                return {
-                    "success": False,
-                    "error": f"Invalid object_id: '{object_id}'. Do not include 'group.' prefix.",
-                    "object_id": object_id,
-                }
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        f"Invalid object_id: '{object_id}'. Do not include 'group.' prefix.",
+                        context={"object_id": object_id},
+                        suggestions=[
+                            "Provide object_id without 'group.' prefix or dots"
+                        ],
+                    )
+                )
 
             # Call group.remove service
             service_data = {"object_id": object_id}
-            await client.call_service("group", "remove", service_data)
+            await self._client.call_service("group", "remove", service_data)
 
             entity_id = f"group.{object_id}"
+
+            result: dict[str, Any] = {}
+            if wait:
+                try:
+                    removed = await wait_for_entity_removed(self._client, entity_id)
+                    if not removed:
+                        result.setdefault("warnings", []).append(
+                            f"Deletion confirmed by API but {entity_id} may still appear briefly."
+                        )
+                except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
+                    result.setdefault("warnings", []).append(
+                        f"Deletion confirmed but removal verification failed: {e}"
+                    )
 
             return {
                 "success": True,
                 "entity_id": entity_id,
                 "object_id": object_id,
                 "message": f"Successfully removed group: {entity_id}",
+                **result,
             }
 
+        except ToolError:
+            raise
         except Exception as e:
-            logger.error(f"Error removing group: {e}")
-            return {
-                "success": False,
-                "error": f"Failed to remove group: {str(e)}",
-                "object_id": object_id,
-                "suggestions": [
+            logger.error(f"Error removing group {object_id!r}: {e}")
+            exception_to_structured_error(
+                e,
+                context={"object_id": object_id},
+                suggestions=[
                     "Check Home Assistant connection",
                     "Verify the group exists using ha_config_list_groups()",
                     "Groups defined in YAML cannot be permanently removed",
                 ],
-            }
+            )
+            return None  # unreachable: exception_to_structured_error always raises
+
+
+def register_group_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
+    """Register Home Assistant entity group management tools."""
+    register_tool_methods(mcp, GroupTools(client))

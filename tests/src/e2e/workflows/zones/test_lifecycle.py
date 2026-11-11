@@ -60,7 +60,7 @@ class TestZoneLifecycle:
             # 1. CREATE: Basic zone
             zone_name = "Test Office E2E"
             create_data = await mcp.call_tool_success(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": zone_name,
                     "latitude": 40.7128,
@@ -101,7 +101,7 @@ class TestZoneLifecycle:
 
             # 3. UPDATE: Modify zone properties
             update_data = await mcp.call_tool_success(
-                "ha_update_zone",
+                "ha_set_zone",
                 {
                     "zone_id": zone_id,
                     "name": "Updated Office E2E",
@@ -136,7 +136,7 @@ class TestZoneLifecycle:
 
             # 5. DELETE: Remove zone
             await mcp.call_tool_success(
-                "ha_delete_zone",
+                "ha_remove_zone",
                 {"zone_id": zone_id},
             )
             logger.info("Zone deleted successfully")
@@ -161,7 +161,7 @@ class TestZoneLifecycle:
         async with MCPAssertions(mcp_client) as mcp:
             zone_name = "Test Passive Zone E2E"
             create_data = await mcp.call_tool_success(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": zone_name,
                     "latitude": 40.7580,
@@ -181,15 +181,13 @@ class TestZoneLifecycle:
 
             for zone in list_data.get("zones", []):
                 if zone.get("id") == zone_id:
-                    assert zone.get("passive") is True, (
-                        f"Passive mode not set: {zone}"
-                    )
+                    assert zone.get("passive") is True, f"Passive mode not set: {zone}"
                     break
             logger.info("Passive mode verified")
 
             # Update passive mode to False
             await mcp.call_tool_success(
-                "ha_update_zone",
+                "ha_set_zone",
                 {
                     "zone_id": zone_id,
                     "passive": False,
@@ -210,7 +208,7 @@ class TestZoneLifecycle:
 
             # Cleanup
             await mcp.call_tool_success(
-                "ha_delete_zone",
+                "ha_remove_zone",
                 {"zone_id": zone_id},
             )
             logger.info("Passive zone cleaned up")
@@ -227,7 +225,7 @@ class TestZoneLifecycle:
             # Create initial zone
             zone_name = "Test Coordinates E2E"
             create_data = await mcp.call_tool_success(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": zone_name,
                     "latitude": 40.0,
@@ -242,7 +240,7 @@ class TestZoneLifecycle:
 
             # Update latitude only
             await mcp.call_tool_success(
-                "ha_update_zone",
+                "ha_set_zone",
                 {
                     "zone_id": zone_id,
                     "latitude": 41.0,
@@ -264,7 +262,7 @@ class TestZoneLifecycle:
 
             # Update both coordinates
             await mcp.call_tool_success(
-                "ha_update_zone",
+                "ha_set_zone",
                 {
                     "zone_id": zone_id,
                     "latitude": 42.0,
@@ -288,7 +286,7 @@ class TestZoneLifecycle:
 
             # Cleanup
             await mcp.call_tool_success(
-                "ha_delete_zone",
+                "ha_remove_zone",
                 {"zone_id": zone_id},
             )
             logger.info("Coordinates test zone cleaned up")
@@ -304,7 +302,7 @@ class TestZoneLifecycle:
         async with MCPAssertions(mcp_client) as mcp:
             # Test: Invalid latitude (out of range)
             await mcp.call_tool_failure(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": "Invalid Latitude",
                     "latitude": 100.0,  # Invalid: must be -90 to 90
@@ -317,7 +315,7 @@ class TestZoneLifecycle:
 
             # Test: Invalid longitude (out of range)
             await mcp.call_tool_failure(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": "Invalid Longitude",
                     "latitude": 40.0,
@@ -330,7 +328,7 @@ class TestZoneLifecycle:
 
             # Test: Invalid radius (zero or negative)
             await mcp.call_tool_failure(
-                "ha_create_zone",
+                "ha_set_zone",
                 {
                     "name": "Invalid Radius",
                     "latitude": 40.0,
@@ -343,7 +341,7 @@ class TestZoneLifecycle:
 
             # Test: Update with no fields
             await mcp.call_tool_failure(
-                "ha_update_zone",
+                "ha_set_zone",
                 {
                     "zone_id": "some_zone_id",
                 },
@@ -353,7 +351,7 @@ class TestZoneLifecycle:
 
             # Test: Delete non-existent zone
             await mcp.call_tool_failure(
-                "ha_delete_zone",
+                "ha_remove_zone",
                 {
                     "zone_id": "nonexistent_zone_xyz_123",
                 },
@@ -400,7 +398,7 @@ class TestZoneLifecycle:
             # Create multiple zones
             for zone_config in zones_to_create:
                 create_data = await mcp.call_tool_success(
-                    "ha_create_zone",
+                    "ha_set_zone",
                     zone_config,
                 )
                 zone_id = create_data.get("zone_id")
@@ -416,15 +414,13 @@ class TestZoneLifecycle:
             zone_ids_in_list = [z.get("id") for z in list_data.get("zones", [])]
 
             for zone_id in created_zone_ids:
-                assert zone_id in zone_ids_in_list, (
-                    f"Zone {zone_id} not found in list"
-                )
+                assert zone_id in zone_ids_in_list, f"Zone {zone_id} not found in list"
             logger.info("All zones verified in list")
 
             # Update all zones
             for zone_id in created_zone_ids:
                 await mcp.call_tool_success(
-                    "ha_update_zone",
+                    "ha_set_zone",
                     {
                         "zone_id": zone_id,
                         "radius": 250,  # Update all to same radius
@@ -435,7 +431,7 @@ class TestZoneLifecycle:
             # Delete all zones
             for zone_id in created_zone_ids:
                 await mcp.call_tool_success(
-                    "ha_delete_zone",
+                    "ha_remove_zone",
                     {"zone_id": zone_id},
                 )
             logger.info("All zones deleted")
@@ -450,6 +446,22 @@ class TestZoneLifecycle:
                 )
             logger.info("All zone deletions verified")
 
+    async def test_zone_get_nonexistent(self, mcp_client):
+        """Test ha_get_zone returns RESOURCE_NOT_FOUND for unknown zone_id.
+
+        Zones are addressed by registry-internal ``zone_id`` here (not by
+        their ``zone.<name>`` entity_id), so RESOURCE_NOT_FOUND is the
+        correct category per #1297.
+        """
+        async with MCPAssertions(mcp_client) as mcp:
+            result = await mcp.call_tool_failure(
+                "ha_get_zone",
+                {"zone_id": "nonexistent_zone_e2e_xyz_404"},
+                expected_error="Zone not found",
+            )
+
+        assert result["error"]["code"] == "RESOURCE_NOT_FOUND"
+
 
 async def test_zone_search_discovery(mcp_client):
     """
@@ -463,16 +475,12 @@ async def test_zone_search_discovery(mcp_client):
         # Search for zone entities
         try:
             search_data = await mcp.call_tool_success(
-                "ha_search_entities",
+                "ha_search",
                 {"query": "zone", "domain_filter": "zone", "limit": 10},
             )
 
-            data = (
-                search_data.get("data", {}) if search_data.get("data") else search_data
-            )
-
-            if data.get("success") and data.get("results"):
-                results = data.get("results", [])
+            if search_data.get("success") and search_data.get("entities"):
+                results = search_data.get("entities", [])
                 logger.info(f"Found {len(results)} zone entities via search")
 
                 for result in results:

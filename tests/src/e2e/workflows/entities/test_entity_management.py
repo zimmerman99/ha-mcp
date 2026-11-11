@@ -6,8 +6,8 @@ import logging
 
 import pytest
 
-from tests.src.e2e.utilities.assertions import assert_mcp_success, parse_mcp_result
-from tests.src.e2e.utilities.cleanup import (
+from ...utilities.assertions import assert_mcp_success, safe_call_tool
+from ...utilities.cleanup import (
     TestEntityCleaner as EntityCleaner,
 )
 
@@ -33,15 +33,15 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         logger.info(f"Created test entity: {entity_id}")
 
         # Create a test area
         area_result = await mcp_client.call_tool(
-            "ha_config_set_area",
-            {"name": "E2E Test Room", "icon": "mdi:room"},
+            "ha_set_area_or_floor",
+            {"kind": "area", "name": "E2E Test Room", "icon": "mdi:room"},
         )
         area_data = assert_mcp_success(area_result, "Create test area")
         area_id = area_data.get("area_id")
@@ -63,7 +63,9 @@ class TestEntityManagement:
 
         # Cleanup
         await cleaner.cleanup_all()
-        await mcp_client.call_tool("ha_config_remove_area", {"area_id": area_id})
+        await mcp_client.call_tool(
+            "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
+        )
 
     async def test_set_entity_clear_area(self, mcp_client, cleanup_tracker):
         """Test clearing area assignment using empty string."""
@@ -79,13 +81,13 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Create and assign to area
         area_result = await mcp_client.call_tool(
-            "ha_config_set_area",
-            {"name": "E2E Clear Area Room", "icon": "mdi:room"},
+            "ha_set_area_or_floor",
+            {"kind": "area", "name": "E2E Clear Area Room", "icon": "mdi:room"},
         )
         area_data = assert_mcp_success(area_result, "Create test area")
         area_id = area_data.get("area_id")
@@ -111,7 +113,9 @@ class TestEntityManagement:
 
         # Cleanup
         await cleaner.cleanup_all()
-        await mcp_client.call_tool("ha_config_remove_area", {"area_id": area_id})
+        await mcp_client.call_tool(
+            "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
+        )
 
     async def test_set_entity_name_and_icon(self, mcp_client, cleanup_tracker):
         """Test updating entity name and icon."""
@@ -127,7 +131,7 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Update name and icon
@@ -169,12 +173,13 @@ class TestEntityManagement:
 
     async def test_set_entity_nonexistent(self, mcp_client):
         """Test error handling for non-existent entity in ha_set_entity."""
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_set_entity",
             {"entity_id": "sensor.nonexistent_entity_xyz", "name": "Test Name"},
         )
-        data = parse_mcp_result(result)
         assert not data.get("success", False), "Should fail for non-existent entity"
+        assert data["error"]["code"] == "SERVICE_CALL_FAILED"
 
         logger.info("Non-existent entity error handling verified")
 
@@ -192,7 +197,7 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Set aliases
@@ -250,7 +255,7 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Disable entity using enabled=False
@@ -294,7 +299,7 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Hide entity using hidden=True
@@ -338,13 +343,13 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id)
 
         # Create a test area
         area_result = await mcp_client.call_tool(
-            "ha_config_set_area",
-            {"name": "E2E Get Entity Room", "icon": "mdi:room"},
+            "ha_set_area_or_floor",
+            {"kind": "area", "name": "E2E Get Entity Room", "icon": "mdi:room"},
         )
         area_data = assert_mcp_success(area_result, "Create test area")
         area_id = area_data.get("area_id")
@@ -414,7 +419,9 @@ class TestEntityManagement:
 
         # Cleanup
         await cleaner.cleanup_all()
-        await mcp_client.call_tool("ha_config_remove_area", {"area_id": area_id})
+        await mcp_client.call_tool(
+            "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
+        )
 
     async def test_get_entity_multiple(self, mcp_client, cleanup_tracker):
         """Test ha_get_entity with multiple entities returns list response."""
@@ -430,7 +437,7 @@ class TestEntityManagement:
             },
         )
         data1 = assert_mcp_success(create_result1, "Create first test entity")
-        entity_id1 = data1.get("entity_id") or f"input_boolean.{data1['helper_data']['id']}"
+        entity_id1 = data1.get("entity_id") or f"input_boolean.{data1['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id1)
 
         # Create second test helper
@@ -443,7 +450,7 @@ class TestEntityManagement:
             },
         )
         data2 = assert_mcp_success(create_result2, "Create second test entity")
-        entity_id2 = data2.get("entity_id") or f"input_boolean.{data2['helper_data']['id']}"
+        entity_id2 = data2.get("entity_id") or f"input_boolean.{data2['data']['id']}"
         cleaner.track_entity("input_boolean", entity_id2)
 
         # Call ha_get_entity with list of 2 entity_ids
@@ -462,8 +469,12 @@ class TestEntityManagement:
 
         # Verify both entities are present
         returned_entity_ids = {e.get("entity_id") for e in entity_entries}
-        assert entity_id1 in returned_entity_ids, f"entity_id1 missing: {entity_entries}"
-        assert entity_id2 in returned_entity_ids, f"entity_id2 missing: {entity_entries}"
+        assert entity_id1 in returned_entity_ids, (
+            f"entity_id1 missing: {entity_entries}"
+        )
+        assert entity_id2 in returned_entity_ids, (
+            f"entity_id2 missing: {entity_entries}"
+        )
 
         # Verify each entry has expected fields
         for entry in entity_entries:
@@ -484,15 +495,17 @@ class TestEntityManagement:
 
     async def test_get_entity_nonexistent(self, mcp_client):
         """Test error handling for non-existent entity in ha_get_entity."""
-        result = await mcp_client.call_tool(
+        data = await safe_call_tool(
+            mcp_client,
             "ha_get_entity",
             {"entity_id": "sensor.nonexistent_entity_xyz"},
         )
-        data = parse_mcp_result(result)
 
         assert not data.get("success", True), "Should fail for non-existent entity"
         assert "error" in data, f"Missing error field: {data}"
-        assert "suggestions" in data, f"Missing suggestions field: {data}"
+        assert data.get("error", {}).get("suggestions"), (
+            f"Missing suggestions field: {data}"
+        )
 
         logger.info("Non-existent entity error handling verified")
 
@@ -505,7 +518,9 @@ class TestEntityManagement:
         data = assert_mcp_success(result, "Get entity with empty list")
 
         assert data.get("count") == 0, f"Expected count=0, got: {data}"
-        assert data.get("entity_entries") == [], f"Expected empty entity_entries: {data}"
+        assert data.get("entity_entries") == [], (
+            f"Expected empty entity_entries: {data}"
+        )
         assert data.get("message") == "No entities requested", (
             f"Expected 'No entities requested' message: {data}"
         )
@@ -526,7 +541,7 @@ class TestEntityManagement:
             },
         )
         data = assert_mcp_success(create_result, "Create test entity")
-        valid_entity_id = data.get("entity_id") or f"input_boolean.{data['helper_data']['id']}"
+        valid_entity_id = data.get("entity_id") or f"input_boolean.{data['data']['id']}"
         cleaner.track_entity("input_boolean", valid_entity_id)
 
         nonexistent_entity_id = "sensor.nonexistent_partial_test"
@@ -539,7 +554,9 @@ class TestEntityManagement:
         get_data = assert_mcp_success(get_result, "Get entity partial success")
 
         # Verify partial success
-        assert get_data.get("count") == 1, f"Expected count=1 (partial), got: {get_data}"
+        assert get_data.get("count") == 1, (
+            f"Expected count=1 (partial), got: {get_data}"
+        )
 
         entity_entries = get_data.get("entity_entries", [])
         assert len(entity_entries) == 1, f"Expected 1 entry: {entity_entries}"
@@ -558,3 +575,94 @@ class TestEntityManagement:
 
         # Cleanup
         await cleaner.cleanup_all()
+
+
+@pytest.mark.registry
+class TestSetEntityNegativeInputs:
+    """Negative-input tests for ha_set_entity.
+
+    All cases exercise MCP-layer pre-flight guards — no WebSocket call is made.
+    """
+
+    async def test_set_entity_empty_list_rejected(self, mcp_client) -> None:
+        """Rejects an empty entity_id list before any registry call is made."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": [], "name": "Test"},
+        )
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+
+    async def test_set_entity_bulk_with_single_param_rejected(self, mcp_client) -> None:
+        """Rejects bulk operation when a single-entity parameter is provided."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": ["light.a", "light.b"], "name": "Shared Name"},
+        )
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+
+    async def test_set_entity_invalid_area_id_rejected(self, mcp_client) -> None:
+        """Rejects unknown areas instead of creating a dangling assignment."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": "light.test", "area_id": "unknown_area_id"},
+        )
+
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert data["area_id"] == "unknown_area_id"
+
+    async def test_set_entity_invalid_label_rejected(self, mcp_client) -> None:
+        """Rejects unknown labels instead of creating a dangling assignment."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": "light.test", "labels": ["unknown_label_id"]},
+        )
+
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+        assert data["unknown_labels"] == ["unknown_label_id"]
+
+    async def test_set_entity_automation_disable_rejected(self, mcp_client) -> None:
+        """Rejects registry-disabling an automation entity.
+
+        Introduced in #796: automation and script entities cannot be registry-disabled
+        via ha_set_entity(enabled=False) because it removes them from the state machine.
+        Use ha_call_service('automation', 'turn_off', ...) instead.
+        """
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": "automation.test_automation", "enabled": False},
+        )
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+
+    async def test_set_entity_invalid_assistant_rejected(self, mcp_client) -> None:
+        """Rejects expose_to with an unrecognised assistant ID."""
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": "light.test", "expose_to": {"unknown_assistant": True}},
+        )
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"
+
+    async def test_set_entity_script_disable_rejected(self, mcp_client) -> None:
+        """Rejects registry-disabling a script entity.
+
+        Introduced in #796: script entities cannot be registry-disabled via
+        ha_set_entity(enabled=False). Use ha_call_service('script', 'turn_off', ...) instead.
+        """
+        data = await safe_call_tool(
+            mcp_client,
+            "ha_set_entity",
+            {"entity_id": "script.test_script", "enabled": False},
+        )
+        assert not data.get("success", False)
+        assert data["error"]["code"] == "VALIDATION_INVALID_PARAMETER"

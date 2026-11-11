@@ -5,11 +5,10 @@ NOTE: Run these tests with the Docker test environment:
     HAMCP_ENV_FILE=tests/.env.test uv run pytest tests/src/e2e/workflows/system/test_system_tools.py -v
 
 Tests for system management MCP tools:
-- ha_check_config: Configuration validation
 - ha_restart: Home Assistant restart (with safety measures)
 - ha_reload_core: Reload specific configuration components
 - ha_get_overview: Get system information and entity overview
-- ha_get_system_health: Get system health data
+- ha_get_system_health: System health data + config validation (include="config_check")
 
 Note: ha_restart is tested carefully to avoid disrupting the test environment.
 We verify the safety mechanisms work but do not actually restart HA during tests.
@@ -19,7 +18,11 @@ import logging
 
 import pytest
 
-from ...utilities.assertions import parse_mcp_result
+from ...utilities.assertions import (
+    extract_error_message,
+    parse_mcp_result,
+    safe_call_tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,39 +32,91 @@ class TestSystemTools:
     """Test system management tools."""
 
     @pytest.mark.asyncio
-    async def test_check_config_valid(self, mcp_client):
+    async def test_config_check_via_system_health(self, mcp_client):
         """
-        Test: Check Home Assistant configuration for errors.
+        Test: Validate HA configuration via ha_get_system_health(include="config_check").
 
-        This test validates that we can check the HA configuration
-        and that the test environment has valid configuration.
+        The standalone ha_check_config tool was folded into ha_get_system_health;
+        configuration validation now lives under the "config_check" include section.
         """
-        logger.info("Checking Home Assistant configuration...")
+        logger.info("Checking Home Assistant configuration via system health...")
 
-        result = await mcp_client.call_tool("ha_check_config", {})
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "config_check"}
+        )
         data = parse_mcp_result(result)
 
-        logger.info(f"Config check result: {data}")
+        logger.info(f"System health (config_check) result: {data}")
 
         # Verify the tool executed successfully
-        assert data.get("success") is True, f"Config check failed: {data.get('error')}"
+        assert data.get("success") is True, (
+            f"Health check failed: {extract_error_message(data)}"
+        )
 
-        # Verify we got the expected fields
-        assert "result" in data, "Missing 'result' field"
-        assert "is_valid" in data, "Missing 'is_valid' field"
-        assert "errors" in data, "Missing 'errors' field"
+        # Verify the folded config_check section is present with expected fields
+        assert "config_check" in data, "Missing 'config_check' section"
+        config_check = data["config_check"]
+        assert "result" in config_check, "Missing 'result' field"
+        assert "is_valid" in config_check, "Missing 'is_valid' field"
+        assert "errors" in config_check, "Missing 'errors' field"
 
         # The test environment should have valid config
-        if data.get("is_valid"):
+        if config_check.get("is_valid"):
             logger.info("Configuration is valid")
-            assert data["result"] == "valid"
-            errors = data.get("errors") or []
+            assert config_check["result"] == "valid"
+            errors = config_check.get("errors") or []
             assert len(errors) == 0, f"Valid config should have no errors: {errors}"
         else:
             # Log errors if config is invalid (unexpected in test env)
-            logger.warning(f"Configuration has errors: {data['errors']}")
+            logger.warning(f"Configuration has errors: {config_check['errors']}")
 
         logger.info("Config check test completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_dead_entities_via_system_health(self, mcp_client):
+        """
+        Test: Surface orphaned/stale registry entries via
+        ha_get_system_health(include="dead_entities").
+
+        Validates the section shape (tiered buckets + summary) against a real HA
+        instance. The clean test environment is not expected to carry dead
+        entries, so the assertion is on structure, not on specific findings.
+        """
+        logger.info("Fetching dead entities via system health...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "dead_entities"}
+        )
+        data = parse_mcp_result(result)
+
+        logger.info(f"System health (dead_entities) result: {data}")
+
+        assert data.get("success") is True, (
+            f"Health check failed: {extract_error_message(data)}"
+        )
+
+        assert "dead_entities" in data, "Missing 'dead_entities' section"
+        dead = data["dead_entities"]
+        # Foundational sources (states + registry) must be reachable on a live
+        # instance — a section-level error here is a real failure.
+        assert "error" not in dead, f"dead_entities errored: {dead.get('error')}"
+
+        for tier in ("config_entry_orphans", "stale_restored"):
+            assert tier in dead, f"Missing '{tier}' tier"
+            bucket = dead[tier]
+            assert "items" in bucket and isinstance(bucket["items"], list)
+            assert "count" in bucket and "total_count" in bucket
+
+        assert "summary" in dead, "Missing 'summary'"
+        assert "registry_total" in dead["summary"]
+        assert dead["summary"]["registry_total"] > 0, (
+            "A live HA instance should have a non-empty entity registry"
+        )
+        # config/entries/get is available in the test env, so the definitive
+        # orphan tier should be active.
+        assert dead.get("config_entries_checked") is True
+
+        logger.info("Dead entities test completed successfully")
 
     @pytest.mark.asyncio
     async def test_restart_without_confirmation(self, mcp_client):
@@ -73,20 +128,23 @@ class TestSystemTools:
         """
         logger.info("Testing restart safety mechanism (no confirmation)...")
 
-        result = await mcp_client.call_tool("ha_restart", {})
-        data = parse_mcp_result(result)
+        data = await safe_call_tool(mcp_client, "ha_restart", {})
 
         logger.info(f"Restart result (no confirm): {data}")
 
         # Should fail with helpful error
         assert data.get("success") is False, "Restart should fail without confirmation"
-        assert "not confirmed" in data.get("error", "").lower(), (
-            f"Expected 'not confirmed' error, got: {data.get('error')}"
+        error = data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "not confirmed" in error_msg.lower(), (
+            f"Expected 'not confirmed' error, got: {error_msg}"
         )
 
         # Should provide suggestions
-        assert "suggestions" in data, "Should provide suggestions"
-        suggestions = data["suggestions"]
+        suggestions = error.get("suggestions", []) if isinstance(error, dict) else []
+        assert suggestions, "Should provide suggestions"
         assert any("confirm" in s.lower() for s in suggestions), (
             "Suggestions should mention confirmation"
         )
@@ -102,15 +160,18 @@ class TestSystemTools:
         """
         logger.info("Testing restart with explicit confirm=False...")
 
-        result = await mcp_client.call_tool("ha_restart", {"confirm": False})
-        data = parse_mcp_result(result)
+        data = await safe_call_tool(mcp_client, "ha_restart", {"confirm": False})
 
         logger.info(f"Restart result (confirm=False): {data}")
 
         # Should fail with helpful error
         assert data.get("success") is False, "Restart should fail with confirm=False"
-        assert "not confirmed" in data.get("error", "").lower(), (
-            f"Expected 'not confirmed' error, got: {data.get('error')}"
+        error = data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "not confirmed" in error_msg.lower(), (
+            f"Expected 'not confirmed' error, got: {error_msg}"
         )
 
         logger.info("Restart safety test passed - explicit false confirmation rejected")
@@ -130,9 +191,7 @@ class TestSystemTools:
         """
         logger.info("Testing reload automations...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "automations"}
-        )
+        result = await mcp_client.call_tool("ha_reload_core", {"target": "automations"})
         data = parse_mcp_result(result)
 
         logger.info(f"Reload automations result: {data}")
@@ -153,9 +212,7 @@ class TestSystemTools:
         """
         logger.info("Testing reload scripts...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "scripts"}
-        )
+        result = await mcp_client.call_tool("ha_reload_core", {"target": "scripts"})
         data = parse_mcp_result(result)
 
         logger.info(f"Reload scripts result: {data}")
@@ -173,9 +230,7 @@ class TestSystemTools:
         """
         logger.info("Testing reload scenes...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "scenes"}
-        )
+        result = await mcp_client.call_tool("ha_reload_core", {"target": "scenes"})
         data = parse_mcp_result(result)
 
         logger.info(f"Reload scenes result: {data}")
@@ -193,9 +248,7 @@ class TestSystemTools:
         """
         logger.info("Testing reload core config...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "core"}
-        )
+        result = await mcp_client.call_tool("ha_reload_core", {"target": "core"})
         data = parse_mcp_result(result)
 
         logger.info(f"Reload core config result: {data}")
@@ -213,23 +266,28 @@ class TestSystemTools:
         """
         logger.info("Testing reload with invalid target...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "invalid_target_xyz"}
+        data = await safe_call_tool(
+            mcp_client, "ha_reload_core", {"target": "invalid_target_xyz"}
         )
-        data = parse_mcp_result(result)
 
         logger.info(f"Reload invalid target result: {data}")
 
         # Should fail with helpful error
         assert data.get("success") is False, "Reload should fail for invalid target"
-        assert "invalid" in data.get("error", "").lower(), (
-            f"Expected 'invalid' in error, got: {data.get('error')}"
+        error = data.get("error", {})
+        error_msg = (
+            error.get("message", str(error)) if isinstance(error, dict) else str(error)
+        )
+        assert "invalid" in error_msg.lower(), (
+            f"Expected 'invalid' in error, got: {error_msg}"
         )
 
-        # Should provide valid targets
+        # Should provide valid targets (returned at top level in error response)
         assert "valid_targets" in data, "Should provide list of valid targets"
         valid_targets = data["valid_targets"]
-        assert "automations" in valid_targets, "Valid targets should include 'automations'"
+        assert "automations" in valid_targets, (
+            "Valid targets should include 'automations'"
+        )
         assert "scripts" in valid_targets, "Valid targets should include 'scripts'"
 
         logger.info("Invalid target test passed with helpful error message")
@@ -245,9 +303,7 @@ class TestSystemTools:
         """
         logger.info("Testing reload all components...")
 
-        result = await mcp_client.call_tool(
-            "ha_reload_core", {"target": "all"}
-        )
+        result = await mcp_client.call_tool("ha_reload_core", {"target": "all"})
         data = parse_mcp_result(result)
 
         logger.info(f"Reload all result: {data}")
@@ -262,9 +318,11 @@ class TestSystemTools:
         # Some core components should always be reloadable
         assert len(reloaded) > 0, "Should have reloaded at least one component"
 
-        # Log any warnings
-        if data.get("warnings"):
-            logger.warning(f"Reload warnings: {data['warnings']}")
+        # A clean container should produce no reload warnings — any warning
+        # here means RELOAD_TARGETS lists a target whose reload service does
+        # not exist (e.g. issue #1453: `counter.reload`).
+        warnings = data.get("warnings") or []
+        assert not warnings, f"Reload all produced unexpected warnings: {warnings}"
 
         logger.info("Reload all test completed successfully")
 
@@ -278,7 +336,7 @@ class TestSystemTools:
         """
         logger.info("Testing get system overview...")
 
-        result = await mcp_client.call_tool("ha_get_overview", {})
+        result = await mcp_client.call_tool("ha_get_overview", {"detail_level": "full"})
         data = parse_mcp_result(result)
 
         logger.info(f"System overview result keys: {list(data.keys())}")
@@ -290,17 +348,25 @@ class TestSystemTools:
         assert "system_info" in data, "Missing 'system_info' field"
         system_info = data["system_info"]
 
-        # Verify expected fields in system_info
+        # Verify expected fields in system_info (components only at "full" level)
         expected_fields = [
             "version",
             "location_name",
             "time_zone",
-            "components",
             "components_loaded",
+            "allowlist_external_dirs",
         ]
 
         for field in expected_fields:
-            assert field in system_info, f"Missing expected field in system_info: {field}"
+            assert field in system_info, (
+                f"Missing expected field in system_info: {field}"
+            )
+
+        # allowlist_external_dirs is list (HA exposed it) or None (HA omitted the key)
+        allowlist = system_info["allowlist_external_dirs"]
+        assert allowlist is None or isinstance(allowlist, list), (
+            "allowlist_external_dirs should be a list or None"
+        )
 
         # Log key information
         logger.info(f"Home Assistant version: {system_info.get('version')}")
@@ -308,17 +374,59 @@ class TestSystemTools:
         logger.info(f"Timezone: {system_info.get('time_zone')}")
         logger.info(f"Components loaded: {system_info.get('components_loaded')}")
 
-        # Verify components list is non-empty
-        components = system_info.get("components", [])
-        assert len(components) > 0, "Should have at least some components loaded"
+        # Verify components_loaded count is positive
+        components_loaded = system_info.get("components_loaded", 0)
+        assert components_loaded > 0, "Should have at least some components loaded"
 
-        # Verify some essential components are present
-        essential_components = ["homeassistant", "automation", "script"]
-        for component in essential_components:
-            if component not in components:
-                logger.warning(f"Expected component '{component}' not found")
+        # Verify notification_count is present (included at all detail levels)
+        assert "notification_count" in data, "Missing 'notification_count' field"
+        assert isinstance(data["notification_count"], int)
+        logger.info(f"Notification count: {data['notification_count']}")
+
+        # Verify repair_count is present
+        assert "repair_count" in data, "Missing 'repair_count' field"
+        assert isinstance(data["repair_count"], int)
+        logger.info(f"Repair count: {data['repair_count']}")
 
         logger.info("Get system overview test completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_overview_minimal_excludes_full_only_fields(self, mcp_client):
+        """
+        Test: full-only system_info fields must not leak at lower detail levels.
+
+        Guards against accidental hoisting of fields out of the
+        `if detail_level == "full":` branch in tools_search.py.
+        """
+        logger.info("Testing minimal overview excludes full-only system_info fields")
+
+        result = await mcp_client.call_tool(
+            "ha_get_overview", {"detail_level": "minimal"}
+        )
+        data = parse_mcp_result(result)
+        assert data.get("success") is True, (
+            f"Minimal overview failed: {data.get('error')}"
+        )
+
+        full_only_fields = {
+            "country",
+            "currency",
+            "unit_system",
+            "latitude",
+            "longitude",
+            "elevation",
+            "components_loaded",
+            "safe_mode",
+            "internal_url",
+            "external_url",
+            "allowlist_external_dirs",
+        }
+        leaked = full_only_fields & data.get("system_info", {}).keys()
+        assert not leaked, (
+            f"full-only fields leaked at detail_level='minimal': {leaked}"
+        )
+
+        logger.info("Minimal overview leak guard completed successfully")
 
     @pytest.mark.asyncio
     async def test_get_system_health(self, mcp_client):
@@ -371,6 +479,224 @@ class TestSystemTools:
 
         logger.info("Get system health test completed successfully")
 
+    @pytest.mark.asyncio
+    async def test_get_system_health_with_repairs(self, mcp_client):
+        """
+        Test: Get system health with repairs included.
+
+        Verifies that the include="repairs" parameter adds repair data
+        to the system health response.
+        """
+        logger.info("Testing get system health with repairs include...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "repairs"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = data.get("error", "")
+            if "not available" in str(error_msg).lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Get system health with repairs failed: {error_msg}")
+
+        assert "health_info" in data, "Missing 'health_info' field"
+        assert "repairs" in data, "Missing 'repairs' field when include='repairs'"
+
+        repairs = data["repairs"]
+        assert "issues" in repairs, "Repairs should contain 'issues' list"
+        assert "count" in repairs, "Repairs should contain 'count'"
+        assert isinstance(repairs["issues"], list), "Repairs issues should be a list"
+
+        logger.info(
+            f"System health with repairs: {repairs['count']} repair issues found"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_default_no_extras(self, mcp_client):
+        """
+        Test: Default system health (no include) should NOT contain repairs/zha_network.
+        """
+        logger.info("Testing default system health has no extras...")
+
+        result = await mcp_client.call_tool("ha_get_system_health", {})
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            pytest.skip("system_health not available in test environment")
+
+        assert "repairs" not in data, "Default health should not include repairs"
+        assert "zha_network" not in data, (
+            "Default health should not include zha_network"
+        )
+
+        logger.info("Default system health correctly excludes extras")
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_with_zha_network(self, mcp_client):
+        """
+        Test: Get system health with ZHA network data.
+
+        ZHA may or may not be installed — verify response structure
+        regardless (error isolation means it should still succeed).
+        system_health may raise ToolError in CI (no system_health component).
+        """
+        logger.info("Testing get system health with zha_network include...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "zha_network"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Get system health with ZHA failed: {error_msg}")
+
+        assert "health_info" in data, "Missing 'health_info' field"
+        assert "zha_network" in data, "Missing 'zha_network' when include='zha_network'"
+
+        zha = data["zha_network"]
+        assert "devices" in zha, "ZHA network should contain 'devices' list"
+        assert "count" in zha, "ZHA network should contain 'count'"
+        assert isinstance(zha["devices"], list), "ZHA devices should be a list"
+
+        logger.info(f"System health with ZHA: {zha['count']} devices found")
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_with_combined_include(self, mcp_client):
+        """
+        Test: Get system health with comma-separated include parameter.
+        """
+        logger.info("Testing system health with combined include...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "repairs,zha_network"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(
+                    f"Get system health with combined include failed: {error_msg}"
+                )
+
+        assert "repairs" in data, "Combined include should have repairs"
+        assert "zha_network" in data, "Combined include should have zha_network"
+
+        logger.info("Combined include correctly returns both sections")
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_with_zwave_network(self, mcp_client):
+        """
+        Test: Get system health with Z-Wave JS network data.
+
+        Z-Wave JS may or may not be installed — verify response structure
+        regardless (error isolation means it should still succeed).
+        system_health may raise ToolError in CI (no system_health component).
+        """
+        logger.info("Testing get system health with zwave_network include...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "zwave_network"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Get system health with zwave_network failed: {error_msg}")
+
+        assert "health_info" in data, "Missing 'health_info' field"
+        assert "zwave_network" in data, (
+            "Missing 'zwave_network' when include='zwave_network'"
+        )
+
+        zwave = data["zwave_network"]
+        assert "controller" in zwave, "Z-Wave network should contain 'controller'"
+        assert "nodes" in zwave, "Z-Wave network should contain 'nodes' list"
+        assert "count" in zwave, "Z-Wave network should contain 'count'"
+        assert isinstance(zwave["nodes"], list), "Z-Wave nodes should be a list"
+
+        logger.info(f"System health with Z-Wave: {zwave['count']} nodes found")
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_unknown_include_warns(self, mcp_client):
+        """
+        Test: Unknown include values produce a warning in the response.
+        """
+        logger.info("Testing system health with unknown include value...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "repairs,bogus_section"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(
+                    f"Get system health with unknown include failed: {error_msg}"
+                )
+
+        assert "warnings" in data, (
+            "Unknown include value should produce a warnings entry"
+        )
+        assert any("bogus_section" in w for w in data["warnings"]), (
+            "Warnings should mention the unknown section"
+        )
+
+        logger.info(f"Unknown include warnings: {data['warnings']}")
+
+    @pytest.mark.asyncio
+    async def test_get_system_health_with_themes(self, mcp_client):
+        """
+        Test: Get system health with themes data.
+
+        Verifies that include='themes' adds theme names and defaults to the
+        system health response. Live instances may have zero themes (minimal
+        installs), so count >= 0 is the only hard assertion.
+        """
+        logger.info("Testing get system health with themes include...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "themes"}
+        )
+        data = parse_mcp_result(result)
+
+        if not data.get("success"):
+            error_msg = extract_error_message(data)
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Get system health with themes failed: {error_msg}")
+
+        assert "health_info" in data, "Missing 'health_info' field"
+        assert "themes" in data, "Missing 'themes' field when include='themes'"
+
+        themes = data["themes"]
+        assert "themes" in themes, "Themes should contain 'themes' list"
+        assert "count" in themes, "Themes should contain 'count'"
+        assert "default_theme" in themes, "Themes should contain 'default_theme'"
+        assert "default_dark_theme" in themes, (
+            "Themes should contain 'default_dark_theme' (None when unset)"
+        )
+        assert isinstance(themes["themes"], list), "Themes list should be a list"
+        assert isinstance(themes["count"], int), "Count should be an int"
+        assert themes["count"] >= 0, "Count should be non-negative"
+
+        logger.info(f"System health with themes: {themes['count']} themes found")
+
 
 @pytest.mark.system
 class TestSystemToolsIntegration:
@@ -387,13 +713,16 @@ class TestSystemToolsIntegration:
         """
         logger.info("Testing check config -> reload workflow...")
 
-        # Step 1: Check configuration
-        config_result = await mcp_client.call_tool("ha_check_config", {})
+        # Step 1: Check configuration (folded into ha_get_system_health)
+        config_result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "config_check"}
+        )
         config_data = parse_mcp_result(config_result)
 
         assert config_data.get("success") is True, "Config check should succeed"
+        config_check = config_data.get("config_check", {})
 
-        if config_data.get("is_valid"):
+        if config_check.get("is_valid"):
             logger.info("Config is valid, proceeding with reload...")
 
             # Step 2: Reload automations
@@ -402,7 +731,9 @@ class TestSystemToolsIntegration:
             )
             reload_data = parse_mcp_result(reload_result)
 
-            assert reload_data.get("success") is True, "Reload should succeed after valid config check"
+            assert reload_data.get("success") is True, (
+                "Reload should succeed after valid config check"
+            )
             logger.info("Workflow completed: config check -> reload automations")
         else:
             logger.warning("Config has errors - reload would be skipped in production")
@@ -424,19 +755,27 @@ class TestSystemToolsIntegration:
         info_result = await mcp_client.call_tool("ha_get_overview", {})
         info_data = parse_mcp_result(info_result)
 
-        # Get system health (may not be available in test environment)
-        health_result = await mcp_client.call_tool("ha_get_system_health", {})
+        # Get system health + config status. Config validation is folded into
+        # ha_get_system_health as the "config_check" include section, so one
+        # call covers both. config_check is REST-based, so this call succeeds
+        # (degrading gracefully) even if the system_health WebSocket baseline is
+        # unavailable.
+        health_result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "config_check"}
+        )
         health_data = parse_mcp_result(health_result)
-
-        # Get config status
-        config_result = await mcp_client.call_tool("ha_check_config", {})
-        config_data = parse_mcp_result(config_result)
 
         # Verify essential tools returned successfully
         assert info_data.get("success") is True, "System overview should succeed"
-        assert config_data.get("success") is True, "Config check should succeed"
-        # Health data might not be available in test containers - don't require it
-        health_available = health_data.get("success") is True
+        assert health_data.get("success") is True, (
+            "ha_get_system_health(include='config_check') should always succeed "
+            "(REST config_check degrades gracefully if the WS baseline is down)"
+        )
+        config_check = health_data.get("config_check", {})
+        assert "is_valid" in config_check, "config_check section should be present"
+        # The WS health baseline may still be unavailable in minimal containers;
+        # config_check does not depend on it.
+        baseline_available = health_data.get("baseline_available", True)
 
         # Extract system_info from overview
         system_info = info_data.get("system_info", {})
@@ -449,11 +788,252 @@ class TestSystemToolsIntegration:
         logger.info(f"Location: {system_info.get('location_name')}")
         logger.info(f"Timezone: {system_info.get('time_zone')}")
         logger.info(f"Components: {system_info.get('components_loaded')}")
-        logger.info(f"Config Status: {config_data.get('result')}")
-        if health_available:
+        logger.info(f"Config Status: {config_check.get('result', 'unknown')}")
+        if baseline_available:
             logger.info(f"Health Components: {health_data.get('component_count')}")
         else:
-            logger.info("Health: Not available in this environment")
+            logger.info("Health baseline: not available in this environment")
         logger.info("=" * 60)
 
         logger.info("System overview test completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_overview_notifications_opt_out(self, mcp_client):
+        """Test that include_notifications=False omits notification data from overview."""
+        logger.info("Testing ha_get_overview with include_notifications=False")
+
+        result = await mcp_client.call_tool(
+            "ha_get_overview",
+            {"detail_level": "minimal", "include_notifications": False},
+        )
+        data = parse_mcp_result(result)
+
+        assert data.get("success") is True
+        assert "notification_count" not in data, (
+            "Expected no 'notification_count' when include_notifications=False"
+        )
+        assert "notifications" not in data, (
+            "Expected no 'notifications' when include_notifications=False"
+        )
+        logger.info("Notification opt-out test completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_overview_notification_lifecycle(self, mcp_client):
+        """Test that creating and dismissing a notification is reflected in the overview."""
+        logger.info("Testing notification lifecycle via overview")
+
+        # Create a test notification
+        create_result = await mcp_client.call_tool(
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "create",
+                "data": {
+                    "title": "Test Notification",
+                    "message": "E2E test notification",
+                    "notification_id": "e2e_test_overview_notif",
+                },
+            },
+        )
+        parse_mcp_result(create_result)
+
+        # Verify it appears in the overview
+        result = await mcp_client.call_tool(
+            "ha_get_overview",
+            {"detail_level": "minimal"},
+        )
+        data = parse_mcp_result(result)
+
+        assert data.get("notification_count", 0) > 0, "Expected at least 1 notification"
+        assert "notifications" in data
+
+        found = any(
+            n["notification_id"] == "e2e_test_overview_notif"
+            for n in data["notifications"]
+        )
+        assert found, "Expected to find the test notification in overview"
+
+        # Dismiss the notification
+        await mcp_client.call_tool(
+            "ha_call_service",
+            {
+                "domain": "persistent_notification",
+                "service": "dismiss",
+                "data": {"notification_id": "e2e_test_overview_notif"},
+            },
+        )
+
+        # Verify it's gone
+        result2 = await mcp_client.call_tool(
+            "ha_get_overview",
+            {"detail_level": "minimal"},
+        )
+        data2 = parse_mcp_result(result2)
+
+        if data2.get("notifications"):
+            not_found = all(
+                n["notification_id"] != "e2e_test_overview_notif"
+                for n in data2["notifications"]
+            )
+            assert not_found, "Test notification should be dismissed"
+
+        logger.info("Notification lifecycle test completed successfully")
+
+    @pytest.mark.asyncio
+    async def test_overview_fields_projection(self, mcp_client):
+        """fields= returns only the requested top-level keys (plus success).
+
+        Validates the 94% token-reduction path from issue #1199: callers that
+        need only one section receive a projected response with all other
+        top-level keys absent.
+        """
+        logger.info("Testing ha_get_overview fields= projection")
+
+        result = await mcp_client.call_tool(
+            "ha_get_overview",
+            {"fields": ["system_info"]},
+        )
+        data = parse_mcp_result(result)
+
+        assert data.get("success") is True
+        assert "system_info" in data, "requested field must be present"
+        assert "version" in data["system_info"], "system_info must be populated"
+
+        # All unrequested top-level keys must be absent.
+        for absent_key in (
+            "domains",
+            "entity_summary",
+            "total_entities",
+            "repair_count",
+        ):
+            assert absent_key not in data, (
+                f'key {absent_key!r} should be projected out when fields=["system_info"]'
+            )
+
+        logger.info("fields= projection test passed")
+
+
+@pytest.mark.system
+class TestReportIssueE2E:
+    """E2E coverage for ha_report_issue guidance against a live HA instance.
+
+    Proves the tool actually hands back the missing-tool refresh hint and the
+    beta-features flag when invoked end-to-end (issue #1804). It cannot prove an
+    LLM will read or act on the hint — only that the server returns it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_report_issue_surfaces_hint_and_beta_flag(self, mcp_client):
+        """ha_report_issue returns the missing-tool hint (field + pre-check) and
+        reports the beta master flag, verified against a real server."""
+        logger.info("Calling ha_report_issue against live HA...")
+
+        result = await mcp_client.call_tool("ha_report_issue", {})
+        data = parse_mcp_result(result)
+
+        # The tool always succeeds (diagnostics are best-effort); a failure here
+        # is a real regression, not a degraded-environment skip.
+        assert data.get("success") is True, (
+            f"ha_report_issue failed: {extract_error_message(data)}"
+        )
+
+        # 1) The dedicated hint field is present and carries the actual
+        #    refresh-your-tool-list guidance — the #1804 fix.
+        hint = data.get("missing_tool_hint", "")
+        assert hint, "missing_tool_hint field should be present and non-empty"
+        hint_lower = hint.lower()
+        assert "refresh" in hint_lower and "reconnect" in hint_lower, (
+            f"hint should tell the user to refresh/reconnect; got: {hint}"
+        )
+        assert "tool list" in hint_lower, (
+            "hint should name the stale client tool list as the cause"
+        )
+
+        # 2) The agent-facing workflow front-loads the pre-check (before the
+        #    duplicate-check step), so a missing tool is triaged before filing.
+        instructions = data.get("instructions", "")
+        assert "PRE-CHECK" in instructions, (
+            "instructions should include the missing-tool pre-check step"
+        )
+        assert instructions.index("PRE-CHECK") < instructions.index(
+            "Check for duplicates FIRST"
+        ), "pre-check must come before the duplicate-check step"
+
+        # 3) The beta master flag is read from live Settings into the structured
+        #    toggle snapshot AND rendered into the report a triager reads.
+        toggles = data.get("diagnostic_info", {}).get("config_toggles", {})
+        assert "enable_beta_features" in toggles, (
+            "config_toggles should report the beta master flag"
+        )
+        assert isinstance(toggles["enable_beta_features"], bool)
+        report = data.get("formatted_report", "")
+        assert "enable_beta_features" in report, (
+            "formatted_report should render the beta flag in its config toggles"
+        )
+
+        logger.info(
+            "ha_report_issue hint + beta flag verified end-to-end "
+            f"(enable_beta_features={toggles['enable_beta_features']})"
+        )
+
+
+class TestGetSystemHealthDiagnosticsE2E:
+    """E2E coverage for include='diagnostics' on ha_get_system_health."""
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_without_config_entry_id_returns_error_subdict(
+        self, mcp_client
+    ):
+        """include='diagnostics' without config_entry_id returns an error inside
+        result['diagnostics'] — the outer call still succeeds (matches the
+        repairs/zha_network embed pattern)."""
+        logger.info("Testing include='diagnostics' without config_entry_id...")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health", {"include": "diagnostics"}
+        )
+        data = parse_mcp_result(result)
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Outer call should succeed; got: {error_msg}")
+        assert "diagnostics" in data, "Missing 'diagnostics' sub-dict"
+        diag = data["diagnostics"]
+        assert "error" in diag, f"Expected error in diagnostics sub-dict, got: {diag}"
+        assert "config_entry_id" in diag["error"]
+        assert "ha_get_integration" in diag["error"]
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_with_config_entry_id_returns_subdict(self, mcp_client):
+        """include='diagnostics' + a real config_entry_id returns either a
+        populated data payload or a graceful 404 error — same contract as the
+        helper test."""
+        logger.info("Locating a config entry to probe diagnostics on...")
+        list_result = await mcp_client.call_tool("ha_get_integration", {})
+        list_data = parse_mcp_result(list_result)
+        entries = list_data.get("entries") or list_data.get("results") or []
+        if not entries:
+            pytest.skip("No config entries loaded in test container")
+        entry_id = entries[0].get("entry_id")
+
+        result = await mcp_client.call_tool(
+            "ha_get_system_health",
+            {"include": "diagnostics", "config_entry_id": entry_id},
+        )
+        data = parse_mcp_result(result)
+        if not data.get("success"):
+            error_msg = str(data.get("error", ""))
+            if "not available" in error_msg.lower():
+                pytest.skip("system_health not available in test environment")
+            else:
+                pytest.fail(f"Outer call should succeed; got: {error_msg}")
+        assert "diagnostics" in data
+        diag = data["diagnostics"]
+        assert diag.get("config_entry_id") == entry_id
+        has_data = "data" in diag
+        has_error = "error" in diag
+        assert has_data ^ has_error, (
+            f"Diagnostics sub-dict should have exactly one of 'data' or 'error'. Got: {diag}"
+        )
